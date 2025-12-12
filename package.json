@@ -1,0 +1,20 @@
+{
+  "name": "metatron-vector-foil",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.tsx --bundle --outfile=static/main.js --platform=browser --format=esm --minify --sourcemap --loader:.ts=ts --loader:.tsx=tsx",
+    "watch": "npm run build -- --watch"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.3",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1"
+  }
+}
