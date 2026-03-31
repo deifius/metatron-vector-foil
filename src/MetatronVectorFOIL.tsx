@@ -912,8 +912,26 @@ export default function MetatronVectorFOIL() {
 
   // ===================== UI =====================
   return (
-    <div className="w-full h-full relative" style={{ background: "#05060a" }}>
-      <canvas ref={canvasRef} className="block w-full h-full" />
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        width: "100vw",
+        height: "100dvh",
+        overflow: "hidden",
+        background: "#05060a",
+      }}
+    >
+      <canvas
+        ref={canvasRef}
+        style={{
+          display: "block",
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+        }}
+      />
 
       {/* HUD box */}
       <div style={{
