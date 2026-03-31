@@ -33,7 +33,7 @@ const T = {
   DRAG: 0.0,                           // should remain 0 (user request)
   ORBIT_GAIN: 1.03,                    // initial tangential velocity multiplier
   FUEL_MAX: 100,                       // fuel capacity
-  FUEL_BURN: 16.0,                     // fuel burn per second @ full thrust
+  FUEL_BURN: 8.0,                     // fuel burn per second @ full thrust
   FUEL_REGEN_INNER: 10.0,              // fuel regen per second inside red ring
   FUEL_REGEN_OUTER: 0.0,               // regen outside ring (keep 0)
   FUEL_PICKUP_AMOUNT: 12.0,            // fuel gained per collected bit
@@ -56,10 +56,11 @@ const T = {
   DEBUG_TEXT: true,                    // show debug overlay toggle default
 
   // Weapons
-  FIRE_RATE: 0.12,                     // seconds between shots
-  BULLET_SPEED: 1200,                  // bullet speed
-  BULLET_LIFE: 2.2,                    // bullet lifetime seconds
-  BULLET_TAIL: 0.024,                  // tail length factor
+  FIRE_RATE: 0.52,                     // seconds between shots
+  BULLET_SPEED: 1000,                  // bullet speed
+  BULLET_LIFE: 4.2,                    // bullet lifetime seconds
+  BULLET_RADIUS: 4.0,                  // bullet collision radius against wireframe edges
+  BULLET_TAIL: 0.044,                  // tail length factor
 
   // Enemies
   ENEMY_MAX: 5,                        // max enemies on screen
@@ -68,17 +69,21 @@ const T = {
   ENEMY_SPEED: 140,                    // base enemy drift speed
   ENEMY_STEER: 180,                    // pursuit acceleration
   ENEMY_ORBIT_BIAS: 0.55,              // tendency to orbit rather than beeline
-  ENEMY_HIT_RADIUS_MULT: 1.25,         // bullet hit radius multiplier
-  ENEMY_COLLAPSE_RATE: 1.25,           // dimension collapse speed
-  SHRAPNEL_COUNT_MIN: 6,               // min shrapnel on hit
-  SHRAPNEL_COUNT_MAX: 14,              // max shrapnel on hit
+  ENEMY_HIT_RADIUS_MULT: 1.25,         // player collision radius multiplier against enemies
+  ENEMY_COLLAPSE_RATE: 1.25,           // solid downgrade morph speed
+  SHIP_HIT_RADIUS: 10,                 // player hit radius
+  SHARD_HIT_RADIUS_PAD: 2.5,           // extra shard collision padding
+  SHRAPNEL_COUNT_MIN: 4,               // min shrapnel on hit
+  SHRAPNEL_COUNT_MAX: 8,              // max shrapnel on hit
   SHRAPNEL_SPEED_MIN: 240,             // shrapnel speed min
   SHRAPNEL_SPEED_MAX: 560,             // shrapnel speed max
+  SHRAPNEL_GRAVITY_MULT: 1.0,          // shard gravity multiplier
+  SHRAPNEL_PARENT_VEL: 0.6,            // how much parent velocity shards inherit
   SHRAPNEL_LIFE_MIN: 0.9,              // shrapnel life min
   SHRAPNEL_LIFE_MAX: 1.9,              // shrapnel life max
 
   // Metatron animation
-  META_BASE_SPIN: 0.22,                // base spin
+  META_BASE_SPIN: 0.12,                // base spin
   META_SPIN_GAIN: 0.22,                // spin increases with distance
   META_DWELL: 0.82,                    // dwell damping toward readable pose
   META_SPHERE_PULSE: 6.0,              // seconds per pulse
@@ -153,24 +158,56 @@ function metatronCenters(radius: number) {
 const MET_EDGES = (() => { const e: number[][] = []; for (let i = 0; i < 13; i++) for (let j = i + 1; j < 13; j++) e.push([i, j]); return e; })();
 
 // ===================== POLYHEDRA =====================
-function makePolyhedron(kind: "tetra" | "cube" | "octa" | "icosa", r: number) {
-  const verts: V3[] = [];
+type SolidKind = "tetra" | "cube" | "octa" | "dodeca" | "icosa";
+type PolyMesh = { verts: V3[]; edges: number[][] };
+type Impact = { point: V2; normal: V2; edgeI: number; edgeJ: number; d2: number };
+
+function buildEdgesByNearestDistance(verts: V3[], slack = 1.05) {
   const edges: number[][] = [];
+  let min = Infinity;
+  for (let i = 0; i < verts.length; i++) for (let j = i + 1; j < verts.length; j++) {
+    const dx = verts[i].x - verts[j].x, dy = verts[i].y - verts[j].y, dz = verts[i].z - verts[j].z;
+    min = Math.min(min, Math.hypot(dx, dy, dz));
+  }
+  const th = min * slack;
+  for (let i = 0; i < verts.length; i++) for (let j = i + 1; j < verts.length; j++) {
+    const dx = verts[i].x - verts[j].x, dy = verts[i].y - verts[j].y, dz = verts[i].z - verts[j].z;
+    const d = Math.hypot(dx, dy, dz);
+    if (d <= th) edges.push([i, j]);
+  }
+  return edges;
+}
+
+function makePolyhedron(kind: SolidKind, r: number): PolyMesh {
+  const verts: V3[] = [];
+  let edges: number[][] = [];
   const phi = (1 + Math.sqrt(5)) / 2;
+  const invPhi = 1 / phi;
 
   if (kind === "tetra") {
     const base = [new V3(1, 1, 1), new V3(-1, -1, 1), new V3(-1, 1, -1), new V3(1, -1, -1)];
     base.forEach((v) => verts.push(v));
-    [[0,1],[0,2],[0,3],[1,2],[1,3],[2,3]].forEach((p) => edges.push(p));
+    edges = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
   }
   if (kind === "cube") {
     const s = [-1, 1];
     for (const x of s) for (const y of s) for (const z of s) verts.push(new V3(x, y, z));
-    [[0,1],[0,2],[0,4],[1,3],[1,5],[2,3],[2,6],[3,7],[4,5],[4,6],[5,7],[6,7]].forEach((p) => edges.push(p));
+    edges = [[0, 1], [0, 2], [0, 4], [1, 3], [1, 5], [2, 3], [2, 6], [3, 7], [4, 5], [4, 6], [5, 7], [6, 7]];
   }
   if (kind === "octa") {
-    [new V3(1,0,0),new V3(-1,0,0),new V3(0,1,0),new V3(0,-1,0),new V3(0,0,1),new V3(0,0,-1)].forEach(v=>verts.push(v));
-    [[0,2],[0,3],[0,4],[0,5],[1,2],[1,3],[1,4],[1,5],[2,4],[2,5],[3,4],[3,5]].forEach(p=>edges.push(p));
+    [new V3(1, 0, 0), new V3(-1, 0, 0), new V3(0, 1, 0), new V3(0, -1, 0), new V3(0, 0, 1), new V3(0, 0, -1)].forEach((v) => verts.push(v));
+    edges = [[0, 2], [0, 3], [0, 4], [0, 5], [1, 2], [1, 3], [1, 4], [1, 5], [2, 4], [2, 5], [3, 4], [3, 5]];
+  }
+  if (kind === "dodeca") {
+    const base = [
+      new V3(1, 1, 1), new V3(1, 1, -1), new V3(1, -1, 1), new V3(1, -1, -1),
+      new V3(-1, 1, 1), new V3(-1, 1, -1), new V3(-1, -1, 1), new V3(-1, -1, -1),
+      new V3(0, invPhi, phi), new V3(0, invPhi, -phi), new V3(0, -invPhi, phi), new V3(0, -invPhi, -phi),
+      new V3(invPhi, phi, 0), new V3(invPhi, -phi, 0), new V3(-invPhi, phi, 0), new V3(-invPhi, -phi, 0),
+      new V3(phi, 0, invPhi), new V3(phi, 0, -invPhi), new V3(-phi, 0, invPhi), new V3(-phi, 0, -invPhi),
+    ];
+    base.forEach((v) => verts.push(v));
+    edges = buildEdgesByNearestDistance(verts);
   }
   if (kind === "icosa") {
     const a = 1, b = phi;
@@ -179,28 +216,24 @@ function makePolyhedron(kind: "tetra" | "cube" | "octa" | "icosa", r: number) {
       new V3(a, b, 0), new V3(-a, b, 0), new V3(a, -b, 0), new V3(-a, -b, 0),
       new V3(b, 0, a), new V3(-b, 0, a), new V3(b, 0, -a), new V3(-b, 0, -a),
     ];
-    base.forEach(v=>verts.push(v));
-    // edge build via nearest-neighbor rule
-    let min = Infinity;
-    for (let i=0;i<verts.length;i++) for (let j=i+1;j<verts.length;j++) {
-      const dx=verts[i].x-verts[j].x, dy=verts[i].y-verts[j].y, dz=verts[i].z-verts[j].z;
-      min = Math.min(min, Math.hypot(dx,dy,dz));
-    }
-    const th = min * 1.05;
-    for (let i=0;i<verts.length;i++) for (let j=i+1;j<verts.length;j++) {
-      const dx=verts[i].x-verts[j].x, dy=verts[i].y-verts[j].y, dz=verts[i].z-verts[j].z;
-      const d = Math.hypot(dx,dy,dz);
-      if (d <= th) edges.push([i,j]);
-    }
+    base.forEach((v) => verts.push(v));
+    edges = buildEdgesByNearestDistance(verts);
   }
 
-  // scale
   for (const v of verts) { v.x *= r; v.y *= r; v.z *= r; }
   return { verts, edges };
 }
 
+const DOWNGRADE: Record<SolidKind, SolidKind | null> = {
+  icosa: "dodeca",
+  dodeca: "octa",
+  octa: "cube",
+  cube: "tetra",
+  tetra: null,
+};
+
 // ===================== GAME TYPES =====================
-type Bullet = { pos: V2; vel: V2; life: number };
+type Bullet = { pos: V2; prevPos: V2; vel: V2; life: number };
 type FuelBit = { pos: V2; vel: V2; life: number; hue: number; };
 type Shard = { pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
 
@@ -208,11 +241,11 @@ type Enemy = {
   pos: V2; vel: V2;
   ax: number; ay: number; az: number;
   r: number; hue: number;
-  mesh: { verts: V3[]; edges: number[][] };
-  dim: 3 | 2 | 1;
-  collapsing: boolean;
-  collapse: number;
-  hp: number;
+  kind: SolidKind;
+  mesh: PolyMesh;
+  morphing: boolean;
+  morph: number;
+  nextKind: SolidKind | null;
 };
 
 type Level = {
@@ -394,10 +427,12 @@ export default function MetatronVectorFOIL() {
 
   // ===================== GAME LOOP =====================
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    const canvasEl = canvasRef.current;
+    if (!canvasEl) return;
+    const ctx0 = canvasEl.getContext("2d");
+    if (!ctx0) return;
+    const ctx = ctx0;
+    const canvas = canvasEl;
 
     // ---- sizing ----
     let dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
@@ -524,99 +559,158 @@ export default function MetatronVectorFOIL() {
 
     const makeBullet = () => {
       const muzzle = V2.fromAngle(player.angle, 18);
+      const pos = player.pos.copy().add(muzzle);
       const vel = V2.fromAngle(player.angle, T.BULLET_SPEED).add(player.vel.copy());
-      return { pos: player.pos.copy().add(muzzle), vel, life: T.BULLET_LIFE };
+      return { pos, prevPos: pos.copy(), vel, life: T.BULLET_LIFE };
     };
 
     const spawnEnemy = (lvl: Level) => {
       const a = rand(0, TAU);
-      const r = rand(horizonR * 1.0, horizonR * 1.25);
-      const pos = new V2(Math.cos(a) * r, Math.sin(a) * r);
+      const rOrbit = rand(horizonR * 1.0, horizonR * 1.25);
+      const pos = new V2(Math.cos(a) * rOrbit, Math.sin(a) * rOrbit);
       const vel = V2.fromAngle(a + Math.PI / 2, rand(T.ENEMY_SPEED * 0.6, T.ENEMY_SPEED * 1.1));
-      const kinds: Enemy["mesh"][] = [
-        makePolyhedron("tetra", rand(10, 16)),
-        makePolyhedron("cube", rand(10, 16)),
-        makePolyhedron("octa", rand(10, 16)),
-        makePolyhedron("icosa", rand(10, 16)),
-      ];
-      const mesh = kinds[(Math.random() * kinds.length) | 0];
+      const spawnKinds: SolidKind[] = ["cube", "octa", "dodeca", "icosa", "icosa"];
+      const kind = spawnKinds[(Math.random() * spawnKinds.length) | 0];
+      const r = rand(12, 22);
       return {
         pos,
         vel,
         ax: rand(0, TAU),
         ay: rand(0, TAU),
         az: rand(0, TAU),
-        r: rand(12, 22),
+        r,
         hue: rand(170, 320),
-        mesh,
-        dim: 3,
-        collapsing: false,
-        collapse: 0,
-        hp: 2,
+        kind,
+        mesh: makePolyhedron(kind, r),
+        morphing: false,
+        morph: 0,
+        nextKind: null,
       } satisfies Enemy;
+    };
+
+    const getEnemyMorphScale = (e: Enemy) => {
+      if (!e.morphing) return { y: 1, z: 1 };
+      const squash = Math.sin(Math.PI * clamp(e.morph, 0, 1));
+      return {
+        y: 1 - 0.34 * squash,
+        z: Math.max(0.08, 1 - 0.92 * squash),
+      };
     };
 
     const getEnemyProjectedVerts = (e: Enemy) => {
       const out: { x: number; y: number }[] = [];
+      const scale = getEnemyMorphScale(e);
       for (const v0 of e.mesh.verts) {
         let v = v0;
         v = rotX(v, e.ax); v = rotY(v, e.ay); v = rotZ(v, e.az);
-        // collapse morph: squash Z then Y
-        let zScale = 1, yScale = 1;
-        if (e.dim === 3) zScale = 1 - e.collapse;
-        else { zScale = 0; yScale = e.dim === 2 ? (1 - e.collapse) : 0; }
-        v = new V3(v.x, v.y * yScale, v.z * zScale);
+        v = new V3(v.x, v.y * scale.y, v.z * scale.z);
         const p = project(v, 1, 4);
         out.push({ x: e.pos.x + p.x, y: e.pos.y + p.y });
       }
       return out;
     };
 
-    const closestEdgePoint = (e: Enemy, hit: V2) => {
-      const verts = getEnemyProjectedVerts(e);
-      let bestP = e.pos.copy();
-      let bestI = -1, bestJ = -1, bestD2 = Infinity;
-      for (const [i, j] of e.mesh.edges) {
-        const a = verts[i], b = verts[j];
-        if (!a || !b) continue;
-        const abx = b.x - a.x, aby = b.y - a.y;
-        const apx = hit.x - a.x, apy = hit.y - a.y;
-        const ab2 = abx * abx + aby * aby || 1;
-        let t = (apx * abx + apy * aby) / ab2;
-        t = clamp(t, 0, 1);
-        const px = a.x + abx * t, py = a.y + aby * t;
-        const dx = hit.x - px, dy = hit.y - py;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < bestD2) { bestD2 = d2; bestP = new V2(px, py); bestI = i; bestJ = j; }
+    const closestPointsOnSegments = (p1: V2, q1: V2, p2: V2, q2: V2) => {
+      const u = q1.copy().sub(p1);
+      const v = q2.copy().sub(p2);
+      const w = p1.copy().sub(p2);
+      const a = u.dot(u);
+      const b = u.dot(v);
+      const c = v.dot(v);
+      const d = u.dot(w);
+      const e = v.dot(w);
+      const EPS = 1e-6;
+      let sN: number, sD = a * c - b * b;
+      let tN: number, tD = sD;
+
+      if (sD < EPS) {
+        sN = 0;
+        sD = 1;
+        tN = e;
+        tD = c;
+      } else {
+        sN = b * e - c * d;
+        tN = a * e - b * d;
+        if (sN < 0) {
+          sN = 0;
+          tN = e;
+          tD = c;
+        } else if (sN > sD) {
+          sN = sD;
+          tN = e + b;
+          tD = c;
+        }
       }
-      return { p: bestP, i: bestI, j: bestJ };
+
+      if (tN < 0) {
+        tN = 0;
+        if (-d < 0) sN = 0;
+        else if (-d > a) sN = sD;
+        else { sN = -d; sD = a; }
+      } else if (tN > tD) {
+        tN = tD;
+        if (-d + b < 0) sN = 0;
+        else if (-d + b > a) sN = sD;
+        else { sN = -d + b; sD = a; }
+      }
+
+      const sc = Math.abs(sN) < EPS ? 0 : sN / sD;
+      const tc = Math.abs(tN) < EPS ? 0 : tN / tD;
+      const bulletPoint = p1.copy().add(u.mul(sc));
+      const edgePoint = p2.copy().add(v.mul(tc));
+      const d2 = bulletPoint.copy().sub(edgePoint).dot(bulletPoint.copy().sub(edgePoint));
+      return { bulletPoint, edgePoint, d2 };
     };
 
-    const spawnShrapnel = (e: Enemy, hit: V2) => {
-      const { p, i, j } = closestEdgePoint(e, hit);
+    const findBulletEnemyImpact = (b: Bullet, e: Enemy): Impact | null => {
       const verts = getEnemyProjectedVerts(e);
-      const origin = p;
+      let best: Impact | null = null;
+      const maxD2 = T.BULLET_RADIUS * T.BULLET_RADIUS;
+      for (const [i, j] of e.mesh.edges) {
+        const a = verts[i], c = verts[j];
+        if (!a || !c) continue;
+        const res = closestPointsOnSegments(b.prevPos, b.pos, new V2(a.x, a.y), new V2(c.x, c.y));
+        if (res.d2 > maxD2) continue;
+        if (!best || res.d2 < best.d2) {
+          const edge = new V2(c.x - a.x, c.y - a.y).norm();
+          const n1 = new V2(-edge.y, edge.x);
+          const n2 = new V2(edge.y, -edge.x);
+          const away = res.edgePoint.copy().sub(e.pos);
+          best = {
+            point: res.edgePoint,
+            normal: (n1.dot(away) > 0 ? n1 : n2).norm(),
+            edgeI: i,
+            edgeJ: j,
+            d2: res.d2,
+          };
+        }
+      }
+      return best;
+    };
 
-      // derive outward-ish direction from struck edge normal
-      let dir = hit.copy().sub(e.pos).norm();
-      if (i >= 0) {
-        const a = verts[i], b = verts[j];
-        const edge = new V2(b.x - a.x, b.y - a.y).norm();
-        const n1 = new V2(-edge.y, edge.x);
-        const n2 = new V2(edge.y, -edge.x);
-        const away = origin.copy().sub(e.pos);
-        dir = (n1.dot(away) > 0 ? n1 : n2).add(edge.mul(0.35)).norm();
+    const spawnShrapnel = (e: Enemy, impact: Impact) => {
+      const verts = getEnemyProjectedVerts(e);
+      const origin = impact.point.copy();
+
+      let dir = impact.normal.copy();
+      if (impact.edgeI >= 0) {
+        const a = verts[impact.edgeI], b = verts[impact.edgeJ];
+        if (a && b) {
+          const edge = new V2(b.x - a.x, b.y - a.y).norm();
+          dir = impact.normal.copy().add(edge.mul(0.35)).norm();
+        }
       }
 
-      const N = (rand(T.SHRAPNEL_COUNT_MIN, T.SHRAPNEL_COUNT_MAX + 1) | 0);
+      const kindFactor: Record<SolidKind, number> = { tetra: 0.6, cube: 0.78, octa: 0.88, dodeca: 1.0, icosa: 1.12 };
+      const N = Math.max(3, ((rand(T.SHRAPNEL_COUNT_MIN, T.SHRAPNEL_COUNT_MAX + 1) * kindFactor[e.kind]) | 0));
       for (let k = 0; k < N; k++) {
-        const jitter = rand(-Math.PI / 10, Math.PI / 10);
+        const jitter = rand(-Math.PI / 6, Math.PI / 6);
         const dj = dir.copy().rot(jitter).norm();
         const sp = rand(T.SHRAPNEL_SPEED_MIN, T.SHRAPNEL_SPEED_MAX);
-        const v = dj.mul(sp).add(e.vel.copy().mul(0.2));
+        const v = dj.copy().mul(sp).add(e.vel.copy().mul(T.SHRAPNEL_PARENT_VEL));
         const life0 = rand(T.SHRAPNEL_LIFE_MIN, T.SHRAPNEL_LIFE_MAX);
         shards.push({
-          pos: origin.copy().add(dj.copy().mul(rand(0.5, 5))),
+          pos: origin.copy().add(dj.copy().mul(rand(0.2, 2.4))),
           vel: v,
           life: life0,
           life0,
@@ -626,6 +720,20 @@ export default function MetatronVectorFOIL() {
           spin: rand(-6, 6),
         });
       }
+    };
+
+    const downgradeEnemy = (e: Enemy) => {
+      const next = DOWNGRADE[e.kind];
+      if (!next) return false;
+      e.morphing = true;
+      e.morph = 0;
+      e.nextKind = next;
+      return true;
+    };
+
+    const killPlayer = () => {
+      audioRef.current.explode();
+      resetRun(false);
     };
 
     const settleFuelBitsFromShards = (dt: number) => {
@@ -736,6 +844,7 @@ export default function MetatronVectorFOIL() {
       // bullets
       for (let i = bullets.length - 1; i >= 0; i--) {
         const b = bullets[i];
+        b.prevPos = b.pos.copy();
         b.pos.add(b.vel.copy().mul(dt));
         b.life -= dt;
         if (b.life <= 0 || Math.abs(b.pos.x) > oortOuter * 3 || Math.abs(b.pos.y) > oortOuter * 3) bullets.splice(i, 1);
@@ -773,14 +882,24 @@ export default function MetatronVectorFOIL() {
         // rotation
         e.ax += 0.75 * dt; e.ay += 0.55 * dt; e.az += 0.42 * dt;
 
-        // collapse
-        if (e.collapsing) {
-          e.collapse += T.ENEMY_COLLAPSE_RATE * dt;
-          if (e.collapse >= 1) {
-            e.collapse = 0;
-            e.collapsing = false;
-            e.dim = e.dim === 3 ? 2 : (e.dim === 2 ? 1 : 1);
+        if (e.morphing) {
+          e.morph += T.ENEMY_COLLAPSE_RATE * dt;
+          if (e.nextKind && e.morph >= 0.5) {
+            e.kind = e.nextKind;
+            e.mesh = makePolyhedron(e.kind, e.r);
+            e.nextKind = null;
           }
+          if (e.morph >= 1) {
+            e.morph = 0;
+            e.morphing = false;
+          }
+        }
+
+        const toPlayer = player.pos.copy().sub(e.pos);
+        const enemyHitR = Math.max(8, e.r * T.ENEMY_HIT_RADIUS_MULT);
+        if (toPlayer.len() <= T.SHIP_HIT_RADIUS + enemyHitR) {
+          killPlayer();
+          return;
         }
 
         // cull far away
@@ -793,18 +912,15 @@ export default function MetatronVectorFOIL() {
         let hit = false;
         for (let ei = enemies.length - 1; ei >= 0; ei--) {
           const e = enemies[ei];
-          const dx = b.pos.x - e.pos.x, dy = b.pos.y - e.pos.y;
-          const hitR = e.r * T.ENEMY_HIT_RADIUS_MULT;
-          if (dx * dx + dy * dy <= hitR * hitR) {
-            spawnShrapnel(e, b.pos);
-            audioRef.current.hit();
-            b.life = -1;
-            e.hp -= 1;
-            e.collapsing = true;
-            if (e.hp <= 0 && e.dim === 1) enemies.splice(ei, 1);
-            hit = true;
-            break;
-          }
+          if (e.morphing) continue;
+          const impact = findBulletEnemyImpact(b, e);
+          if (!impact) continue;
+          spawnShrapnel(e, impact);
+          audioRef.current.hit();
+          b.life = -1;
+          if (!downgradeEnemy(e)) enemies.splice(ei, 1);
+          hit = true;
+          break;
         }
         if (hit || b.life <= 0) bullets.splice(bi, 1);
       }
@@ -812,10 +928,16 @@ export default function MetatronVectorFOIL() {
       // shrapnel update
       for (let i = shards.length - 1; i >= 0; i--) {
         const s = shards[i];
-        s.vel.add(gravityAt(s.pos, lvl.gravityGM * 0.18).mul(dt));
+        s.vel.add(gravityAt(s.pos, lvl.gravityGM * T.SHRAPNEL_GRAVITY_MULT).mul(dt));
         s.pos.add(s.vel.copy().mul(dt));
         s.ang += s.spin * dt;
         s.life -= dt;
+
+        if (s.pos.copy().sub(player.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD) {
+          killPlayer();
+          return;
+        }
+
         if (s.life <= 0 || s.pos.len() > oortOuter * 2.4) shards.splice(i, 1);
       }
 
@@ -1237,12 +1359,12 @@ function render(
   ctx.save();
   for (const e of S.entities.enemies) {
     const proj: { x: number; y: number }[] = [];
+    const squash = Math.sin(Math.PI * clamp(e.morph, 0, 1));
+    const yScale = e.morphing ? (1 - 0.34 * squash) : 1;
+    const zScale = e.morphing ? Math.max(0.08, 1 - 0.92 * squash) : 1;
     for (const v0 of e.mesh.verts) {
       let v = v0;
       v = rotX(v, e.ax); v = rotY(v, e.ay); v = rotZ(v, e.az);
-      let zScale = 1, yScale = 1;
-      if (e.dim === 3) zScale = 1 - e.collapse;
-      else { zScale = 0; yScale = e.dim === 2 ? (1 - e.collapse) : 0; }
       v = new V3(v.x, v.y * yScale, v.z * zScale);
       const p = project(v, 1, 4);
       proj.push({ x: e.pos.x + p.x, y: e.pos.y + p.y });

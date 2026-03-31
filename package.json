@@ -12,9 +12,9 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "esbuild": "^0.24.0",
-    "typescript": "^5.6.3",
     "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1"
+    "@types/react-dom": "^18.3.1",
+    "esbuild": "^0.27.4",
+    "typescript": "^5.6.3"
   }
 }
