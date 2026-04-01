@@ -29,11 +29,11 @@ const T = {
   SHIP_MASS: 26.0,                     // ship mass (higher = more inertia)
   ROT_SPEED: 3.6,                      // ship rotation speed (rad/s)
   THRUST_FORCE: 1900,                  // engine thrust (force units)
-  BRAKE_FORCE: 900,                    // reverse/feather force (force units)
+  BRAKE_COEFF: 0.97,                  // braking drag coefficient applied per fixed step
   DRAG: 0.0,                           // should remain 0 (user request)
   ORBIT_GAIN: 1.03,                    // initial tangential velocity multiplier
   FUEL_MAX: 100,                       // fuel capacity
-  FUEL_BURN: 8.0,                     // fuel burn per second @ full thrust
+  FUEL_BURN: 16.0,                     // fuel burn per second @ full thrust
   FUEL_REGEN_INNER: 10.0,              // fuel regen per second inside red ring
   FUEL_REGEN_OUTER: 0.0,               // regen outside ring (keep 0)
   FUEL_PICKUP_AMOUNT: 12.0,            // fuel gained per collected bit
@@ -56,11 +56,11 @@ const T = {
   DEBUG_TEXT: true,                    // show debug overlay toggle default
 
   // Weapons
-  FIRE_RATE: 0.52,                     // seconds between shots
-  BULLET_SPEED: 1000,                  // bullet speed
-  BULLET_LIFE: 4.2,                    // bullet lifetime seconds
+  FIRE_RATE: 0.12,                     // seconds between shots
+  BULLET_SPEED: 1200,                  // bullet speed
+  BULLET_LIFE: 2.2,                    // bullet lifetime seconds
   BULLET_RADIUS: 4.0,                  // bullet collision radius against wireframe edges
-  BULLET_TAIL: 0.044,                  // tail length factor
+  BULLET_TAIL: 0.024,                  // tail length factor
 
   // Enemies
   ENEMY_MAX: 5,                        // max enemies on screen
@@ -73,8 +73,8 @@ const T = {
   ENEMY_COLLAPSE_RATE: 1.25,           // solid downgrade morph speed
   SHIP_HIT_RADIUS: 10,                 // player hit radius
   SHARD_HIT_RADIUS_PAD: 2.5,           // extra shard collision padding
-  SHRAPNEL_COUNT_MIN: 4,               // min shrapnel on hit
-  SHRAPNEL_COUNT_MAX: 8,              // max shrapnel on hit
+  SHRAPNEL_COUNT_MIN: 6,               // min shrapnel on hit
+  SHRAPNEL_COUNT_MAX: 14,              // max shrapnel on hit
   SHRAPNEL_SPEED_MIN: 240,             // shrapnel speed min
   SHRAPNEL_SPEED_MAX: 560,             // shrapnel speed max
   SHRAPNEL_GRAVITY_MULT: 1.0,          // shard gravity multiplier
@@ -83,7 +83,7 @@ const T = {
   SHRAPNEL_LIFE_MAX: 1.9,              // shrapnel life max
 
   // Metatron animation
-  META_BASE_SPIN: 0.12,                // base spin
+  META_BASE_SPIN: 0.22,                // base spin
   META_SPIN_GAIN: 0.22,                // spin increases with distance
   META_DWELL: 0.82,                    // dwell damping toward readable pose
   META_SPHERE_PULSE: 6.0,              // seconds per pulse
@@ -804,14 +804,20 @@ export default function MetatronVectorFOIL() {
       const sail = solarSailAt(player.pos, player.angle, lvl.solarPressure * (solar / T.SOLAR_PRESSURE));
       const fwd = V2.fromAngle(player.angle, 1);
 
-      // engine thrust (only if fuel)
-      const engine = fwd.copy().mul((player.fuel > 0 ? 1 : 0) * (player.thrust > 0 ? thrust : T.BRAKE_FORCE) * player.thrust);
+      // engine thrust (only if fuel); braking is multiplicative drag, not reverse thrust
+      const engine = fwd.copy().mul((player.fuel > 0 ? 1 : 0) * Math.max(0, player.thrust) * thrust);
       // acceleration = (g + sail + engine/mass)
       player.vel.add(g.mul(dt));
       player.vel.add(sail.mul(dt / T.SHIP_MASS));
       player.vel.add(engine.mul(dt / T.SHIP_MASS));
 
-      // no drag
+      const brake = clamp(-player.thrust, 0, 1);
+      if (brake > 0.001) {
+        const brakeMul = lerp(1, T.BRAKE_COEFF, brake);
+        player.vel.mul(brakeMul);
+      }
+
+      // no passive drag
       if (T.DRAG > 0) player.vel.mul(1 - T.DRAG * dt);
 
       // clamp speed
