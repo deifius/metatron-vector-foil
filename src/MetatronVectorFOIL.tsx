@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 /**
  * Metatron Vector FOIL
@@ -252,11 +252,11 @@ type Enemy = {
 
 type Level = {
   name: string;
+  wave: number;
   gravityGM: number;
   solarPressure: number;
-  enemyMax: number;
-  spawnRate: number;
-  targetAngles: { ax: number; ay: number; az: number };
+  enemyCount: number;
+  enemyKind: SolidKind;
 };
 
 // ===================== WEB AUDIO (WAVETABLE) =====================
@@ -385,6 +385,10 @@ export default function MetatronVectorFOIL() {
   const [mode, setMode] = useState<"menu" | "playing" | "paused" | "transition">("menu");
   const [levelIdx, setLevelIdx] = useState(0);
   const [toggles, setToggles] = useState({ metatron: true, trails: true, debug: T.DEBUG_TEXT });
+
+  const modeRef = useRef(mode);
+  const levelIdxRef = useRef(levelIdx);
+  const togglesRef = useRef(toggles);
   const [sliders, setSliders] = useState({
     gravity: T.GRAVITY_GM,
     thrust: T.THRUST_FORCE,
@@ -399,33 +403,23 @@ export default function MetatronVectorFOIL() {
   // Keep slider values available inside the loop without rerenders
   const slidersRef = useRef(sliders);
   useEffect(() => { slidersRef.current = sliders; audioRef.current.setMaster(sliders.master); }, [sliders]);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { levelIdxRef.current = levelIdx; }, [levelIdx]);
+  useEffect(() => { togglesRef.current = toggles; }, [toggles]);
 
-  const levels: Level[] = useMemo(() => ([
-    {
-      name: "I. The Splayed Lattice",
-      gravityGM: T.GRAVITY_GM * 1.0,
-      solarPressure: T.SOLAR_PRESSURE * 0.95,
-      enemyMax: 3,
-      spawnRate: 0.95,
-      targetAngles: { ax: 0.0, ay: 0.0, az: 0.0 },
-    },
-    {
-      name: "II. The Foil Choir",
-      gravityGM: T.GRAVITY_GM * 1.12,
-      solarPressure: T.SOLAR_PRESSURE * 1.05,
-      enemyMax: 5,
-      spawnRate: 0.75,
-      targetAngles: { ax: 0.7, ay: 0.25, az: 0.5 },
-    },
-    {
-      name: "III. Door of the Star",
-      gravityGM: T.GRAVITY_GM * 1.25,
-      solarPressure: T.SOLAR_PRESSURE * 1.18,
-      enemyMax: 7,
-      spawnRate: 0.6,
-      targetAngles: { ax: 1.2, ay: 0.6, az: 0.9 },
-    },
-  ]), []);
+  const getLevel = (idx: number): Level => {
+    const wave = idx + 1;
+    const enemyKind: SolidKind = wave <= 1 ? "cube" : wave === 2 ? "octa" : wave === 3 ? "dodeca" : "icosa";
+    const kindName = enemyKind.charAt(0).toUpperCase() + enemyKind.slice(1);
+    return {
+      name: `Wave ${wave} · ${kindName}`,
+      wave,
+      gravityGM: T.GRAVITY_GM * (1 + idx * 0.08),
+      solarPressure: T.SOLAR_PRESSURE * (1 + idx * 0.05),
+      enemyCount: wave,
+      enemyKind,
+    };
+  };
 
   // ===================== GAME LOOP =====================
   useEffect(() => {
@@ -464,11 +458,17 @@ export default function MetatronVectorFOIL() {
       keys.add(e.key);
 
       if (e.key === "Enter") {
-        if (mode === "menu") setMode("playing");
-        if (mode === "paused") setMode("playing");
+        if (modeRef.current === "menu" || modeRef.current === "paused") {
+          modeRef.current = "playing";
+          setMode("playing");
+        }
       }
       if (e.key === "p" || e.key === "P") {
-        setMode((m) => (m === "playing" ? "paused" : (m === "paused" ? "playing" : m)));
+        setMode((m) => {
+          const next = m === "playing" ? "paused" : (m === "paused" ? "playing" : m);
+          modeRef.current = next;
+          return next;
+        });
       }
       if (e.key === "m" || e.key === "M") setToggles((t) => ({ ...t, metatron: !t.metatron }));
       if (e.key === "t" || e.key === "T") setToggles((t) => ({ ...t, trails: !t.trails }));
@@ -504,15 +504,25 @@ export default function MetatronVectorFOIL() {
     const fuelBits: FuelBit[] = [];
     const trail: V2[] = [];
 
-    // metatron angles + door state
+    // metatron angles
     let metaAx = 0, metaAy = 0, metaAz = 0;
-    let alignHold = 0;
 
-    // timers
+    // timers / wave state
     let gunCD = 0;
-    let spawnT = 0.8;
+    let waveBannerTimer = 0;
+    let waveBannerText = "";
+    let waveActive = false;
+    let pendingWaveIdx = 0;
 
     // reset helper
+    const queueWaveBanner = (waveIdx: number) => {
+      const wave = getLevel(waveIdx).wave;
+      waveBannerText = `Prepare for Wave ${wave}`;
+      waveBannerTimer = 3.0;
+      pendingWaveIdx = waveIdx;
+      waveActive = false;
+    };
+
     const resetRun = (toMenu = false) => {
       bullets.length = 0; enemies.length = 0; shards.length = 0; fuelBits.length = 0; trail.length = 0;
       player.pos = new V2(metaRadius, 0);
@@ -524,11 +534,14 @@ export default function MetatronVectorFOIL() {
       player.fuel = T.FUEL_MAX;
       player.stuckTime = 0;
       gunCD = 0;
-      spawnT = 0.8;
-      alignHold = 0;
       metaAx = 0; metaAy = 0; metaAz = 0;
       audioRef.current.stop();
-      if (toMenu) setMode("menu"); else setMode("playing");
+      levelIdxRef.current = 0;
+      setLevelIdx(0);
+      queueWaveBanner(0);
+      const nextMode = toMenu ? "menu" : "playing";
+      modeRef.current = nextMode;
+      setMode(nextMode);
     };
 
     // initial orbit
@@ -566,16 +579,17 @@ export default function MetatronVectorFOIL() {
       return { pos, prevPos: pos.copy(), vel, life: T.BULLET_LIFE };
     };
 
-    const spawnEnemy = (lvl: Level) => {
-      const a = rand(0, TAU);
+    const spawnEnemy = (kind: SolidKind, waveIdx: number, index: number, total: number) => {
+      const baseAngle = rand(0, TAU);
+      const spread = total <= 1 ? 0 : (index / total) * TAU;
+      const a = baseAngle + spread;
       const rOrbit = rand(
         oortOuter * T.ENEMY_SPAWN_RADIUS_INNER_MULT,
         oortOuter * T.ENEMY_SPAWN_RADIUS_OUTER_MULT,
       );
       const pos = new V2(Math.cos(a) * rOrbit, Math.sin(a) * rOrbit);
-      const vel = V2.fromAngle(a + Math.PI / 2, rand(T.ENEMY_SPEED * 0.6, T.ENEMY_SPEED * 1.1));
-      const spawnKinds: SolidKind[] = ["cube", "octa", "dodeca", "icosa", "icosa"];
-      const kind = spawnKinds[(Math.random() * spawnKinds.length) | 0];
+      const speedScale = 1 + waveIdx * 0.03;
+      const vel = V2.fromAngle(a + Math.PI / 2, rand(T.ENEMY_SPEED * 0.6, T.ENEMY_SPEED * 1.1) * speedScale);
       const r = rand(12, 22);
       return {
         pos,
@@ -591,6 +605,17 @@ export default function MetatronVectorFOIL() {
         morph: 0,
         nextKind: null,
       } satisfies Enemy;
+    };
+
+    const startWave = (waveIdx: number) => {
+      const lvl = getLevel(waveIdx);
+      enemies.length = 0;
+      for (let i = 0; i < lvl.enemyCount; i++) {
+        enemies.push(spawnEnemy(lvl.enemyKind, waveIdx, i, lvl.enemyCount));
+      }
+      levelIdxRef.current = waveIdx;
+      setLevelIdx(waveIdx);
+      waveActive = true;
     };
 
     const getEnemyMorphScale = (e: Enemy) => {
@@ -774,13 +799,13 @@ export default function MetatronVectorFOIL() {
     let acc = 0;
 
     const step = (dt: number) => {
-      const lvl = levels[clamp(levelIdx, 0, levels.length - 1)];
+      const lvl = getLevel(levelIdxRef.current);
       const gm = slidersRef.current.gravity;
       const thrust = slidersRef.current.thrust;
       const solar = slidersRef.current.solar;
 
       // handle pause/menu/transition
-      if (mode !== "playing") {
+      if (modeRef.current !== "playing") {
         // still animate metatron slowly for menu vibes
         const dist = player.pos.len();
         const spin = (T.META_BASE_SPIN + T.META_SPIN_GAIN * (dist / Math.max(1, metaRadius))) * 0.15;
@@ -861,12 +886,11 @@ export default function MetatronVectorFOIL() {
         if (b.life <= 0 || Math.abs(b.pos.x) > oortOuter * 3 || Math.abs(b.pos.y) > oortOuter * 3) bullets.splice(i, 1);
       }
 
-      // enemies spawn
-      spawnT -= dt;
-      if (spawnT <= 0) {
-        if (enemies.length < lvl.enemyMax) enemies.push(spawnEnemy(lvl));
-        const t = clamp(levelIdx / Math.max(1, levels.length - 1), 0, 1);
-        spawnT = lerp(lvl.spawnRate, T.ENEMY_SPAWN_MIN, t);
+      if (waveBannerTimer > 0) {
+        waveBannerTimer = Math.max(0, waveBannerTimer - dt);
+        if (waveBannerTimer <= 0) {
+          startWave(pendingWaveIdx);
+        }
       }
 
       // enemies update + AI
@@ -981,23 +1005,9 @@ export default function MetatronVectorFOIL() {
       metaAy -= metaAy * dwell * dt;
       metaAz -= metaAz * dwell * 0.35 * dt; // let az keep motion
 
-      // alignment → arm the door
-      const tar = lvl.targetAngles;
-      const err = Math.abs(wrapAngle(metaAx - tar.ax)) + Math.abs(wrapAngle(metaAy - tar.ay)) + Math.abs(wrapAngle(metaAz - tar.az));
-      const aligned = err < T.ALIGN_THRESHOLD;
-      alignHold = aligned ? (alignHold + dt) : Math.max(0, alignHold - dt * 0.8);
-
-      // if door armed and ship enters, advance level
-      const doorArmed = alignHold >= T.ALIGN_HOLD_TIME;
-      if (doorArmed && player.pos.len() < T.DOOR_RADIUS) {
+      if (waveActive && enemies.length === 0 && shards.length === 0) {
         audioRef.current.levelUp();
-        setMode("transition");
-        // tiny delay then next level + reset run
-        window.setTimeout(() => {
-          setLevelIdx((i) => (i + 1) % levels.length);
-          resetRun(false);
-          setMode("playing");
-        }, 420);
+        queueWaveBanner(levelIdxRef.current + 1);
       }
 
       // camera (center stays on star; zoom guarantees ship in view)
@@ -1019,13 +1029,15 @@ export default function MetatronVectorFOIL() {
       }
 
       render(ctx, canvas, dpr, {
-        mode, level: levels[clamp(levelIdx, 0, levels.length - 1)],
+        mode: modeRef.current,
+        level: getLevel(levelIdxRef.current),
         player, camera,
         meta: { ax: metaAx, ay: metaAy, az: metaAz, centers3 },
         entities: { bullets, enemies, shards, fuelBits, trail },
-        toggles,
+        toggles: togglesRef.current,
         horizonR, oortInner, oortOuter,
-        alignHold,
+        waveBannerTimer,
+        waveBannerText,
       });
 
       raf = requestAnimationFrame(loop);
@@ -1041,7 +1053,7 @@ export default function MetatronVectorFOIL() {
       audioRef.current.stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, levelIdx, toggles.metatron, toggles.trails, toggles.debug]);
+  }, []);
 
   // ===================== UI =====================
   return (
@@ -1085,8 +1097,8 @@ export default function MetatronVectorFOIL() {
         <Overlay>
           <h1 style={{ margin: 0, fontSize: 28 }}>Metatron Vector FOIL</h1>
           <p style={{ maxWidth: 680, opacity: 0.9, lineHeight: 1.35 }}>
-            You are a foil-ship riding gravity and starlight. Align the Metatron lattice — when alignment holds,
-            the star becomes a <b>door</b>. Fly into it to advance.
+            You are a foil-ship riding gravity and starlight. Survive each incoming wave of Platonic solids,
+            hold your orbit, and be ready when the next formation arrives.
           </p>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             <Keycap>Enter</Keycap><span style={{ opacity: 0.85 }}>Start</span>
@@ -1095,7 +1107,8 @@ export default function MetatronVectorFOIL() {
             <Keycap>Space</Keycap><span style={{ opacity: 0.85 }}>Shoot</span>
           </div>
           <p style={{ opacity: 0.72, marginTop: 12 }}>
-            Tip: collect drifting fuel bits in the Oort band. Try “tacking” by angling the foil relative to the star.
+            Tip: collect drifting fuel bits in the Oort band. Try “tacking” by angling the foil relative to the star,
+            and use the quiet between waves to set up your next approach.
           </p>
         </Overlay>
       )}
@@ -1147,7 +1160,12 @@ export default function MetatronVectorFOIL() {
 
           <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
             <button onClick={() => setMode("playing")} style={btnStyle}>Resume</button>
-            <button onClick={() => { setLevelIdx(0); setMode("menu"); }} style={btnStyle}>Back to title</button>
+            <button onClick={() => {
+              levelIdxRef.current = 0;
+              setLevelIdx(0);
+              modeRef.current = "menu";
+              setMode("menu");
+            }} style={btnStyle}>Back to title</button>
           </div>
         </Overlay>
       )}
@@ -1248,7 +1266,8 @@ function render(
     horizonR: number;
     oortInner: number;
     oortOuter: number;
-    alignHold: number;
+    waveBannerTimer: number;
+    waveBannerText: string;
   }
 ) {
   const w = canvas.width / dpr;
@@ -1278,15 +1297,14 @@ function render(
   ctx.beginPath(); arcSafe(ctx, 0, 0, S.oortOuter); ctx.stroke();
   ctx.restore();
 
-  // star (door when aligned)
-  const doorArmed = S.alignHold >= T.ALIGN_HOLD_TIME;
+  // star
   ctx.save();
-  const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, doorArmed ? T.DOOR_RADIUS * 2.2 : T.STAR_RADIUS * 2.2);
-  grad.addColorStop(0, doorArmed ? "rgba(255,255,230,0.95)" : "rgba(255,255,230,0.80)");
-  grad.addColorStop(0.2, doorArmed ? "rgba(255,230,170,0.35)" : "rgba(255,210,150,0.25)");
+  const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, T.STAR_RADIUS * 2.2);
+  grad.addColorStop(0, "rgba(255,255,230,0.80)");
+  grad.addColorStop(0.2, "rgba(255,210,150,0.25)");
   grad.addColorStop(1, "rgba(255,180,120,0)");
   ctx.fillStyle = grad;
-  ctx.beginPath(); arcSafe(ctx, 0, 0, doorArmed ? T.DOOR_RADIUS : T.STAR_RADIUS); ctx.fill();
+  ctx.beginPath(); arcSafe(ctx, 0, 0, T.STAR_RADIUS); ctx.fill();
   ctx.restore();
 
   // metatron (animated)
@@ -1434,7 +1452,7 @@ function render(
 
   const spd = S.player.vel.len();
   ctx.fillText(`${S.level.name}`, 12, 18);
-  ctx.fillText(`Fuel ${S.player.fuel.toFixed(0)} / ${T.FUEL_MAX}  |  speed ${spd.toFixed(1)}  |  align ${(S.alignHold).toFixed(2)}`, 12, 34);
+  ctx.fillText(`Fuel ${S.player.fuel.toFixed(0)} / ${T.FUEL_MAX}  |  speed ${spd.toFixed(1)}  |  incoming ${S.level.enemyKind} × ${S.level.enemyCount}`, 12, 34);
 
   if (S.toggles.debug) {
     ctx.fillStyle = "rgba(255,255,255,0.74)";
@@ -1442,9 +1460,18 @@ function render(
     ctx.fillText(`bullets ${S.entities.bullets.length}  enemies ${S.entities.enemies.length}  shards ${S.entities.shards.length}  fuelbits ${S.entities.fuelBits.length}`, 12, 68);
   }
 
-  if (doorArmed) {
-    ctx.fillStyle = "rgba(255,235,210,0.86)";
-    ctx.fillText(`DOOR ARMED — fly into the star`, 12, 86);
+  if (S.waveBannerTimer > 0 && S.waveBannerText) {
+    const alpha = clamp(Math.min(1, S.waveBannerTimer / 0.45), 0, 1) * (0.72 + 0.28 * Math.sin(performance.now() / 120));
+    ctx.save();
+    ctx.font = "28px ui-monospace, Menlo, monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.strokeStyle = `rgba(200,230,255,${0.25 * alpha})`;
+    ctx.lineWidth = 2;
+    ctx.strokeText(S.waveBannerText, w / 2, h * 0.24);
+    ctx.fillStyle = `rgba(235,245,255,${0.12 * alpha})`;
+    ctx.fillText(S.waveBannerText, w / 2, h * 0.24);
+    ctx.restore();
   }
 }
 
@@ -1473,13 +1500,6 @@ function updateCamera(camera: { pos: V2; zoom: number }, canvas: HTMLCanvasEleme
   const blend = T.CAMERA_AESTHETIC;
   const target = Math.min(keepZoom, lerp(keepZoom, aesthetic, blend));
   camera.zoom = clamp(lerp(camera.zoom, target, T.CAMERA_LERP), T.CAMERA_ZOOM_FLOOR, T.CAMERA_ZOOM_CEIL);
-}
-
-function wrapAngle(a: number) {
-  // wrap to [-pi, pi]
-  a = (a + Math.PI) % TAU;
-  if (a < 0) a += TAU;
-  return a - Math.PI;
 }
 
 function formatNum(v: number) {
