@@ -100,7 +100,23 @@ const T = {
 
   // UI / Audio
   UI_FONT: "12px ui-monospace, Menlo, monospace",
-  MASTER_VOL: 0.55,                    // overall audio volume
+  MASTER_VOL: 0.95,                    // overall audio volume
+  AUDIO_DRONE_BUS_GAIN: 0.92,          // overall level of the sustained drone layer
+  AUDIO_SFX_BUS_GAIN: 0.9,             // procedural / one-shot SFX level
+  AUDIO_BACKGROUND_LEVEL: 0.51,        // base 216 Hz bed level (raised so it is clearly audible)
+  AUDIO_BACKGROUND_FILTER_HZ: 2400,    // tone color of the 216 Hz bed
+  AUDIO_ENEMY_GAIN_FAR: 0.014,         // minimum platonic-solid drone level, even out in the Oort cloud
+  AUDIO_ENEMY_GAIN_NEAR: 0.065,        // max platonic-solid drone level near Sol
+  AUDIO_ENEMY_GAIN_CURVE: 1.25,        // falloff shape: lower = louder farther out, higher = quieter until close
+  AUDIO_ENEMY_FILTER_FAR_HZ: 700,      // far-field tone color for platonic solids
+  AUDIO_ENEMY_FILTER_NEAR_HZ: 2800,    // near-field brightness for platonic solids
+  AUDIO_ENEMY_PAN_WORLD_WIDTH: 340,    // stereo pan spread relative to player position
+  AUDIO_ENEMY_DEVOLVE_GLISS_SEC: 0.24, // glide time when a solid collapses to a lower order
+  AUDIO_DOPPLER_SCALE: 0.0008,         // subtle pitch bend from radial motion relative to the player
+  AUDIO_MODE_MENU_DRONES: 0.55,        // drone bus multiplier in menu
+  AUDIO_MODE_PLAYING_DRONES: 1.0,      // drone bus multiplier while playing
+  AUDIO_MODE_PAUSED_DRONES: 0.38,      // drone bus multiplier while paused
+  AUDIO_MODE_TRANSITION_DRONES: 0.82,  // drone bus multiplier between waves
 };
 
 const TAU = Math.PI * 2;
@@ -242,6 +258,7 @@ type FuelBit = { pos: V2; vel: V2; life: number; hue: number; };
 type Shard = { pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
 
 type Enemy = {
+  id: string;
   pos: V2; vel: V2;
   ax: number; ay: number; az: number;
   r: number; hue: number;
@@ -261,31 +278,237 @@ type Level = {
   enemyKind: SolidKind;
 };
 
-// ===================== WEB AUDIO (WAVETABLE) =====================
+// ===================== WEB AUDIO (DRONES + SFX) =====================
+type GameMode = "menu" | "playing" | "paused" | "transition";
+
+const AUDIO = {
+  MASTER_GAIN: T.MASTER_VOL,
+  DRONE_BUS_GAIN: T.AUDIO_DRONE_BUS_GAIN,
+  SFX_BUS_GAIN: T.AUDIO_SFX_BUS_GAIN,
+  BUFFER_URL: "/static/audio/drone-432.wav",
+  BACKGROUND: {
+    PLAYBACK_RATE: 0.5,
+    GAIN: T.AUDIO_BACKGROUND_LEVEL,
+    PAN: 0,
+    FILTER_HZ: T.AUDIO_BACKGROUND_FILTER_HZ,
+  },
+  HARMONICS: {
+    tetra: 1.0,
+    cube: 1.5,
+    octa: 2.0,
+    dodeca: 2.5,
+    icosa: 3.0,
+  } as const,
+  ENEMY: {
+    MIN_GAIN: T.AUDIO_ENEMY_GAIN_FAR,
+    MAX_GAIN: T.AUDIO_ENEMY_GAIN_NEAR,
+    GAIN_CURVE_EXP: T.AUDIO_ENEMY_GAIN_CURVE,
+    PAN_WORLD_WIDTH: T.AUDIO_ENEMY_PAN_WORLD_WIDTH,
+    PAN_SMOOTH_SEC: 0.075,
+    GAIN_SMOOTH_SEC: 0.09,
+    FILTER_MIN_HZ: T.AUDIO_ENEMY_FILTER_FAR_HZ,
+    FILTER_MAX_HZ: T.AUDIO_ENEMY_FILTER_NEAR_HZ,
+    FILTER_SMOOTH_SEC: 0.1,
+    RATE_SMOOTH_SEC: 0.085,
+    DEVOLVE_GLISS_SEC: T.AUDIO_ENEMY_DEVOLVE_GLISS_SEC,
+    SPAWN_FADE_SEC: 0.18,
+    DEATH_FADE_SEC: 0.1,
+  },
+  DOPPLER: {
+    ENABLED: true,
+    SCALE: T.AUDIO_DOPPLER_SCALE,
+    MIN_FACTOR: 0.985,
+    MAX_FACTOR: 1.015,
+  },
+  THRUST: {
+    BASE_FREQ: 85,
+    FREQ_RANGE: 180,
+    BASE_FILTER: 380,
+    FILTER_RANGE: 1600,
+    GAIN_MAX: 0.16,
+  },
+  MODE: {
+    menu: T.AUDIO_MODE_MENU_DRONES,
+    playing: T.AUDIO_MODE_PLAYING_DRONES,
+    paused: T.AUDIO_MODE_PAUSED_DRONES,
+    transition: T.AUDIO_MODE_TRANSITION_DRONES,
+  } as const,
+  FALLBACK_BUFFER_SECONDS: 6,
+};
+
+class DroneVoice {
+  source: AudioBufferSourceNode | null = null;
+  filter: BiquadFilterNode;
+  gain: GainNode;
+  panner: StereoPannerNode;
+
+  constructor(private ctx: AudioContext, private buffer: AudioBuffer, output: AudioNode) {
+    this.filter = this.ctx.createBiquadFilter();
+    this.filter.type = "lowpass";
+    this.filter.frequency.value = AUDIO.ENEMY.FILTER_MAX_HZ;
+
+    this.gain = this.ctx.createGain();
+    this.gain.gain.value = 0;
+
+    this.panner = this.ctx.createStereoPanner();
+    this.panner.pan.value = 0;
+
+    this.filter.connect(this.gain);
+    this.gain.connect(this.panner);
+    this.panner.connect(output);
+  }
+
+  start(playbackRate: number, gain: number, pan: number, filterHz: number) {
+    if (this.source) return;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.buffer;
+    src.loop = true;
+    src.playbackRate.value = playbackRate;
+    src.connect(this.filter);
+    this.filter.frequency.value = filterHz;
+    this.gain.gain.value = gain;
+    this.panner.pan.value = pan;
+    src.start();
+    this.source = src;
+  }
+
+  setPlaybackRate(rate: number, ramp = AUDIO.ENEMY.RATE_SMOOTH_SEC) {
+    if (!this.source) return;
+    const now = this.ctx.currentTime;
+    const param = this.source.playbackRate;
+    const current = param.value;
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(current, now);
+    param.linearRampToValueAtTime(rate, now + Math.max(0.001, ramp));
+  }
+
+  setGain(value: number, ramp = AUDIO.ENEMY.GAIN_SMOOTH_SEC) {
+    const now = this.ctx.currentTime;
+    const param = this.gain.gain;
+    const current = param.value;
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(current, now);
+    param.linearRampToValueAtTime(Math.max(0.00001, value), now + Math.max(0.001, ramp));
+  }
+
+  setPan(value: number, ramp = AUDIO.ENEMY.PAN_SMOOTH_SEC) {
+    const now = this.ctx.currentTime;
+    const param = this.panner.pan;
+    const current = param.value;
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(current, now);
+    param.linearRampToValueAtTime(clamp(value, -1, 1), now + Math.max(0.001, ramp));
+  }
+
+  setFilterHz(value: number, ramp = AUDIO.ENEMY.FILTER_SMOOTH_SEC) {
+    const now = this.ctx.currentTime;
+    const param = this.filter.frequency;
+    const current = Math.max(20, param.value);
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(current, now);
+    param.linearRampToValueAtTime(Math.max(40, value), now + Math.max(0.001, ramp));
+  }
+
+  stop(fadeSec = AUDIO.ENEMY.DEATH_FADE_SEC) {
+    if (!this.source) return;
+    const now = this.ctx.currentTime;
+    const src = this.source;
+    const param = this.gain.gain;
+    const current = param.value;
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(Math.max(0.00001, current), now);
+    param.linearRampToValueAtTime(0.00001, now + Math.max(0.01, fadeSec));
+    try { src.stop(now + Math.max(0.02, fadeSec + 0.02)); } catch {}
+    this.source = null;
+  }
+}
+
+class EnemyDroneVoice {
+  voice: DroneVoice;
+  lastKind: SolidKind;
+
+  constructor(ctx: AudioContext, buffer: AudioBuffer, output: AudioNode, kind: SolidKind) {
+    this.voice = new DroneVoice(ctx, buffer, output);
+    this.lastKind = kind;
+    this.voice.start(AUDIO.HARMONICS[kind], 0.00001, 0, AUDIO.ENEMY.FILTER_MIN_HZ);
+  }
+
+  update(enemy: Enemy, player: { pos: V2; vel: V2 }, solRadius: number, oortOuter: number) {
+    const rel = enemy.pos.copy().sub(player.pos);
+    const relDist = Math.max(1, rel.len());
+    const relDir = rel.copy().mul(1 / relDist);
+    const relVel = enemy.vel.copy().sub(player.vel);
+    const radialSpeed = relVel.dot(relDir);
+    const doppler = AUDIO.DOPPLER.ENABLED
+      ? clamp(1 - radialSpeed * AUDIO.DOPPLER.SCALE, AUDIO.DOPPLER.MIN_FACTOR, AUDIO.DOPPLER.MAX_FACTOR)
+      : 1;
+
+    const baseRate = AUDIO.HARMONICS[enemy.kind];
+    const rate = baseRate * doppler;
+    const rateRamp = this.lastKind === enemy.kind ? AUDIO.ENEMY.RATE_SMOOTH_SEC : AUDIO.ENEMY.DEVOLVE_GLISS_SEC;
+    this.voice.setPlaybackRate(rate, rateRamp);
+    this.lastKind = enemy.kind;
+
+    const relX = enemy.pos.x - player.pos.x;
+    const pan = clamp(relX / AUDIO.ENEMY.PAN_WORLD_WIDTH, -1, 1);
+    this.voice.setPan(pan, AUDIO.ENEMY.PAN_SMOOTH_SEC);
+
+    const r = enemy.pos.len();
+    const t = 1 - clamp((r - solRadius) / Math.max(1, oortOuter - solRadius), 0, 1);
+    const shaped = Math.pow(t, AUDIO.ENEMY.GAIN_CURVE_EXP);
+    const gain = lerp(AUDIO.ENEMY.MIN_GAIN, AUDIO.ENEMY.MAX_GAIN, shaped);
+    const filterHz = lerp(AUDIO.ENEMY.FILTER_MIN_HZ, AUDIO.ENEMY.FILTER_MAX_HZ, t);
+    this.voice.setGain(gain, AUDIO.ENEMY.GAIN_SMOOTH_SEC);
+    this.voice.setFilterHz(filterHz, AUDIO.ENEMY.FILTER_SMOOTH_SEC);
+  }
+
+  stop() {
+    this.voice.stop(AUDIO.ENEMY.DEATH_FADE_SEC);
+  }
+}
+
 class AudioEngine {
   ctx: AudioContext | null = null;
   master: GainNode | null = null;
+  droneBus: GainNode | null = null;
+  sfxBus: GainNode | null = null;
 
   thrustOsc: OscillatorNode | null = null;
   thrustGain: GainNode | null = null;
   thrustFilter: BiquadFilterNode | null = null;
 
+  droneBuffer: AudioBuffer | null = null;
+  droneLoadPromise: Promise<AudioBuffer> | null = null;
+  backgroundVoice: DroneVoice | null = null;
+  enemyVoices = new Map<string, EnemyDroneVoice>();
+
   enabled = false;
   get ready() { return !!this.ctx && this.enabled; }
 
   init() {
-    if (this.ctx) return;
+    if (this.ctx) {
+      void this.ctx.resume();
+      return;
+    }
     const Ctx = (window.AudioContext || (window as any).webkitAudioContext);
     if (!Ctx) return;
     this.ctx = new Ctx();
+
     this.master = this.ctx.createGain();
-    this.master.gain.value = T.MASTER_VOL;
+    this.master.gain.value = AUDIO.MASTER_GAIN;
+
+    this.droneBus = this.ctx.createGain();
+    this.droneBus.gain.value = AUDIO.DRONE_BUS_GAIN * AUDIO.MODE.menu;
+
+    this.sfxBus = this.ctx.createGain();
+    this.sfxBus.gain.value = AUDIO.SFX_BUS_GAIN;
+
+    this.droneBus.connect(this.master);
+    this.sfxBus.connect(this.master);
     this.master.connect(this.ctx.destination);
 
-    // Wavetable (rich but not harsh)
     const real = new Float32Array(16);
     const imag = new Float32Array(16);
-    // odd harmonics with a gentle rolloff
     for (let i = 1; i < 16; i++) {
       const amp = 1 / (i * i * 0.9);
       real[i] = 0;
@@ -295,21 +518,75 @@ class AudioEngine {
 
     this.thrustOsc = this.ctx.createOscillator();
     this.thrustOsc.setPeriodicWave(wave);
-    this.thrustOsc.frequency.value = 90;
+    this.thrustOsc.frequency.value = AUDIO.THRUST.BASE_FREQ;
 
     this.thrustFilter = this.ctx.createBiquadFilter();
     this.thrustFilter.type = "lowpass";
-    this.thrustFilter.frequency.value = 600;
+    this.thrustFilter.frequency.value = AUDIO.THRUST.BASE_FILTER;
 
     this.thrustGain = this.ctx.createGain();
     this.thrustGain.gain.value = 0;
 
     this.thrustOsc.connect(this.thrustFilter);
     this.thrustFilter.connect(this.thrustGain);
-    this.thrustGain.connect(this.master);
-
+    this.thrustGain.connect(this.sfxBus);
     this.thrustOsc.start();
+
     this.enabled = true;
+    void this.ensureDroneBuffer().then(() => this.ensureBackgroundVoice());
+  }
+
+  async ensureDroneBuffer() {
+    if (this.droneBuffer) return this.droneBuffer;
+    if (!this.ctx) throw new Error("Audio context unavailable");
+    if (!this.droneLoadPromise) {
+      this.droneLoadPromise = this.loadDroneBuffer();
+    }
+    this.droneBuffer = await this.droneLoadPromise;
+    return this.droneBuffer;
+  }
+
+  private async loadDroneBuffer(): Promise<AudioBuffer> {
+    if (!this.ctx) throw new Error("Audio context unavailable");
+    try {
+      const res = await fetch(AUDIO.BUFFER_URL);
+      if (!res.ok) throw new Error(`Drone fetch failed: ${res.status}`);
+      const arr = await res.arrayBuffer();
+      return await this.ctx.decodeAudioData(arr.slice(0));
+    } catch {
+      return this.makeFallbackDroneBuffer();
+    }
+  }
+
+  private makeFallbackDroneBuffer() {
+    if (!this.ctx) throw new Error("Audio context unavailable");
+    const len = Math.floor(this.ctx.sampleRate * AUDIO.FALLBACK_BUFFER_SECONDS);
+    const buffer = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const ch = buffer.getChannelData(0);
+    for (let i = 0; i < len; i++) {
+      const t = i / this.ctx.sampleRate;
+      const env = 0.92 + 0.08 * Math.sin(TAU * 0.17 * t);
+      const s = (
+        Math.sin(TAU * 432 * t) * 0.58 +
+        Math.sin(TAU * 864 * t) * 0.17 +
+        Math.sin(TAU * 648 * t) * 0.11 +
+        Math.sin(TAU * 1080 * t) * 0.06 +
+        Math.sin(TAU * 216 * t) * 0.08
+      ) * env;
+      ch[i] = s * 0.35;
+    }
+    return buffer;
+  }
+
+  private ensureBackgroundVoice() {
+    if (!this.ctx || !this.droneBus || !this.droneBuffer || this.backgroundVoice) return;
+    this.backgroundVoice = new DroneVoice(this.ctx, this.droneBuffer, this.droneBus);
+    this.backgroundVoice.start(
+      AUDIO.BACKGROUND.PLAYBACK_RATE,
+      AUDIO.BACKGROUND.GAIN,
+      AUDIO.BACKGROUND.PAN,
+      AUDIO.BACKGROUND.FILTER_HZ,
+    );
   }
 
   setMaster(v: number) {
@@ -317,19 +594,62 @@ class AudioEngine {
     this.master.gain.value = clamp(v, 0, 1);
   }
 
+  setMode(mode: GameMode) {
+    if (!this.ctx || !this.droneBus) return;
+    const now = this.ctx.currentTime;
+    const target = AUDIO.DRONE_BUS_GAIN * AUDIO.MODE[mode];
+    const param = this.droneBus.gain;
+    const current = param.value;
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(current, now);
+    param.linearRampToValueAtTime(target, now + 0.12);
+  }
+
+  updateDrones(mode: GameMode, enemies: Enemy[], player: { pos: V2; vel: V2 }, solRadius: number, oortOuter: number) {
+    if (!this.ctx || !this.droneBus || !this.enabled) return;
+    this.setMode(mode);
+    if (!this.droneBuffer) {
+      void this.ensureDroneBuffer().then(() => this.ensureBackgroundVoice());
+      return;
+    }
+    this.ensureBackgroundVoice();
+
+    const liveIds = new Set(enemies.map((e) => e.id));
+    for (const enemy of enemies) {
+      let voice = this.enemyVoices.get(enemy.id);
+      if (!voice) {
+        voice = new EnemyDroneVoice(this.ctx, this.droneBuffer, this.droneBus, enemy.kind);
+        this.enemyVoices.set(enemy.id, voice);
+      }
+      voice.update(enemy, player, solRadius, oortOuter);
+    }
+
+    for (const [id, voice] of this.enemyVoices.entries()) {
+      if (!liveIds.has(id)) {
+        voice.stop();
+        this.enemyVoices.delete(id);
+      }
+    }
+  }
+
+  clearEnemyDrones() {
+    for (const voice of this.enemyVoices.values()) voice.stop();
+    this.enemyVoices.clear();
+  }
+
   setThrust(amount01: number) {
     if (!this.ctx || !this.thrustOsc || !this.thrustGain || !this.thrustFilter) return;
     const t = this.ctx.currentTime;
     const a = clamp(amount01, 0, 1);
-    const freq = 85 + a * 180;
-    const cutoff = 380 + a * 1600;
+    const freq = AUDIO.THRUST.BASE_FREQ + a * AUDIO.THRUST.FREQ_RANGE;
+    const cutoff = AUDIO.THRUST.BASE_FILTER + a * AUDIO.THRUST.FILTER_RANGE;
     this.thrustOsc.frequency.setTargetAtTime(freq, t, 0.02);
     this.thrustFilter.frequency.setTargetAtTime(cutoff, t, 0.02);
-    this.thrustGain.gain.setTargetAtTime(a * 0.22, t, 0.03);
+    this.thrustGain.gain.setTargetAtTime(a * AUDIO.THRUST.GAIN_MAX, t, 0.03);
   }
 
   blip(freq: number, dur = 0.06, gain = 0.18) {
-    if (!this.ctx || !this.master) return;
+    if (!this.ctx || !this.sfxBus) return;
     const t0 = this.ctx.currentTime;
     const osc = this.ctx.createOscillator();
     osc.type = "triangle";
@@ -340,13 +660,13 @@ class AudioEngine {
     g.gain.linearRampToValueAtTime(gain, t0 + 0.005);
     g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
 
-    osc.connect(g); g.connect(this.master);
+    osc.connect(g); g.connect(this.sfxBus);
     osc.start(t0);
     osc.stop(t0 + dur + 0.02);
   }
 
   noiseBurst(dur = 0.12, gain = 0.16, hp = 700) {
-    if (!this.ctx || !this.master) return;
+    if (!this.ctx || !this.sfxBus) return;
     const t0 = this.ctx.currentTime;
     const buf = this.ctx.createBuffer(1, Math.floor(this.ctx.sampleRate * dur), this.ctx.sampleRate);
     const ch = buf.getChannelData(0);
@@ -363,7 +683,7 @@ class AudioEngine {
     g.gain.setValueAtTime(gain, t0);
     g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
 
-    src.connect(filter); filter.connect(g); g.connect(this.master);
+    src.connect(filter); filter.connect(g); g.connect(this.sfxBus);
     src.start(t0);
     src.stop(t0 + dur + 0.02);
   }
@@ -376,6 +696,7 @@ class AudioEngine {
   stop() {
     if (!this.ctx) return;
     try { this.thrustGain?.gain.setValueAtTime(0, this.ctx.currentTime); } catch {}
+    this.clearEnemyDrones();
   }
 }
 
@@ -395,7 +716,7 @@ export default function MetatronVectorFOIL() {
     gravity: T.GRAVITY_GM,
     thrust: T.THRUST_FORCE,
     trail: T.TRAIL_SAMPLES,
-    master: T.MASTER_VOL,
+    master: AUDIO.MASTER_GAIN,
     solar: T.SOLAR_PRESSURE,
   });
 
@@ -405,7 +726,11 @@ export default function MetatronVectorFOIL() {
   // Keep slider values available inside the loop without rerenders
   const slidersRef = useRef(sliders);
   useEffect(() => { slidersRef.current = sliders; audioRef.current.setMaster(sliders.master); }, [sliders]);
-  useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => {
+    modeRef.current = mode;
+    audioRef.current.setMode(mode);
+    if (mode !== "playing") audioRef.current.setThrust(0);
+  }, [mode]);
   useEffect(() => { levelIdxRef.current = levelIdx; }, [levelIdx]);
   useEffect(() => { togglesRef.current = toggles; }, [toggles]);
 
@@ -479,6 +804,8 @@ export default function MetatronVectorFOIL() {
     const onKeyUp = (e: KeyboardEvent) => { keys.delete(e.key); };
     window.addEventListener("keydown", onKeyDown, { passive: false });
     window.addEventListener("keyup", onKeyUp);
+    const onPointerDown = () => audioRef.current.init();
+    window.addEventListener("pointerdown", onPointerDown, { passive: true });
 
     // ---- world ----
     const metaRadius = T.META_RADIUS;
@@ -502,6 +829,7 @@ export default function MetatronVectorFOIL() {
 
     const bullets: Bullet[] = [];
     const enemies: Enemy[] = [];
+    let nextEnemyId = 1;
     const shards: Shard[] = [];
     const fuelBits: FuelBit[] = [];
     const trail: V2[] = [];
@@ -536,8 +864,10 @@ export default function MetatronVectorFOIL() {
       player.fuel = T.FUEL_MAX;
       player.stuckTime = 0;
       gunCD = 0;
+      nextEnemyId = 1;
       metaAx = 0; metaAy = 0; metaAz = 0;
       audioRef.current.stop();
+      audioRef.current.setMode(toMenu ? "menu" : "playing");
       levelIdxRef.current = 0;
       setLevelIdx(0);
       queueWaveBanner(0);
@@ -594,6 +924,7 @@ export default function MetatronVectorFOIL() {
       const vel = V2.fromAngle(a + Math.PI / 2, rand(T.ENEMY_SPEED * 0.6, T.ENEMY_SPEED * 1.1) * speedScale);
       const r = rand(12, 22);
       return {
+        id: `enemy-${nextEnemyId++}`,
         pos,
         vel,
         ax: rand(0, TAU),
@@ -818,6 +1149,8 @@ export default function MetatronVectorFOIL() {
         metaAz += spin * dt;
         metaAx += spin * 0.6 * dt;
         metaAy += spin * 0.4 * dt;
+        audioRef.current.updateDrones(modeRef.current as GameMode, enemies, player, T.STAR_RADIUS, oortOuter);
+        audioRef.current.setThrust(0);
         return;
       }
 
@@ -1032,6 +1365,7 @@ export default function MetatronVectorFOIL() {
       // camera (center stays on star; zoom guarantees ship in view)
       updateCamera(camera, canvas, dpr, player.pos, player.vel, horizonR);
       // audio continuous
+      audioRef.current.updateDrones(modeRef.current as GameMode, enemies, player, T.STAR_RADIUS, oortOuter);
       audioRef.current.setThrust(Math.max(0, player.thrust) * (player.fuel > 0 ? 1 : 0));
     };
 
@@ -1069,6 +1403,7 @@ export default function MetatronVectorFOIL() {
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onKeyDown as any);
       window.removeEventListener("keyup", onKeyUp as any);
+      window.removeEventListener("pointerdown", onPointerDown as any);
       audioRef.current.stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
