@@ -44,7 +44,7 @@ const T = {
 
   // Camera
   CAMERA_LERP: 0.14,                   // camera zoom smoothing
-  CAMERA_ZOOM_FLOOR: 0.025,            // min zoom so scene never vanishes
+  CAMERA_ZOOM_FLOOR: 0.125,            // min zoom so scene never vanishes
   CAMERA_ZOOM_CEIL: 3.0,               // max zoom to avoid jitter
   CAMERA_PAD_PX: 56,                   // screen-space padding for keep-in-view
   CAMERA_AESTHETIC: 0.55,              // blend weight toward aesthetic zoom (0..1)
@@ -67,22 +67,24 @@ const T = {
   ENEMY_SPAWN_BASE: 0.9,               // base spawn interval
   ENEMY_SPAWN_MIN: 0.35,               // minimum spawn interval at higher levels
   ENEMY_SPEED: 140,                    // base enemy drift speed
-  ENEMY_SPAWN_RADIUS_INNER_MULT: 1.2,  // enemy spawn shell inner radius, measured from Oort outer edge
-  ENEMY_SPAWN_RADIUS_OUTER_MULT: 1.6,  // enemy spawn shell outer radius, measured from Oort outer edge
-  ENEMY_STEER: 180,                    // pursuit acceleration
-  ENEMY_ORBIT_BIAS: 0.55,              // tendency to orbit rather than beeline
+  ENEMY_SPAWN_RADIUS_INNER_MULT: 1.6,  // enemy spawn shell inner radius, measured from Oort outer edge
+  ENEMY_SPAWN_RADIUS_OUTER_MULT: 1.9,  // enemy spawn shell outer radius, measured from Oort outer edge
+  ENEMY_STEER: 180,                    // inward acceleration toward Sol
+  ENEMY_ORBIT_BIAS: 0.55,              // tendency to spiral rather than beeline
+  ENEMY_PLAYER_BIAS: 0.18,             // slight ship-seeking influence while still diving inward
+  ENEMY_GRAVITY_MULT: 1.1,             // extra stellar pull on enemies
   ENEMY_HIT_RADIUS_MULT: 1.25,         // player collision radius multiplier against enemies
   ENEMY_COLLAPSE_RATE: 1.25,           // solid downgrade morph speed
   SHIP_HIT_RADIUS: 10,                 // player hit radius
   SHARD_HIT_RADIUS_PAD: 2.5,           // extra shard collision padding
-  SHRAPNEL_COUNT_MIN: 6,               // min shrapnel on hit
-  SHRAPNEL_COUNT_MAX: 14,              // max shrapnel on hit
-  SHRAPNEL_SPEED_MIN: 240,             // shrapnel speed min
-  SHRAPNEL_SPEED_MAX: 560,             // shrapnel speed max
-  SHRAPNEL_GRAVITY_MULT: 1.0,          // shard gravity multiplier
+  SHRAPNEL_COUNT_MIN: 2,               // min shrapnel on hit
+  SHRAPNEL_COUNT_MAX: 8,              // max shrapnel on hit
+  SHRAPNEL_SPEED_MIN: 120,             // shrapnel speed min
+  SHRAPNEL_SPEED_MAX: 300,             // shrapnel speed max
+  SHRAPNEL_GRAVITY_MULT: 4.0,          // shard gravity multiplier
   SHRAPNEL_PARENT_VEL: 0.6,            // how much parent velocity shards inherit
-  SHRAPNEL_LIFE_MIN: 0.9,              // shrapnel life min
-  SHRAPNEL_LIFE_MAX: 1.9,              // shrapnel life max
+  SHRAPNEL_LIFE_MIN: 1.9,              // shrapnel life min
+  SHRAPNEL_LIFE_MAX: 10.9,              // shrapnel life max
 
   // Metatron animation
   META_BASE_SPIN: 0.22,                // base spin
@@ -761,9 +763,13 @@ export default function MetatronVectorFOIL() {
       return true;
     };
 
-    const killPlayer = () => {
+    const loseRun = () => {
       audioRef.current.explode();
       resetRun(false);
+    };
+
+    const killPlayer = () => {
+      loseRun();
     };
 
     const settleFuelBitsFromShards = (dt: number) => {
@@ -897,19 +903,26 @@ export default function MetatronVectorFOIL() {
       for (let i = enemies.length - 1; i >= 0; i--) {
         const e = enemies[i];
 
+        const toStar = e.pos.copy().mul(-1);
+        const starDist = Math.max(1, toStar.len());
+        const starDir = toStar.copy().mul(1 / starDist);
+        const starTang = starDir.copy().rot(Math.PI / 2);
+
         const toShip = player.pos.copy().sub(e.pos);
-        const d = Math.max(1, toShip.len());
-        const dir = toShip.copy().mul(1 / d);
-        const tang = dir.copy().rot(Math.PI / 2);
+        const shipDist = Math.max(1, toShip.len());
+        const shipDir = toShip.copy().mul(1 / shipDist);
 
-        // pursuit + orbit bias (gives nice arcs)
-        const orbit = tang.mul(T.ENEMY_STEER * T.ENEMY_ORBIT_BIAS);
-        const chase = dir.mul(T.ENEMY_STEER * (1 - T.ENEMY_ORBIT_BIAS));
-        e.vel.add(chase.mul(dt));
-        e.vel.add(orbit.mul(dt * (0.6 + 0.4 * Math.sin(e.ax + e.ay))));
+        // primary behavior: fall toward Sol in a spiraling path, with only a slight bias toward the ship
+        const spiralSign = Math.sin(e.ax + e.ay) >= 0 ? 1 : -1;
+        const inward = starDir.copy().mul(T.ENEMY_STEER * (1 - T.ENEMY_ORBIT_BIAS));
+        const orbit = starTang.mul(spiralSign * T.ENEMY_STEER * T.ENEMY_ORBIT_BIAS);
+        const shipBias = shipDir.mul(T.ENEMY_STEER * T.ENEMY_PLAYER_BIAS);
+        e.vel.add(inward.mul(dt));
+        e.vel.add(orbit.mul(dt * (0.7 + 0.3 * Math.cos(e.az))));
+        e.vel.add(shipBias.mul(dt));
 
-        // mild gravity
-        e.vel.add(gravityAt(e.pos, lvl.gravityGM * 0.55).mul(dt));
+        // stellar gravity keeps them diving inward instead of simply crossing the centerline ballistically
+        e.vel.add(gravityAt(e.pos, lvl.gravityGM * T.ENEMY_GRAVITY_MULT).mul(dt));
 
         e.vel.mul(0.999);
         e.pos.add(e.vel.copy().mul(dt));
@@ -934,6 +947,12 @@ export default function MetatronVectorFOIL() {
         const enemyHitR = Math.max(8, e.r * T.ENEMY_HIT_RADIUS_MULT);
         if (toPlayer.len() <= T.SHIP_HIT_RADIUS + enemyHitR) {
           killPlayer();
+          return;
+        }
+
+        const starLossR = T.STAR_RADIUS + e.r * 0.4;
+        if (e.pos.len() <= starLossR) {
+          loseRun();
           return;
         }
 
