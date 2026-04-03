@@ -67,6 +67,8 @@ const T = {
   ENEMY_SPAWN_BASE: 0.9,               // base spawn interval
   ENEMY_SPAWN_MIN: 0.35,               // minimum spawn interval at higher levels
   ENEMY_SPEED: 140,                    // base enemy drift speed
+  ENEMY_SPAWN_RADIUS_INNER_MULT: 1.2,  // enemy spawn shell inner radius, measured from Oort outer edge
+  ENEMY_SPAWN_RADIUS_OUTER_MULT: 1.6,  // enemy spawn shell outer radius, measured from Oort outer edge
   ENEMY_STEER: 180,                    // pursuit acceleration
   ENEMY_ORBIT_BIAS: 0.55,              // tendency to orbit rather than beeline
   ENEMY_HIT_RADIUS_MULT: 1.25,         // player collision radius multiplier against enemies
@@ -566,7 +568,10 @@ export default function MetatronVectorFOIL() {
 
     const spawnEnemy = (lvl: Level) => {
       const a = rand(0, TAU);
-      const rOrbit = rand(horizonR * 1.0, horizonR * 1.25);
+      const rOrbit = rand(
+        oortOuter * T.ENEMY_SPAWN_RADIUS_INNER_MULT,
+        oortOuter * T.ENEMY_SPAWN_RADIUS_OUTER_MULT,
+      );
       const pos = new V2(Math.cos(a) * rOrbit, Math.sin(a) * rOrbit);
       const vel = V2.fromAngle(a + Math.PI / 2, rand(T.ENEMY_SPEED * 0.6, T.ENEMY_SPEED * 1.1));
       const spawnKinds: SolidKind[] = ["cube", "octa", "dodeca", "icosa", "icosa"];
