@@ -56,9 +56,9 @@ const T = {
   DEBUG_TEXT: true,                    // show debug overlay toggle default
 
   // Weapons
-  FIRE_RATE: 0.12,                     // seconds between shots
-  BULLET_SPEED: 1200,                  // bullet speed
-  BULLET_LIFE: 2.2,                    // bullet lifetime seconds
+  FIRE_RATE: 0.32,                     // seconds between shots
+  BULLET_SPEED: 800,                  // bullet speed
+  BULLET_LIFE: 4.2,                    // bullet lifetime seconds
   BULLET_RADIUS: 4.0,                  // bullet collision radius against wireframe edges
   BULLET_TAIL: 0.024,                  // tail length factor
 
@@ -66,11 +66,11 @@ const T = {
   ENEMY_MAX: 5,                        // max enemies on screen
   ENEMY_SPAWN_BASE: 0.9,               // base spawn interval
   ENEMY_SPAWN_MIN: 0.35,               // minimum spawn interval at higher levels
-  ENEMY_SPEED: 140,                    // base enemy drift speed
+  ENEMY_SPEED: 100,                    // base enemy drift speed
   ENEMY_SPAWN_RADIUS_INNER_MULT: 1.6,  // enemy spawn shell inner radius, measured from Oort outer edge
   ENEMY_SPAWN_RADIUS_OUTER_MULT: 1.9,  // enemy spawn shell outer radius, measured from Oort outer edge
-  ENEMY_STEER: 180,                    // inward acceleration toward Sol
-  ENEMY_ORBIT_BIAS: 0.55,              // tendency to spiral rather than beeline
+  ENEMY_STEER: 140,                    // inward acceleration toward Sol
+  ENEMY_ORBIT_BIAS: 0.75,              // tendency to spiral rather than beeline
   ENEMY_PLAYER_BIAS: 0.18,             // slight ship-seeking influence while still diving inward
   ENEMY_GRAVITY_MULT: 1.1,             // extra stellar pull on enemies
   ENEMY_HIT_RADIUS_MULT: 1.25,         // player collision radius multiplier against enemies
@@ -87,10 +87,10 @@ const T = {
   SHRAPNEL_LIFE_MAX: 10.9,              // shrapnel life max
 
   // Metatron animation
-  META_BASE_SPIN: 0.22,                // base spin
-  META_SPIN_GAIN: 0.22,                // spin increases with distance
+  META_BASE_SPIN: 0.06,                // base spin
+  META_SPIN_GAIN: 0.32,                // spin increases with distance
   META_DWELL: 0.82,                    // dwell damping toward readable pose
-  META_SPHERE_PULSE: 6.0,              // seconds per pulse
+  META_SPHERE_PULSE: 8.0,              // seconds per pulse
   META_SPHERE_CHANCE: 0.16,            // chance a circle becomes a "sphere"
 
   // Door / progression
@@ -101,22 +101,39 @@ const T = {
   // UI / Audio
   UI_FONT: "12px ui-monospace, Menlo, monospace",
   MASTER_VOL: 0.95,                    // overall audio volume
-  AUDIO_DRONE_BUS_GAIN: 0.92,          // overall level of the sustained drone layer
+  AUDIO_DRONE_BUS_GAIN: 0.72,          // overall level of the sustained drone layer
   AUDIO_SFX_BUS_GAIN: 0.9,             // procedural / one-shot SFX level
   AUDIO_BACKGROUND_LEVEL: 0.51,        // base 216 Hz bed level (raised so it is clearly audible)
   AUDIO_BACKGROUND_FILTER_HZ: 2400,    // tone color of the 216 Hz bed
-  AUDIO_ENEMY_GAIN_FAR: 0.014,         // minimum platonic-solid drone level, even out in the Oort cloud
+  AUDIO_ENEMY_GAIN_FAR: 0.024,         // minimum platonic-solid drone level, even out in the Oort cloud
   AUDIO_ENEMY_GAIN_NEAR: 0.065,        // max platonic-solid drone level near Sol
   AUDIO_ENEMY_GAIN_CURVE: 1.25,        // falloff shape: lower = louder farther out, higher = quieter until close
   AUDIO_ENEMY_FILTER_FAR_HZ: 700,      // far-field tone color for platonic solids
   AUDIO_ENEMY_FILTER_NEAR_HZ: 2800,    // near-field brightness for platonic solids
   AUDIO_ENEMY_PAN_WORLD_WIDTH: 340,    // stereo pan spread relative to player position
-  AUDIO_ENEMY_DEVOLVE_GLISS_SEC: 0.24, // glide time when a solid collapses to a lower order
-  AUDIO_DOPPLER_SCALE: 0.0008,         // subtle pitch bend from radial motion relative to the player
-  AUDIO_MODE_MENU_DRONES: 0.55,        // drone bus multiplier in menu
+  AUDIO_ENEMY_DEVOLVE_GLISS_SEC: 0.34, // glide time when a solid collapses to a lower order
+  AUDIO_DOPPLER_SCALE: 0.0012,         // subtle pitch bend from radial motion relative to the player
+  AUDIO_MODE_MENU_DRONES: 0.35,        // drone bus multiplier in menu
   AUDIO_MODE_PLAYING_DRONES: 1.0,      // drone bus multiplier while playing
   AUDIO_MODE_PAUSED_DRONES: 0.38,      // drone bus multiplier while paused
   AUDIO_MODE_TRANSITION_DRONES: 0.82,  // drone bus multiplier between waves
+
+  AUDIO_THRUST_URL: "/static/audio/thrust.wav",
+  AUDIO_BLASTER_URL: "/static/audio/blaster-fire.wav",
+  AUDIO_SHIP_DESTROYED_URL: "/static/audio/ship-destroyed.wav",
+  AUDIO_SOL_DESTROYED_URL: "/static/audio/sol-destroyed.wav",
+  AUDIO_NEXT_WAVE_URL: "/static/audio/next-wave.wav",
+
+  AUDIO_THRUST_SAMPLE_GAIN: 0.18,      // level of looped thrust.wav when present
+  AUDIO_THRUST_RATE_MIN: 0.92,         // idle playback rate for thrust.wav
+  AUDIO_THRUST_RATE_MAX: 1.24,         // full-thrust playback rate for thrust.wav
+  AUDIO_THRUST_FILTER_MIN_HZ: 420,     // idle filter for thrust.wav
+  AUDIO_THRUST_FILTER_MAX_HZ: 2400,    // full-thrust filter for thrust.wav
+
+  AUDIO_BLASTER_GAIN: 0.08,            // one-shot gain for blaster-fire.wav
+  AUDIO_SHIP_DESTROYED_GAIN: 0.12,     // one-shot gain for ship-destroyed.wav
+  AUDIO_SOL_DESTROYED_GAIN: 0.45,      // one-shot gain for sol-destroyed.wav
+  AUDIO_NEXT_WAVE_GAIN: 0.14,           // one-shot gain for next-wave.wav
 };
 
 const TAU = Math.PI * 2;
@@ -477,6 +494,19 @@ class AudioEngine {
   thrustGain: GainNode | null = null;
   thrustFilter: BiquadFilterNode | null = null;
 
+  thrustSampleSrc: AudioBufferSourceNode | null = null;
+  thrustSampleGain: GainNode | null = null;
+  thrustSampleFilter: BiquadFilterNode | null = null;
+
+  sampleBuffers: Record<"thrust" | "blaster" | "shipDestroyed" | "solDestroyed" | "nextWave", AudioBuffer | null> = {
+    thrust: null,
+    blaster: null,
+    shipDestroyed: null,
+    solDestroyed: null,
+    nextWave: null,
+  };
+  sampleLoads = new Set<"thrust" | "blaster" | "shipDestroyed" | "solDestroyed" | "nextWave">();
+
   droneBuffer: AudioBuffer | null = null;
   droneLoadPromise: Promise<AudioBuffer> | null = null;
   backgroundVoice: DroneVoice | null = null;
@@ -487,7 +517,7 @@ class AudioEngine {
 
   init() {
     if (this.ctx) {
-      void this.ctx.resume();
+      if (this.ctx.state === "suspended") void this.ctx.resume();
       return;
     }
     const Ctx = (window.AudioContext || (window as any).webkitAudioContext);
@@ -534,6 +564,12 @@ class AudioEngine {
 
     this.enabled = true;
     void this.ensureDroneBuffer().then(() => this.ensureBackgroundVoice());
+
+    this.loadSample("thrust", T.AUDIO_THRUST_URL);
+    this.loadSample("blaster", T.AUDIO_BLASTER_URL);
+    this.loadSample("shipDestroyed", T.AUDIO_SHIP_DESTROYED_URL);
+    this.loadSample("solDestroyed", T.AUDIO_SOL_DESTROYED_URL);
+    this.loadSample("nextWave", T.AUDIO_NEXT_WAVE_URL);
   }
 
   async ensureDroneBuffer() {
@@ -589,6 +625,67 @@ class AudioEngine {
     );
   }
 
+  private loadSample(key: keyof AudioEngine["sampleBuffers"], url: string) {
+    if (!this.ctx || this.sampleBuffers[key] || this.sampleLoads.has(key)) return;
+    this.sampleLoads.add(key);
+    fetch(url)
+      .then((r) => {
+        if (!r.ok) throw new Error(`sample ${key} not found`);
+        return r.arrayBuffer();
+      })
+      .then((buf) => this.ctx!.decodeAudioData(buf))
+      .then((decoded) => {
+        this.sampleBuffers[key] = decoded;
+        if (key === "thrust") this.ensureThrustSampleLoop();
+      })
+      .catch(() => {})
+      .finally(() => this.sampleLoads.delete(key));
+  }
+
+  private ensureThrustSampleLoop() {
+    if (!this.ctx || !this.sfxBus || this.thrustSampleSrc || !this.sampleBuffers.thrust) return;
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.sampleBuffers.thrust;
+    src.loop = true;
+    src.playbackRate.value = T.AUDIO_THRUST_RATE_MIN;
+
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = T.AUDIO_THRUST_FILTER_MIN_HZ;
+
+    const gain = this.ctx.createGain();
+    gain.gain.value = 0;
+
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.sfxBus);
+    src.start();
+
+    this.thrustSampleSrc = src;
+    this.thrustSampleFilter = filter;
+    this.thrustSampleGain = gain;
+  }
+
+  private playSample(key: keyof AudioEngine["sampleBuffers"], gainValue = 0.2, playbackRate = 1): boolean {
+    if (!this.ctx || !this.sfxBus) return false;
+    const buf = this.sampleBuffers[key];
+    if (!buf) return false;
+
+    const t0 = this.ctx.currentTime;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = playbackRate;
+
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(gainValue, t0);
+
+    src.connect(g);
+    g.connect(this.sfxBus);
+    src.start(t0);
+    return true;
+  }
+
   setMaster(v: number) {
     if (!this.master) return;
     this.master.gain.value = clamp(v, 0, 1);
@@ -638,9 +735,23 @@ class AudioEngine {
   }
 
   setThrust(amount01: number) {
-    if (!this.ctx || !this.thrustOsc || !this.thrustGain || !this.thrustFilter) return;
+    if (!this.ctx) return;
     const t = this.ctx.currentTime;
     const a = clamp(amount01, 0, 1);
+
+    this.ensureThrustSampleLoop();
+
+    if (this.thrustSampleSrc && this.thrustSampleGain && this.thrustSampleFilter) {
+      const rate = lerp(T.AUDIO_THRUST_RATE_MIN, T.AUDIO_THRUST_RATE_MAX, a);
+      const cutoff = lerp(T.AUDIO_THRUST_FILTER_MIN_HZ, T.AUDIO_THRUST_FILTER_MAX_HZ, a);
+      this.thrustSampleSrc.playbackRate.setTargetAtTime(rate, t, 0.03);
+      this.thrustSampleFilter.frequency.setTargetAtTime(cutoff, t, 0.03);
+      this.thrustSampleGain.gain.setTargetAtTime(a * T.AUDIO_THRUST_SAMPLE_GAIN, t, 0.04);
+      if (this.thrustGain) this.thrustGain.gain.setTargetAtTime(0, t, 0.02);
+      return;
+    }
+
+    if (!this.thrustOsc || !this.thrustGain || !this.thrustFilter) return;
     const freq = AUDIO.THRUST.BASE_FREQ + a * AUDIO.THRUST.FREQ_RANGE;
     const cutoff = AUDIO.THRUST.BASE_FILTER + a * AUDIO.THRUST.FILTER_RANGE;
     this.thrustOsc.frequency.setTargetAtTime(freq, t, 0.02);
@@ -688,14 +799,40 @@ class AudioEngine {
     src.stop(t0 + dur + 0.02);
   }
 
-  shoot() { this.blip(880, 0.05, 0.16); }
+  shoot() {
+    if (!this.playSample("blaster", T.AUDIO_BLASTER_GAIN)) this.blip(880, 0.05, 0.16);
+  }
   hit() { this.noiseBurst(0.14, 0.22, 520); this.blip(220, 0.12, 0.14); }
-  levelUp() { this.blip(660, 0.08, 0.16); this.blip(990, 0.10, 0.14); }
-  explode() { this.noiseBurst(0.32, 0.35, 240); this.blip(110, 0.25, 0.18); }
+  nextWave() {
+    if (!this.playSample("nextWave", T.AUDIO_NEXT_WAVE_GAIN)) {
+      this.blip(660, 0.08, 0.16);
+      this.blip(990, 0.10, 0.14);
+    }
+  }
+  levelUp() { this.nextWave(); }
+  shipDestroyed() {
+    if (!this.playSample("shipDestroyed", T.AUDIO_SHIP_DESTROYED_GAIN)) {
+      this.noiseBurst(0.32, 0.35, 240);
+      this.blip(110, 0.25, 0.18);
+    }
+  }
+  solDestroyed() {
+    if (!this.playSample("solDestroyed", T.AUDIO_SOL_DESTROYED_GAIN)) {
+      this.noiseBurst(0.42, 0.45, 180);
+      this.blip(72, 0.35, 0.22);
+    }
+  }
+  explode() { this.shipDestroyed(); }
 
   stop() {
     if (!this.ctx) return;
-    try { this.thrustGain?.gain.setValueAtTime(0, this.ctx.currentTime); } catch {}
+    const t = this.ctx.currentTime;
+    try { this.thrustGain?.gain.setTargetAtTime(0, t, 0.02); } catch {}
+    try { this.thrustSampleGain?.gain.setTargetAtTime(0, t, 0.03); } catch {}
+    try { this.thrustSampleSrc?.stop(t + 0.06); } catch {}
+    this.thrustSampleSrc = null;
+    this.thrustSampleGain = null;
+    this.thrustSampleFilter = null;
     this.clearEnemyDrones();
   }
 }
@@ -1094,13 +1231,14 @@ export default function MetatronVectorFOIL() {
       return true;
     };
 
-    const loseRun = () => {
-      audioRef.current.explode();
+    const loseRun = (reason: "ship" | "sol" = "ship") => {
+      if (reason === "sol") audioRef.current.solDestroyed();
+      else audioRef.current.shipDestroyed();
       resetRun(false);
     };
 
     const killPlayer = () => {
-      loseRun();
+      loseRun("ship");
     };
 
     const settleFuelBitsFromShards = (dt: number) => {
@@ -1200,8 +1338,7 @@ export default function MetatronVectorFOIL() {
       if (dStar < T.STAR_TRAP_RADIUS && player.vel.len() < 120) {
         player.stuckTime += dt;
         if (player.stuckTime >= T.STAR_TRAP_TIME) {
-          audioRef.current.explode();
-          resetRun(false);
+          loseRun("ship");
           return;
         }
       } else {
@@ -1285,7 +1422,7 @@ export default function MetatronVectorFOIL() {
 
         const starLossR = T.STAR_RADIUS + e.r * 0.4;
         if (e.pos.len() <= starLossR) {
-          loseRun();
+          loseRun("sol");
           return;
         }
 
