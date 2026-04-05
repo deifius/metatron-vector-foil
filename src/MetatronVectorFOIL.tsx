@@ -56,42 +56,61 @@ const T = {
   DEBUG_TEXT: true,                    // show debug overlay toggle default
 
   // Weapons
-  FIRE_RATE: 0.12,                     // seconds between shots
-  BULLET_SPEED: 1200,                  // bullet speed
-  BULLET_LIFE: 2.2,                    // bullet lifetime seconds
+  FIRE_RATE: 0.22,                     // seconds between shots
+  BULLET_SPEED: 500,                  // bullet speed
+  BULLET_LIFE: 8.2,                    // bullet lifetime seconds
   BULLET_RADIUS: 4.0,                  // bullet collision radius against wireframe edges
   BULLET_TAIL: 0.024,                  // tail length factor
+  BULLET_MASS: 2.0,                    // 0 = energy weapon (no gravity), 1 = baseline ballistic slug
+
+  SHIP_RESILIENCE: 6,                  // number of hits the ship can take before destruction; 1 = first hit kills
+  SHIP_HIT_IFRAME_SEC: 0.45,           // brief invulnerability so resilience is meaningful
+  SHIP_HIT_KNOCKBACK: 180,             // impulse away from the impact source
 
   // Enemies
   ENEMY_MAX: 5,                        // max enemies on screen
   ENEMY_SPAWN_BASE: 0.9,               // base spawn interval
   ENEMY_SPAWN_MIN: 0.35,               // minimum spawn interval at higher levels
-  ENEMY_SPEED: 140,                    // base enemy drift speed
-  ENEMY_SPAWN_RADIUS_INNER_MULT: 1.6,  // enemy spawn shell inner radius, measured from Oort outer edge
+  ENEMY_SPEED: 60,                    // base enemy drift speed
+  ENEMY_SPAWN_RADIUS_INNER_MULT: 1.7,  // enemy spawn shell inner radius, measured from Oort outer edge
   ENEMY_SPAWN_RADIUS_OUTER_MULT: 1.9,  // enemy spawn shell outer radius, measured from Oort outer edge
-  ENEMY_STEER: 180,                    // inward acceleration toward Sol
-  ENEMY_ORBIT_BIAS: 0.55,              // tendency to spiral rather than beeline
+  ENEMY_STEER: 140,                    // inward acceleration toward Sol
+  ENEMY_ORBIT_BIAS: 0.95,              // tendency to spiral rather than beeline
   ENEMY_PLAYER_BIAS: 0.18,             // slight ship-seeking influence while still diving inward
   ENEMY_GRAVITY_MULT: 1.1,             // extra stellar pull on enemies
   ENEMY_HIT_RADIUS_MULT: 1.25,         // player collision radius multiplier against enemies
   ENEMY_COLLAPSE_RATE: 1.25,           // solid downgrade morph speed
+  ENEMY_HIT_DEFLECT_IMPULSE: 135,      // direct bullet-hit impulse away from Sol
+  ENEMY_HIT_DEFLECT_TANGENTIAL: 0.22,  // preserves a little sideways motion on direct hits
+  SHARD_ENEMY_KNOCKBACK: 42,           // smaller shrapnel impulse applied to enemies
+  SHARD_ENEMY_SOL_BIAS: 0.35,          // blends shard knockback slightly outward from Sol
   SHIP_HIT_RADIUS: 10,                 // player hit radius
   SHARD_HIT_RADIUS_PAD: 2.5,           // extra shard collision padding
   SHRAPNEL_COUNT_MIN: 2,               // min shrapnel on hit
   SHRAPNEL_COUNT_MAX: 8,              // max shrapnel on hit
-  SHRAPNEL_SPEED_MIN: 120,             // shrapnel speed min
-  SHRAPNEL_SPEED_MAX: 300,             // shrapnel speed max
-  SHRAPNEL_GRAVITY_MULT: 4.0,          // shard gravity multiplier
+  SHRAPNEL_SPEED_MIN: 40,             // shrapnel speed min
+  SHRAPNEL_SPEED_MAX: 120,             // shrapnel speed max
+  SHRAPNEL_GRAVITY_MULT: 6.0,          // shard gravity multiplier
   SHRAPNEL_PARENT_VEL: 0.6,            // how much parent velocity shards inherit
-  SHRAPNEL_LIFE_MIN: 1.9,              // shrapnel life min
-  SHRAPNEL_LIFE_MAX: 10.9,              // shrapnel life max
+  SHRAPNEL_LIFE_MIN: 7.9,              // shrapnel life min
+  SHRAPNEL_LIFE_MAX: 18.9,              // shrapnel life max
 
-  // Metatron animation
-  META_BASE_SPIN: 0.22,                // base spin
+  // Metatron animation / node gameplay
+  META_BASE_SPIN: 0.03,                // base spin
   META_SPIN_GAIN: 0.22,                // spin increases with distance
   META_DWELL: 0.82,                    // dwell damping toward readable pose
-  META_SPHERE_PULSE: 6.0,              // seconds per pulse
-  META_SPHERE_CHANCE: 0.16,            // chance a circle becomes a "sphere"
+  META_SPHERE_PULSE: 8.0,              // seconds per pulse
+  META_NODE_CORE_RADIUS: 22,           // actual gameplay radius around a Metatron-node center
+  META_NODE_TRIGGER_RADIUS: 90,        // hit must land this close to the nearest node to awaken it
+  META_NODE_FUEL_INNER: 3.5,           // small passive fuel trickle in inner-node cores
+  META_NODE_FUEL_OUTER: 5.0,           // small passive fuel trickle in outer-node cores
+  META_SPHERE_FUEL_INNER: 14.0,        // bonus fuel regen inside an awakened inner sphere core
+  META_SPHERE_FUEL_OUTER: 18.0,        // bonus fuel regen inside an awakened outer sphere core
+  META_SPHERE_SHIELD_REGEN: 0.14,      // shield repair per second while holding an awakened inner sphere
+  META_SPHERE_SHIELD_REGEN_OUTER: 0.20,// stronger shield repair per second in awakened outer spheres
+  META_NODE_CHARGE_SEC: 5.5,           // base duration added by any bullet hit on a polyhedron
+  META_NODE_OVERCHARGE_SEC: 9.0,       // bonus duration when a tetrahedron is destroyed in a node
+  META_NODE_MAX_CHARGE_SEC: 18.0,      // cap so repeated hits do not make a node permanent
 
   // Door / progression
   ALIGN_THRESHOLD: 0.11,               // angle error threshold for "aligned"
@@ -101,22 +120,39 @@ const T = {
   // UI / Audio
   UI_FONT: "12px ui-monospace, Menlo, monospace",
   MASTER_VOL: 0.95,                    // overall audio volume
-  AUDIO_DRONE_BUS_GAIN: 0.92,          // overall level of the sustained drone layer
+  AUDIO_DRONE_BUS_GAIN: 0.72,          // overall level of the sustained drone layer
   AUDIO_SFX_BUS_GAIN: 0.9,             // procedural / one-shot SFX level
   AUDIO_BACKGROUND_LEVEL: 0.51,        // base 216 Hz bed level (raised so it is clearly audible)
   AUDIO_BACKGROUND_FILTER_HZ: 2400,    // tone color of the 216 Hz bed
-  AUDIO_ENEMY_GAIN_FAR: 0.014,         // minimum platonic-solid drone level, even out in the Oort cloud
+  AUDIO_ENEMY_GAIN_FAR: 0.024,         // minimum platonic-solid drone level, even out in the Oort cloud
   AUDIO_ENEMY_GAIN_NEAR: 0.065,        // max platonic-solid drone level near Sol
   AUDIO_ENEMY_GAIN_CURVE: 1.25,        // falloff shape: lower = louder farther out, higher = quieter until close
   AUDIO_ENEMY_FILTER_FAR_HZ: 700,      // far-field tone color for platonic solids
   AUDIO_ENEMY_FILTER_NEAR_HZ: 2800,    // near-field brightness for platonic solids
   AUDIO_ENEMY_PAN_WORLD_WIDTH: 340,    // stereo pan spread relative to player position
-  AUDIO_ENEMY_DEVOLVE_GLISS_SEC: 0.24, // glide time when a solid collapses to a lower order
-  AUDIO_DOPPLER_SCALE: 0.0008,         // subtle pitch bend from radial motion relative to the player
-  AUDIO_MODE_MENU_DRONES: 0.55,        // drone bus multiplier in menu
+  AUDIO_ENEMY_DEVOLVE_GLISS_SEC: 0.34, // glide time when a solid collapses to a lower order
+  AUDIO_DOPPLER_SCALE: 0.0012,         // subtle pitch bend from radial motion relative to the player
+  AUDIO_MODE_MENU_DRONES: 0.35,        // drone bus multiplier in menu
   AUDIO_MODE_PLAYING_DRONES: 1.0,      // drone bus multiplier while playing
   AUDIO_MODE_PAUSED_DRONES: 0.38,      // drone bus multiplier while paused
   AUDIO_MODE_TRANSITION_DRONES: 0.82,  // drone bus multiplier between waves
+
+  AUDIO_THRUST_URL: "/static/audio/thrust.wav",
+  AUDIO_BLASTER_URL: "/static/audio/blaster-fire.wav",
+  AUDIO_SHIP_DESTROYED_URL: "/static/audio/ship-destroyed.wav",
+  AUDIO_SOL_DESTROYED_URL: "/static/audio/sol-destroyed.wav",
+  AUDIO_NEXT_WAVE_URL: "/static/audio/next-wave.wav",
+
+  AUDIO_THRUST_SAMPLE_GAIN: 0.18,      // level of looped thrust.wav when present
+  AUDIO_THRUST_RATE_MIN: 0.92,         // idle playback rate for thrust.wav
+  AUDIO_THRUST_RATE_MAX: 1.24,         // full-thrust playback rate for thrust.wav
+  AUDIO_THRUST_FILTER_MIN_HZ: 420,     // idle filter for thrust.wav
+  AUDIO_THRUST_FILTER_MAX_HZ: 2400,    // full-thrust filter for thrust.wav
+
+  AUDIO_BLASTER_GAIN: 0.08,            // one-shot gain for blaster-fire.wav
+  AUDIO_SHIP_DESTROYED_GAIN: 0.12,     // one-shot gain for ship-destroyed.wav
+  AUDIO_SOL_DESTROYED_GAIN: 0.45,      // one-shot gain for sol-destroyed.wav
+  AUDIO_NEXT_WAVE_GAIN: 0.14,           // one-shot gain for next-wave.wav
 };
 
 const TAU = Math.PI * 2;
@@ -253,7 +289,7 @@ const DOWNGRADE: Record<SolidKind, SolidKind | null> = {
 };
 
 // ===================== GAME TYPES =====================
-type Bullet = { pos: V2; prevPos: V2; vel: V2; life: number };
+type Bullet = { pos: V2; prevPos: V2; vel: V2; life: number; mass: number };
 type FuelBit = { pos: V2; vel: V2; life: number; hue: number; };
 type Shard = { pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
 
@@ -267,6 +303,14 @@ type Enemy = {
   morphing: boolean;
   morph: number;
   nextKind: SolidKind | null;
+};
+
+type MetaNodeKind = "center" | "inner" | "outer";
+type MetaNode = {
+  index: number;
+  kind: MetaNodeKind;
+  charge: number;
+  overcharged: boolean;
 };
 
 type Level = {
@@ -477,6 +521,19 @@ class AudioEngine {
   thrustGain: GainNode | null = null;
   thrustFilter: BiquadFilterNode | null = null;
 
+  thrustSampleSrc: AudioBufferSourceNode | null = null;
+  thrustSampleGain: GainNode | null = null;
+  thrustSampleFilter: BiquadFilterNode | null = null;
+
+  sampleBuffers: Record<"thrust" | "blaster" | "shipDestroyed" | "solDestroyed" | "nextWave", AudioBuffer | null> = {
+    thrust: null,
+    blaster: null,
+    shipDestroyed: null,
+    solDestroyed: null,
+    nextWave: null,
+  };
+  sampleLoads = new Set<"thrust" | "blaster" | "shipDestroyed" | "solDestroyed" | "nextWave">();
+
   droneBuffer: AudioBuffer | null = null;
   droneLoadPromise: Promise<AudioBuffer> | null = null;
   backgroundVoice: DroneVoice | null = null;
@@ -487,7 +544,7 @@ class AudioEngine {
 
   init() {
     if (this.ctx) {
-      void this.ctx.resume();
+      if (this.ctx.state === "suspended") void this.ctx.resume();
       return;
     }
     const Ctx = (window.AudioContext || (window as any).webkitAudioContext);
@@ -534,6 +591,12 @@ class AudioEngine {
 
     this.enabled = true;
     void this.ensureDroneBuffer().then(() => this.ensureBackgroundVoice());
+
+    this.loadSample("thrust", T.AUDIO_THRUST_URL);
+    this.loadSample("blaster", T.AUDIO_BLASTER_URL);
+    this.loadSample("shipDestroyed", T.AUDIO_SHIP_DESTROYED_URL);
+    this.loadSample("solDestroyed", T.AUDIO_SOL_DESTROYED_URL);
+    this.loadSample("nextWave", T.AUDIO_NEXT_WAVE_URL);
   }
 
   async ensureDroneBuffer() {
@@ -589,6 +652,67 @@ class AudioEngine {
     );
   }
 
+  private loadSample(key: keyof AudioEngine["sampleBuffers"], url: string) {
+    if (!this.ctx || this.sampleBuffers[key] || this.sampleLoads.has(key)) return;
+    this.sampleLoads.add(key);
+    fetch(url)
+      .then((r) => {
+        if (!r.ok) throw new Error(`sample ${key} not found`);
+        return r.arrayBuffer();
+      })
+      .then((buf) => this.ctx!.decodeAudioData(buf))
+      .then((decoded) => {
+        this.sampleBuffers[key] = decoded;
+        if (key === "thrust") this.ensureThrustSampleLoop();
+      })
+      .catch(() => {})
+      .finally(() => this.sampleLoads.delete(key));
+  }
+
+  private ensureThrustSampleLoop() {
+    if (!this.ctx || !this.sfxBus || this.thrustSampleSrc || !this.sampleBuffers.thrust) return;
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.sampleBuffers.thrust;
+    src.loop = true;
+    src.playbackRate.value = T.AUDIO_THRUST_RATE_MIN;
+
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = T.AUDIO_THRUST_FILTER_MIN_HZ;
+
+    const gain = this.ctx.createGain();
+    gain.gain.value = 0;
+
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.sfxBus);
+    src.start();
+
+    this.thrustSampleSrc = src;
+    this.thrustSampleFilter = filter;
+    this.thrustSampleGain = gain;
+  }
+
+  private playSample(key: keyof AudioEngine["sampleBuffers"], gainValue = 0.2, playbackRate = 1): boolean {
+    if (!this.ctx || !this.sfxBus) return false;
+    const buf = this.sampleBuffers[key];
+    if (!buf) return false;
+
+    const t0 = this.ctx.currentTime;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = playbackRate;
+
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(gainValue, t0);
+
+    src.connect(g);
+    g.connect(this.sfxBus);
+    src.start(t0);
+    return true;
+  }
+
   setMaster(v: number) {
     if (!this.master) return;
     this.master.gain.value = clamp(v, 0, 1);
@@ -638,9 +762,23 @@ class AudioEngine {
   }
 
   setThrust(amount01: number) {
-    if (!this.ctx || !this.thrustOsc || !this.thrustGain || !this.thrustFilter) return;
+    if (!this.ctx) return;
     const t = this.ctx.currentTime;
     const a = clamp(amount01, 0, 1);
+
+    this.ensureThrustSampleLoop();
+
+    if (this.thrustSampleSrc && this.thrustSampleGain && this.thrustSampleFilter) {
+      const rate = lerp(T.AUDIO_THRUST_RATE_MIN, T.AUDIO_THRUST_RATE_MAX, a);
+      const cutoff = lerp(T.AUDIO_THRUST_FILTER_MIN_HZ, T.AUDIO_THRUST_FILTER_MAX_HZ, a);
+      this.thrustSampleSrc.playbackRate.setTargetAtTime(rate, t, 0.03);
+      this.thrustSampleFilter.frequency.setTargetAtTime(cutoff, t, 0.03);
+      this.thrustSampleGain.gain.setTargetAtTime(a * T.AUDIO_THRUST_SAMPLE_GAIN, t, 0.04);
+      if (this.thrustGain) this.thrustGain.gain.setTargetAtTime(0, t, 0.02);
+      return;
+    }
+
+    if (!this.thrustOsc || !this.thrustGain || !this.thrustFilter) return;
     const freq = AUDIO.THRUST.BASE_FREQ + a * AUDIO.THRUST.FREQ_RANGE;
     const cutoff = AUDIO.THRUST.BASE_FILTER + a * AUDIO.THRUST.FILTER_RANGE;
     this.thrustOsc.frequency.setTargetAtTime(freq, t, 0.02);
@@ -688,14 +826,40 @@ class AudioEngine {
     src.stop(t0 + dur + 0.02);
   }
 
-  shoot() { this.blip(880, 0.05, 0.16); }
+  shoot() {
+    if (!this.playSample("blaster", T.AUDIO_BLASTER_GAIN)) this.blip(880, 0.05, 0.16);
+  }
   hit() { this.noiseBurst(0.14, 0.22, 520); this.blip(220, 0.12, 0.14); }
-  levelUp() { this.blip(660, 0.08, 0.16); this.blip(990, 0.10, 0.14); }
-  explode() { this.noiseBurst(0.32, 0.35, 240); this.blip(110, 0.25, 0.18); }
+  nextWave() {
+    if (!this.playSample("nextWave", T.AUDIO_NEXT_WAVE_GAIN)) {
+      this.blip(660, 0.08, 0.16);
+      this.blip(990, 0.10, 0.14);
+    }
+  }
+  levelUp() { this.nextWave(); }
+  shipDestroyed() {
+    if (!this.playSample("shipDestroyed", T.AUDIO_SHIP_DESTROYED_GAIN)) {
+      this.noiseBurst(0.32, 0.35, 240);
+      this.blip(110, 0.25, 0.18);
+    }
+  }
+  solDestroyed() {
+    if (!this.playSample("solDestroyed", T.AUDIO_SOL_DESTROYED_GAIN)) {
+      this.noiseBurst(0.42, 0.45, 180);
+      this.blip(72, 0.35, 0.22);
+    }
+  }
+  explode() { this.shipDestroyed(); }
 
   stop() {
     if (!this.ctx) return;
-    try { this.thrustGain?.gain.setValueAtTime(0, this.ctx.currentTime); } catch {}
+    const t = this.ctx.currentTime;
+    try { this.thrustGain?.gain.setTargetAtTime(0, t, 0.02); } catch {}
+    try { this.thrustSampleGain?.gain.setTargetAtTime(0, t, 0.03); } catch {}
+    try { this.thrustSampleSrc?.stop(t + 0.06); } catch {}
+    this.thrustSampleSrc = null;
+    this.thrustSampleGain = null;
+    this.thrustSampleFilter = null;
     this.clearEnemyDrones();
   }
 }
@@ -815,6 +979,13 @@ export default function MetatronVectorFOIL() {
 
     const centers2 = metatronCenters(metaRadius);
     const centers3 = centers2.map((c, i) => new V3(c.x, c.y, (i % 2 === 0 ? 1 : -1) * 8));
+    const metaNodes: MetaNode[] = centers2.map((_, i) => ({
+      index: i,
+      kind: i === 0 ? "center" : (i <= 6 ? "inner" : "outer"),
+      charge: 0,
+      overcharged: false,
+    }));
+    let metaNodeWorld: V2[] = centers2.map((c) => new V2(c.x, c.y));
 
     // entities
     const camera = { pos: new V2(0, 0), zoom: 1 };
@@ -825,6 +996,8 @@ export default function MetatronVectorFOIL() {
       thrust: 0,
       fuel: T.FUEL_MAX,
       stuckTime: 0,
+      hitsTaken: 0,
+      hitInvuln: 0,
     };
 
     const bullets: Bullet[] = [];
@@ -836,6 +1009,7 @@ export default function MetatronVectorFOIL() {
 
     // metatron angles
     let metaAx = 0, metaAy = 0, metaAz = 0;
+    let metaPulseClock = 0;
 
     // timers / wave state
     let gunCD = 0;
@@ -845,6 +1019,46 @@ export default function MetatronVectorFOIL() {
     let pendingWaveIdx = 0;
 
     // reset helper
+    const syncMetaNodeWorldPositions = () => {
+      metaNodeWorld = centers3.map((v0) => {
+        let v = v0;
+        v = rotX(v, metaAx); v = rotY(v, metaAy); v = rotZ(v, metaAz);
+        const p = project(v, 1, 220 / 240);
+        return new V2(p.x, p.y);
+      });
+    };
+
+    const resetMetaNodes = () => {
+      for (const node of metaNodes) {
+        node.charge = 0;
+        node.overcharged = false;
+      }
+      syncMetaNodeWorldPositions();
+    };
+
+    const findNearestMetaNode = (point: V2) => {
+      let bestNode: MetaNode | null = null;
+      let bestDist = Infinity;
+      for (const node of metaNodes) {
+        if (node.kind === "center") continue;
+        const d = point.copy().sub(metaNodeWorld[node.index]).len();
+        if (d < bestDist) {
+          bestDist = d;
+          bestNode = node;
+        }
+      }
+      if (!bestNode || bestDist > T.META_NODE_TRIGGER_RADIUS) return null;
+      return bestNode;
+    };
+
+    const chargeMetaNodeAt = (point: V2, overcharge = false) => {
+      const node = findNearestMetaNode(point);
+      if (!node) return false;
+      node.charge = clamp(node.charge + (overcharge ? T.META_NODE_OVERCHARGE_SEC : T.META_NODE_CHARGE_SEC), 0, T.META_NODE_MAX_CHARGE_SEC);
+      node.overcharged = node.overcharged || overcharge;
+      return true;
+    };
+
     const queueWaveBanner = (waveIdx: number) => {
       const wave = getLevel(waveIdx).wave;
       waveBannerText = `Prepare for Wave ${wave}`;
@@ -855,6 +1069,7 @@ export default function MetatronVectorFOIL() {
 
     const resetRun = (toMenu = false) => {
       bullets.length = 0; enemies.length = 0; shards.length = 0; fuelBits.length = 0; trail.length = 0;
+      resetMetaNodes();
       player.pos = new V2(metaRadius, 0);
       // orbit init
       const gm = slidersRef.current.gravity;
@@ -863,14 +1078,17 @@ export default function MetatronVectorFOIL() {
       player.angle = Math.atan2(player.vel.y, player.vel.x);
       player.fuel = T.FUEL_MAX;
       player.stuckTime = 0;
+      player.hitsTaken = 0;
+      player.hitInvuln = 0;
       gunCD = 0;
       nextEnemyId = 1;
-      metaAx = 0; metaAy = 0; metaAz = 0;
+      metaAx = 0; metaAy = 0; metaAz = 0; metaPulseClock = 0;
       audioRef.current.stop();
       audioRef.current.setMode(toMenu ? "menu" : "playing");
       levelIdxRef.current = 0;
       setLevelIdx(0);
       queueWaveBanner(0);
+      syncMetaNodeWorldPositions();
       const nextMode = toMenu ? "menu" : "playing";
       modeRef.current = nextMode;
       setMode(nextMode);
@@ -878,6 +1096,7 @@ export default function MetatronVectorFOIL() {
 
     // initial orbit
     resetRun(false);
+    syncMetaNodeWorldPositions();
 
     // helpers
     const gravityAt = (p: V2, gm: number) => {
@@ -908,7 +1127,7 @@ export default function MetatronVectorFOIL() {
       const muzzle = V2.fromAngle(player.angle, 18);
       const pos = player.pos.copy().add(muzzle);
       const vel = V2.fromAngle(player.angle, T.BULLET_SPEED).add(player.vel.copy());
-      return { pos, prevPos: pos.copy(), vel, life: T.BULLET_LIFE };
+      return { pos, prevPos: pos.copy(), vel, life: T.BULLET_LIFE, mass: T.BULLET_MASS };
     };
 
     const spawnEnemy = (kind: SolidKind, waveIdx: number, index: number, total: number) => {
@@ -1094,13 +1313,75 @@ export default function MetatronVectorFOIL() {
       return true;
     };
 
-    const loseRun = () => {
-      audioRef.current.explode();
+    const loseRun = (reason: "ship" | "sol" = "ship") => {
+      if (reason === "sol") audioRef.current.solDestroyed();
+      else audioRef.current.shipDestroyed();
       resetRun(false);
     };
 
     const killPlayer = () => {
-      loseRun();
+      loseRun("ship");
+    };
+
+    const applyShipHit = (sourcePos?: V2) => {
+      if (player.hitInvuln > 0) return false;
+      player.hitsTaken += 1;
+      player.hitInvuln = T.SHIP_HIT_IFRAME_SEC;
+
+      if (sourcePos) {
+        const away = player.pos.copy().sub(sourcePos);
+        if (away.len() > 0.0001) player.vel.add(away.norm().mul(T.SHIP_HIT_KNOCKBACK));
+      }
+
+      audioRef.current.hit();
+      if (player.hitsTaken >= T.SHIP_RESILIENCE) {
+        killPlayer();
+        return true;
+      }
+      return false;
+    };
+
+    const applyEnemyImpulse = (e: Enemy, impulseDir: V2, impulseMag: number, tangentialBias = 0) => {
+      if (impulseMag <= 0) return;
+      const dir = impulseDir.copy();
+      if (dir.len() <= 0.0001) return;
+      dir.norm();
+
+      if (Math.abs(tangentialBias) > 0.0001) {
+        const tang = dir.copy().rot(Math.PI / 2);
+        const sign = e.vel.dot(tang) >= 0 ? 1 : -1;
+        dir.add(tang.mul(tangentialBias * sign)).norm();
+      }
+
+      e.vel.add(dir.mul(impulseMag));
+    };
+
+    const getMetaNodeBonuses = () => {
+      let passiveFuel = 0;
+      let sphereFuel = 0;
+      let shieldRepair = 0;
+      let occupiedNode = -1;
+
+      for (const node of metaNodes) {
+        if (node.kind === "center") continue;
+        const nodePos = metaNodeWorld[node.index];
+        if (!nodePos) continue;
+        const d = player.pos.copy().sub(nodePos).len();
+        if (d > T.META_NODE_CORE_RADIUS) continue;
+
+        occupiedNode = node.index;
+        const passive = node.kind === "outer" ? T.META_NODE_FUEL_OUTER : T.META_NODE_FUEL_INNER;
+        passiveFuel = Math.max(passiveFuel, passive);
+
+        if (node.charge > 0) {
+          const sphereFuelRate = node.kind === "outer" ? T.META_SPHERE_FUEL_OUTER : T.META_SPHERE_FUEL_INNER;
+          const shieldRateBase = node.kind === "outer" ? T.META_SPHERE_SHIELD_REGEN_OUTER : T.META_SPHERE_SHIELD_REGEN;
+          sphereFuel = Math.max(sphereFuel, sphereFuelRate);
+          shieldRepair = Math.max(shieldRepair, node.overcharged ? shieldRateBase * 1.35 : shieldRateBase);
+        }
+      }
+
+      return { passiveFuel, sphereFuel, shieldRepair, occupiedNode };
     };
 
     const settleFuelBitsFromShards = (dt: number) => {
@@ -1141,6 +1422,9 @@ export default function MetatronVectorFOIL() {
       const thrust = slidersRef.current.thrust;
       const solar = slidersRef.current.solar;
 
+      metaPulseClock += dt;
+      syncMetaNodeWorldPositions();
+
       // handle pause/menu/transition
       if (modeRef.current !== "playing") {
         // still animate metatron slowly for menu vibes
@@ -1149,10 +1433,23 @@ export default function MetatronVectorFOIL() {
         metaAz += spin * dt;
         metaAx += spin * 0.6 * dt;
         metaAy += spin * 0.4 * dt;
+        syncMetaNodeWorldPositions();
         audioRef.current.updateDrones(modeRef.current as GameMode, enemies, player, T.STAR_RADIUS, oortOuter);
         audioRef.current.setThrust(0);
         return;
       }
+
+      for (const node of metaNodes) {
+        if (node.charge > 0) {
+          node.charge = Math.max(0, node.charge - dt);
+          if (node.charge <= 0.0001) {
+            node.charge = 0;
+            node.overcharged = false;
+          }
+        }
+      }
+
+      player.hitInvuln = Math.max(0, player.hitInvuln - dt);
 
       // ---- ship input (A/D + W/S) ----
       if (keys.has("a") || keys.has("A") || keys.has("ArrowLeft")) player.angle -= T.ROT_SPEED * dt;
@@ -1166,7 +1463,14 @@ export default function MetatronVectorFOIL() {
       const outside = dist > horizonR;
       const use = Math.max(0, player.thrust);
       if (use > 0.03 && player.fuel > 0) player.fuel = Math.max(0, player.fuel - T.FUEL_BURN * use * dt);
-      if (!outside) player.fuel = Math.min(T.FUEL_MAX, player.fuel + T.FUEL_REGEN_INNER * dt);
+
+      const nodeBonuses = getMetaNodeBonuses();
+      const baseFuelRegen = outside ? T.FUEL_REGEN_OUTER : T.FUEL_REGEN_INNER;
+      const totalFuelRegen = baseFuelRegen + nodeBonuses.passiveFuel + nodeBonuses.sphereFuel;
+      if (totalFuelRegen > 0) player.fuel = Math.min(T.FUEL_MAX, player.fuel + totalFuelRegen * dt);
+      if (nodeBonuses.shieldRepair > 0 && player.hitInvuln <= 0) {
+        player.hitsTaken = Math.max(0, player.hitsTaken - nodeBonuses.shieldRepair * dt);
+      }
 
       // Forces
       const g = gravityAt(player.pos, lvl.gravityGM);
@@ -1200,8 +1504,7 @@ export default function MetatronVectorFOIL() {
       if (dStar < T.STAR_TRAP_RADIUS && player.vel.len() < 120) {
         player.stuckTime += dt;
         if (player.stuckTime >= T.STAR_TRAP_TIME) {
-          audioRef.current.explode();
-          resetRun(false);
+          loseRun("ship");
           return;
         }
       } else {
@@ -1220,6 +1523,7 @@ export default function MetatronVectorFOIL() {
       for (let i = bullets.length - 1; i >= 0; i--) {
         const b = bullets[i];
         b.prevPos = b.pos.copy();
+        if (b.mass > 0) b.vel.add(gravityAt(b.pos, lvl.gravityGM * b.mass).mul(dt));
         b.pos.add(b.vel.copy().mul(dt));
         b.life -= dt;
         if (b.life <= 0 || Math.abs(b.pos.x) > oortOuter * 3 || Math.abs(b.pos.y) > oortOuter * 3) bullets.splice(i, 1);
@@ -1279,13 +1583,12 @@ export default function MetatronVectorFOIL() {
         const toPlayer = player.pos.copy().sub(e.pos);
         const enemyHitR = Math.max(8, e.r * T.ENEMY_HIT_RADIUS_MULT);
         if (toPlayer.len() <= T.SHIP_HIT_RADIUS + enemyHitR) {
-          killPlayer();
-          return;
+          if (applyShipHit(e.pos.copy())) return;
         }
 
         const starLossR = T.STAR_RADIUS + e.r * 0.4;
         if (e.pos.len() <= starLossR) {
-          loseRun();
+          loseRun("sol");
           return;
         }
 
@@ -1302,7 +1605,11 @@ export default function MetatronVectorFOIL() {
           if (e.morphing) continue;
           const impact = findBulletEnemyImpact(b, e);
           if (!impact) continue;
+          const overchargeSphere = e.kind === "tetra" && DOWNGRADE[e.kind] === null;
           spawnShrapnel(e, impact);
+          chargeMetaNodeAt(impact.point, overchargeSphere);
+          const outward = e.pos.copy();
+          applyEnemyImpulse(e, outward, T.ENEMY_HIT_DEFLECT_IMPULSE, T.ENEMY_HIT_DEFLECT_TANGENTIAL);
           audioRef.current.hit();
           b.life = -1;
           if (!downgradeEnemy(e)) enemies.splice(ei, 1);
@@ -1321,9 +1628,29 @@ export default function MetatronVectorFOIL() {
         s.life -= dt;
 
         if (s.pos.copy().sub(player.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD) {
-          killPlayer();
-          return;
+          if (applyShipHit(s.pos.copy())) return;
+          shards.splice(i, 1);
+          continue;
         }
+
+        let shardConsumed = false;
+        for (let ei = enemies.length - 1; ei >= 0; ei--) {
+          const e = enemies[ei];
+          if (e.morphing) continue;
+          const enemyHitR = Math.max(8, e.r * T.ENEMY_HIT_RADIUS_MULT);
+          if (s.pos.copy().sub(e.pos).len() > enemyHitR + s.size + T.SHARD_HIT_RADIUS_PAD) continue;
+
+          const awayFromShard = e.pos.copy().sub(s.pos);
+          const awayFromSol = e.pos.copy();
+          const impulseDir = awayFromShard.len() > 0.0001
+            ? awayFromShard.norm().add(awayFromSol.len() > 0.0001 ? awayFromSol.norm().mul(T.SHARD_ENEMY_SOL_BIAS) : new V2()).norm()
+            : awayFromSol;
+          applyEnemyImpulse(e, impulseDir, T.SHARD_ENEMY_KNOCKBACK);
+          shards.splice(i, 1);
+          shardConsumed = true;
+          break;
+        }
+        if (shardConsumed) continue;
 
         if (s.life <= 0 || s.pos.len() > oortOuter * 2.4) shards.splice(i, 1);
       }
@@ -1356,6 +1683,7 @@ export default function MetatronVectorFOIL() {
       metaAx -= metaAx * dwell * dt;
       metaAy -= metaAy * dwell * dt;
       metaAz -= metaAz * dwell * 0.35 * dt; // let az keep motion
+      syncMetaNodeWorldPositions();
 
       if (waveActive && enemies.length === 0 && shards.length === 0) {
         audioRef.current.levelUp();
@@ -1385,7 +1713,7 @@ export default function MetatronVectorFOIL() {
         mode: modeRef.current,
         level: getLevel(levelIdxRef.current),
         player, camera,
-        meta: { ax: metaAx, ay: metaAy, az: metaAz, centers3 },
+        meta: { ax: metaAx, ay: metaAy, az: metaAz, centers3, nodes: metaNodes, pulseClock: metaPulseClock },
         entities: { bullets, enemies, shards, fuelBits, trail },
         toggles: togglesRef.current,
         horizonR, oortInner, oortOuter,
@@ -1612,9 +1940,9 @@ function render(
   S: {
     mode: "menu" | "playing" | "paused" | "transition";
     level: Level;
-    player: { pos: V2; vel: V2; angle: number; thrust: number; fuel: number; stuckTime: number };
+    player: { pos: V2; vel: V2; angle: number; thrust: number; fuel: number; stuckTime: number; hitsTaken: number; hitInvuln: number };
     camera: { pos: V2; zoom: number };
-    meta: { ax: number; ay: number; az: number; centers3: V3[] };
+    meta: { ax: number; ay: number; az: number; centers3: V3[]; nodes: MetaNode[]; pulseClock: number };
     entities: { bullets: Bullet[]; enemies: Enemy[]; shards: Shard[]; fuelBits: FuelBit[]; trail: V2[] };
     toggles: { metatron: boolean; trails: boolean; debug: boolean };
     horizonR: number;
@@ -1681,26 +2009,41 @@ function render(
     ctx.restore();
 
     // circles / spheres
-    const t = performance.now() / 1000;
+    const t = S.meta.pulseClock;
     ctx.save();
     for (let i = 0; i < C2.length; i++) {
       const c = C2[i];
+      const node = S.meta.nodes[i];
       const pulse = 0.12 + 0.05 * Math.sin((t + i * 0.37) * (TAU / T.META_SPHERE_PULSE));
-      const makeSphere = (Math.sin(t * 0.7 + i) * 0.5 + 0.5) < T.META_SPHERE_CHANCE;
-      if (makeSphere) {
+      const active = !!node && node.charge > 0;
+      const overcharged = !!node && node.overcharged;
+      const sphereStrength = node ? clamp(node.charge / T.META_NODE_MAX_CHARGE_SEC, 0, 1) : 0;
+
+      if (active) {
+        const glowAlpha = overcharged ? 0.22 : 0.16;
         const g = ctx.createRadialGradient(c.x - 6 / S.camera.zoom, c.y - 6 / S.camera.zoom, 2 / S.camera.zoom, c.x, c.y, T.META_RADIUS * (1.0 + pulse));
-        g.addColorStop(0, "rgba(210,235,255,0.15)");
-        g.addColorStop(0.5, "rgba(170,210,255,0.07)");
-        g.addColorStop(1, "rgba(150,190,240,0.02)");
+        g.addColorStop(0, `rgba(220,242,255,${glowAlpha + sphereStrength * 0.08})`);
+        g.addColorStop(0.45, `rgba(175,220,255,${0.08 + sphereStrength * 0.08})`);
+        g.addColorStop(1, `rgba(150,190,240,${0.03 + sphereStrength * 0.03})`);
         ctx.fillStyle = g;
         ctx.beginPath(); arcSafe(ctx, c.x, c.y, T.META_RADIUS * (0.96 + pulse)); ctx.fill();
-        ctx.lineWidth = 0.9 / S.camera.zoom;
-        ctx.strokeStyle = "rgba(170,210,255,0.20)";
+        ctx.lineWidth = 1.1 / S.camera.zoom;
+        ctx.strokeStyle = overcharged ? `rgba(235,248,255,${0.28 + sphereStrength * 0.24})` : `rgba(185,225,255,${0.22 + sphereStrength * 0.18})`;
         ctx.beginPath(); arcSafe(ctx, c.x, c.y, T.META_RADIUS * (0.96 + pulse)); ctx.stroke();
       } else {
         ctx.lineWidth = 0.9 / S.camera.zoom;
         ctx.strokeStyle = `rgba(170,210,255,${0.12 + pulse * 0.6})`;
         ctx.beginPath(); arcSafe(ctx, c.x, c.y, T.META_RADIUS * (1.0 + pulse * 0.15)); ctx.stroke();
+      }
+
+      if (node && node.kind !== "center") {
+        const coreR = T.META_NODE_CORE_RADIUS;
+        const coreAlpha = active ? (overcharged ? 0.42 : 0.34) : 0.12;
+        ctx.lineWidth = 1.05 / S.camera.zoom;
+        ctx.strokeStyle = active
+          ? `rgba(235,250,255,${coreAlpha})`
+          : `rgba(145,195,255,${coreAlpha})`;
+        ctx.beginPath(); arcSafe(ctx, c.x, c.y, coreR); ctx.stroke();
       }
     }
     ctx.restore();
@@ -1793,7 +2136,8 @@ function render(
   ctx.translate(S.player.pos.x, S.player.pos.y);
   ctx.rotate(S.player.angle);
   ctx.lineWidth = 2.2 / S.camera.zoom;
-  ctx.strokeStyle = "rgba(120,255,200,0.95)";
+  const hitFlash = S.player.hitInvuln > 0 && Math.floor(performance.now() / 60) % 2 === 0;
+  ctx.strokeStyle = hitFlash ? "rgba(255,240,200,0.98)" : "rgba(120,255,200,0.95)";
   ctx.beginPath();
   ctx.moveTo(12, 0); ctx.lineTo(-10, -7); ctx.lineTo(-6, 0); ctx.lineTo(-10, 7); ctx.closePath();
   ctx.stroke();
@@ -1805,13 +2149,17 @@ function render(
   ctx.font = T.UI_FONT;
 
   const spd = S.player.vel.len();
+  const effectiveShipResilience = Math.max(1, T.SHIP_RESILIENCE);
+  const shieldPct = clamp(((effectiveShipResilience - S.player.hitsTaken) * 100) / effectiveShipResilience, 0, 100);
+  const hitsRemaining = Math.max(0, Math.ceil(effectiveShipResilience - S.player.hitsTaken));
   ctx.fillText(`${S.level.name}`, 12, 18);
   ctx.fillText(`Fuel ${S.player.fuel.toFixed(0)} / ${T.FUEL_MAX}  |  speed ${spd.toFixed(1)}  |  incoming ${S.level.enemyKind} × ${S.level.enemyCount}`, 12, 34);
+  ctx.fillText(`Shields ${shieldPct.toFixed(0)}%  |  hits remaining ${hitsRemaining}/${effectiveShipResilience}`, 12, 50);
 
   if (S.toggles.debug) {
     ctx.fillStyle = "rgba(255,255,255,0.74)";
-    ctx.fillText(`zoom ${S.camera.zoom.toFixed(3)}  ship (${S.player.pos.x.toFixed(1)}, ${S.player.pos.y.toFixed(1)})  r=${S.player.pos.len().toFixed(1)}`, 12, 52);
-    ctx.fillText(`bullets ${S.entities.bullets.length}  enemies ${S.entities.enemies.length}  shards ${S.entities.shards.length}  fuelbits ${S.entities.fuelBits.length}`, 12, 68);
+    ctx.fillText(`zoom ${S.camera.zoom.toFixed(3)}  ship (${S.player.pos.x.toFixed(1)}, ${S.player.pos.y.toFixed(1)})  r=${S.player.pos.len().toFixed(1)}  bulletMass ${T.BULLET_MASS.toFixed(2)}  hitInvuln ${S.player.hitInvuln.toFixed(2)}`, 12, 68);
+    ctx.fillText(`bullets ${S.entities.bullets.length}  enemies ${S.entities.enemies.length}  shards ${S.entities.shards.length}  fuelbits ${S.entities.fuelBits.length}  hitsTaken ${S.player.hitsTaken.toFixed(2)}`, 12, 84);
   }
 
   if (S.waveBannerTimer > 0 && S.waveBannerText) {
