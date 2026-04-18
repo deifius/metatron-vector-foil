@@ -1,4 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
+import { DEFAULT_HUD_CONFIG, DEFAULT_HUD_STATE } from "./ui/hud/hudConfig";
+import { HUDRoot } from "./ui/hud/HUDRoot";
+import { HUDState } from "./ui/hud/hudTypes";
 
 /**
  * Metatron Vector FOIL
@@ -156,6 +159,7 @@ const T = {
 };
 
 const TAU = Math.PI * 2;
+const HUD_UPDATE_INTERVAL = 1 / 30;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const rand = (a = 0, b = 1) => a + Math.random() * (b - a);
@@ -872,6 +876,8 @@ export default function MetatronVectorFOIL() {
   const [mode, setMode] = useState<"menu" | "playing" | "paused" | "transition">("menu");
   const [levelIdx, setLevelIdx] = useState(0);
   const [toggles, setToggles] = useState({ metatron: true, trails: true, debug: T.DEBUG_TEXT });
+  const [hudState, setHUDState] = useState<HUDState>(DEFAULT_HUD_STATE);
+  const [hudConfig, setHUDConfig] = useState(DEFAULT_HUD_CONFIG);
 
   const modeRef = useRef(mode);
   const levelIdxRef = useRef(levelIdx);
@@ -882,6 +888,8 @@ export default function MetatronVectorFOIL() {
     trail: T.TRAIL_SAMPLES,
     master: AUDIO.MASTER_GAIN,
     solar: T.SOLAR_PRESSURE,
+    hudScale: DEFAULT_HUD_CONFIG.scale,
+    hudOpacity: DEFAULT_HUD_CONFIG.opacity,
   });
 
   const audioRef = useRef(new AudioEngine());
@@ -889,7 +897,11 @@ export default function MetatronVectorFOIL() {
 
   // Keep slider values available inside the loop without rerenders
   const slidersRef = useRef(sliders);
-  useEffect(() => { slidersRef.current = sliders; audioRef.current.setMaster(sliders.master); }, [sliders]);
+  useEffect(() => {
+    slidersRef.current = sliders;
+    audioRef.current.setMaster(sliders.master);
+    setHUDConfig((cfg) => ({ ...cfg, scale: sliders.hudScale, opacity: sliders.hudOpacity }));
+  }, [sliders]);
   useEffect(() => {
     modeRef.current = mode;
     audioRef.current.setMode(mode);
@@ -1017,6 +1029,7 @@ export default function MetatronVectorFOIL() {
     let waveBannerText = "";
     let waveActive = false;
     let pendingWaveIdx = 0;
+    let hudPublishAccumulator = 0;
 
     // reset helper
     const syncMetaNodeWorldPositions = () => {
@@ -1695,6 +1708,86 @@ export default function MetatronVectorFOIL() {
       // audio continuous
       audioRef.current.updateDrones(modeRef.current as GameMode, enemies, player, T.STAR_RADIUS, oortOuter);
       audioRef.current.setThrust(Math.max(0, player.thrust) * (player.fuel > 0 ? 1 : 0));
+
+      hudPublishAccumulator += dt;
+      if (hudPublishAccumulator >= HUD_UPDATE_INTERVAL) {
+        hudPublishAccumulator = 0;
+        const effectiveShipResilience = Math.max(1, T.SHIP_RESILIENCE);
+        const shieldsPct = clamp(((effectiveShipResilience - player.hitsTaken) * 100) / effectiveShipResilience, 0, 100);
+        const hitsRemaining = Math.max(0, Math.ceil(effectiveShipResilience - player.hitsTaken));
+        const speed = player.vel.len();
+        const radialDir = player.pos.copy().norm();
+        const closureRate = enemies.length > 0
+          ? enemies.reduce((best, e) => {
+              const toPlayer = player.pos.copy().sub(e.pos);
+              const dist = toPlayer.len() || 1;
+              const towardPlayer = toPlayer.copy().mul(1 / dist);
+              const relVel = player.vel.copy().sub(e.vel);
+              const close = relVel.dot(towardPlayer);
+              return close > best ? close : best;
+            }, -Infinity)
+          : 0;
+        const nearestRange = enemies.length > 0
+          ? enemies.reduce((best, e) => Math.min(best, e.pos.copy().sub(player.pos).len()), Infinity)
+          : 0;
+        const radarContacts = enemies.slice(0, 10).map((e) => {
+          const rel = e.pos.copy().sub(player.pos);
+          return {
+            bearingRad: Math.atan2(rel.y, rel.x),
+            distanceNorm: clamp(rel.len() / (oortOuter * 1.2), 0.08, 1),
+            kind: e.kind,
+            threat: 1 + (e.kind === "icosa" ? 3 : e.kind === "dodeca" ? 2 : 1),
+          };
+        });
+        let alertText = "SYSTEM STABLE";
+        let alertSeverity: HUDState["alert"]["severity"] = "info";
+        let flashing = false;
+        if (waveBannerTimer > 0 && waveBannerText) {
+          alertText = waveBannerText;
+        } else if (shieldsPct <= 25) {
+          alertText = "SHIELDS CRITICAL";
+          alertSeverity = "critical";
+          flashing = true;
+        } else if (player.pos.len() < horizonR * 0.9) {
+          alertText = "APPROACHING INNER ORBIT";
+          alertSeverity = "warning";
+        } else if (enemies.length > 0) {
+          alertText = `HOSTILES INBOUND × ${enemies.length}`;
+          alertSeverity = "warning";
+        }
+        const trimVec = V2.fromAngle(player.angle, 1);
+        const trimDeg = Math.atan2(trimVec.x * radialDir.y - trimVec.y * radialDir.x, trimVec.dot(radialDir)) * 180 / Math.PI;
+        setHUDState({
+          title: "Metatron Vector FOIL",
+          controlsText: "A/D rotate · W/S trim · Space shoot · Enter start · P pause · M/T/B toggles",
+          alert: { text: alertText, severity: alertSeverity, flashing },
+          player: {
+            shieldsPct,
+            fuelPct: clamp((player.fuel / T.FUEL_MAX) * 100, 0, 100),
+            hitsRemaining,
+            speed,
+            driftSpeed: Math.abs(player.vel.dot(radialDir)),
+            trimDeg,
+            gravFieldStrength: gravityAt(player.pos, slidersRef.current.gravity).len(),
+            phaseState: player.pos.len() < horizonR ? "INNER" : (player.pos.len() < oortInner ? "TRANSFER" : "OUTER"),
+          },
+          tactical: {
+            waveNumber: getLevel(levelIdxRef.current).wave,
+            currentEnemyLabel: getLevel(levelIdxRef.current).enemyKind,
+            incomingCount: getLevel(levelIdxRef.current).enemyCount,
+            bullets: bullets.length,
+            enemies: enemies.length,
+            shards: shards.length,
+            closureRate: Number.isFinite(closureRate) ? closureRate : 0,
+            nearestRange: Number.isFinite(nearestRange) ? nearestRange : 0,
+          },
+          radar: {
+            contacts: radarContacts,
+            placeholderSweepDeg: ((performance.now() / 22) % 360),
+            enabled: true,
+          },
+        });
+      }
     };
 
     function loop() {
@@ -1759,20 +1852,7 @@ export default function MetatronVectorFOIL() {
           height: "100%",
         }}
       />
-
-      {/* HUD box */}
-      <div style={{
-        position: "absolute", top: 12, right: 12,
-        fontFamily: "ui-monospace, Menlo, monospace",
-        fontSize: 12, color: "rgba(255,255,255,.86)",
-        background: "rgba(255,255,255,.05)", border: "1px solid rgba(255,255,255,.10)",
-        backdropFilter: "blur(10px)", borderRadius: 14, padding: "10px 12px",
-        maxWidth: 360,
-      }}>
-        <div style={{ fontWeight: 700, color: "rgba(255,255,255,.95)" }}>Metatron Vector FOIL</div>
-        <div style={{ opacity: .9 }}>A/D rotate • W/S trim • Space shoot</div>
-        <div style={{ opacity: .75 }}>Enter start • P pause • M/T/B toggles</div>
-      </div>
+      <HUDRoot state={hudState} config={hudConfig} />
 
       {/* Start screen */}
       {mode === "menu" && (
@@ -1831,6 +1911,18 @@ export default function MetatronVectorFOIL() {
               value={sliders.master}
               min={0} max={1} step={0.01}
               onChange={(v) => setSliders((s) => ({ ...s, master: v }))}
+            />
+            <SliderRow
+              label="HUD scale"
+              value={sliders.hudScale}
+              min={0.7} max={1.4} step={0.01}
+              onChange={(v) => setSliders((s) => ({ ...s, hudScale: v }))}
+            />
+            <SliderRow
+              label="HUD opacity"
+              value={sliders.hudOpacity}
+              min={0.35} max={1} step={0.01}
+              onChange={(v) => setSliders((s) => ({ ...s, hudOpacity: v }))}
             />
 
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
@@ -2143,38 +2235,7 @@ function render(
   ctx.stroke();
   ctx.restore();
 
-  // screen-space HUD
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = "rgba(255,255,255,0.88)";
-  ctx.font = T.UI_FONT;
 
-  const spd = S.player.vel.len();
-  const effectiveShipResilience = Math.max(1, T.SHIP_RESILIENCE);
-  const shieldPct = clamp(((effectiveShipResilience - S.player.hitsTaken) * 100) / effectiveShipResilience, 0, 100);
-  const hitsRemaining = Math.max(0, Math.ceil(effectiveShipResilience - S.player.hitsTaken));
-  ctx.fillText(`${S.level.name}`, 12, 18);
-  ctx.fillText(`Fuel ${S.player.fuel.toFixed(0)} / ${T.FUEL_MAX}  |  speed ${spd.toFixed(1)}  |  incoming ${S.level.enemyKind} × ${S.level.enemyCount}`, 12, 34);
-  ctx.fillText(`Shields ${shieldPct.toFixed(0)}%  |  hits remaining ${hitsRemaining}/${effectiveShipResilience}`, 12, 50);
-
-  if (S.toggles.debug) {
-    ctx.fillStyle = "rgba(255,255,255,0.74)";
-    ctx.fillText(`zoom ${S.camera.zoom.toFixed(3)}  ship (${S.player.pos.x.toFixed(1)}, ${S.player.pos.y.toFixed(1)})  r=${S.player.pos.len().toFixed(1)}  bulletMass ${T.BULLET_MASS.toFixed(2)}  hitInvuln ${S.player.hitInvuln.toFixed(2)}`, 12, 68);
-    ctx.fillText(`bullets ${S.entities.bullets.length}  enemies ${S.entities.enemies.length}  shards ${S.entities.shards.length}  fuelbits ${S.entities.fuelBits.length}  hitsTaken ${S.player.hitsTaken.toFixed(2)}`, 12, 84);
-  }
-
-  if (S.waveBannerTimer > 0 && S.waveBannerText) {
-    const alpha = clamp(Math.min(1, S.waveBannerTimer / 0.45), 0, 1) * (0.72 + 0.28 * Math.sin(performance.now() / 120));
-    ctx.save();
-    ctx.font = "28px ui-monospace, Menlo, monospace";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.strokeStyle = `rgba(200,230,255,${0.25 * alpha})`;
-    ctx.lineWidth = 2;
-    ctx.strokeText(S.waveBannerText, w / 2, h * 0.24);
-    ctx.fillStyle = `rgba(235,245,255,${0.12 * alpha})`;
-    ctx.fillText(S.waveBannerText, w / 2, h * 0.24);
-    ctx.restore();
-  }
 }
 
 function updateCamera(camera: { pos: V2; zoom: number }, canvas: HTMLCanvasElement, dpr: number, shipPos: V2, shipVel: V2, horizonR: number) {
