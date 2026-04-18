@@ -1,45 +1,66 @@
 import { HUDConfig, HUDState } from "./hudTypes";
 
+// ===================== HUD DEV CONTROLS =====================
+// Keep the main tweak points here so the GUI_HUD branch is easy to tune.
+export const HUD_DEV_CONTROLS = {
+  refreshHz: 15,
+  globalScale: 0.8,
+  globalOpacity: 0.92,
+  pointerEvents: "none" as const,
+  safeMarginPx: 18,
+  animationStrength: 0.65,
+  decorativeIntensity: 0.48,
+
+  clusters: {
+    alertBanner: {
+      enabled: true,
+      scale: 1,
+      opacity: 0.9,
+      anchor: { right: 18, bottom: 18, width: "min(28vw, 360px)" },
+    },
+    tacticalCluster: {
+      enabled: true,
+      scale: 1,
+      opacity: 0.92,
+      anchor: { top: 18, right: 18, width: "min(22vw, 300px)" },
+    },
+    shipCluster: {
+      enabled: true,
+      scale: 1,
+      opacity: 0.9,
+      anchor: { left: 18, bottom: 18, width: "min(26vw, 350px)" },
+    },
+    plotCluster: {
+      enabled: true,
+      scale: 1,
+      opacity: 0.82,
+      anchor: { top: 18, left: 18, width: "min(18vw, 250px)" },
+    },
+  },
+
+  widgets: {
+    radar: { enabled: true, scale: 1, opacity: 0.86 },
+    shields: { enabled: true, scale: 1, opacity: 0.96 },
+    fuel: { enabled: true, scale: 1, opacity: 0.9 },
+    gravTrace: { enabled: true, scale: 1, opacity: 0.6 },
+    tacticalPlot: { enabled: true, scale: 1, opacity: 0.72 },
+    numericReadouts: { enabled: true, scale: 1, opacity: 0.94 },
+  },
+};
+
 export const DEFAULT_HUD_CONFIG: HUDConfig = {
   enabled: true,
-  scale: 1,
-  opacity: 0.96,
-  pointerEvents: "none",
-  safeMarginPx: 18,
-  animationStrength: 0.85,
-  decorativeIntensity: 0.72,
-  alertBanner: {
-    enabled: true,
-    scale: 1,
-    opacity: 0.96,
-    anchor: { top: 18, left: 18, width: "min(42vw, 560px)" },
-  },
-  tacticalCluster: {
-    enabled: true,
-    scale: 1,
-    opacity: 0.95,
-    anchor: { top: 18, right: 18, width: "min(28vw, 360px)" },
-  },
-  shipCluster: {
-    enabled: true,
-    scale: 1,
-    opacity: 0.94,
-    anchor: { left: 18, bottom: 18, width: "min(32vw, 430px)" },
-  },
-  plotCluster: {
-    enabled: true,
-    scale: 1,
-    opacity: 0.9,
-    anchor: { right: 18, bottom: 18, width: "min(24vw, 320px)" },
-  },
-  widgets: {
-    radar: { enabled: true, scale: 1, opacity: 0.92 },
-    shields: { enabled: true, scale: 1, opacity: 1 },
-    fuel: { enabled: true, scale: 1, opacity: 0.96 },
-    gravTrace: { enabled: true, scale: 1, opacity: 0.78 },
-    tacticalPlot: { enabled: true, scale: 1, opacity: 0.84 },
-    numericReadouts: { enabled: true, scale: 1, opacity: 0.95 },
-  },
+  scale: HUD_DEV_CONTROLS.globalScale,
+  opacity: HUD_DEV_CONTROLS.globalOpacity,
+  pointerEvents: HUD_DEV_CONTROLS.pointerEvents,
+  safeMarginPx: HUD_DEV_CONTROLS.safeMarginPx,
+  animationStrength: HUD_DEV_CONTROLS.animationStrength,
+  decorativeIntensity: HUD_DEV_CONTROLS.decorativeIntensity,
+  alertBanner: HUD_DEV_CONTROLS.clusters.alertBanner,
+  tacticalCluster: HUD_DEV_CONTROLS.clusters.tacticalCluster,
+  shipCluster: HUD_DEV_CONTROLS.clusters.shipCluster,
+  plotCluster: HUD_DEV_CONTROLS.clusters.plotCluster,
+  widgets: HUD_DEV_CONTROLS.widgets,
 };
 
 export const DEFAULT_HUD_STATE: HUDState = {

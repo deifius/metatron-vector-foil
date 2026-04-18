@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { DEFAULT_HUD_CONFIG, DEFAULT_HUD_STATE } from "./ui/hud/hudConfig";
+import { DEFAULT_HUD_CONFIG, DEFAULT_HUD_STATE, HUD_DEV_CONTROLS } from "./ui/hud/hudConfig";
 import { HUDRoot } from "./ui/hud/HUDRoot";
 import { HUDState } from "./ui/hud/hudTypes";
 
@@ -159,7 +159,7 @@ const T = {
 };
 
 const TAU = Math.PI * 2;
-const HUD_UPDATE_INTERVAL = 1 / 30;
+const HUD_UPDATE_INTERVAL = 1 / HUD_DEV_CONTROLS.refreshHz;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const rand = (a = 0, b = 1) => a + Math.random() * (b - a);
