@@ -1,0 +1,65 @@
+[
+  {
+    "id": "longShot",
+    "category": "gunnery",
+    "label": "GUNNERY CITATION: LONG SHOT",
+    "subtitle": "RANGING SOLUTION CONFIRMED",
+    "tier": 2
+  },
+  {
+    "id": "fullSalvo",
+    "category": "gunnery",
+    "label": "GUNNERY CITATION: FULL SALVO",
+    "subtitle": "EVERY ROUND FOUND ITS DOCTRINE",
+    "tier": 2
+  },
+  {
+    "id": "slingshot",
+    "category": "pilotage",
+    "label": "PILOT CITATION: SLINGSHOT",
+    "subtitle": "TRAJECTORY ADVANTAGE",
+    "tier": 2
+  },
+  {
+    "id": "highGTurn",
+    "category": "pilotage",
+    "label": "PILOT CITATION: HIGH-G TURN",
+    "subtitle": "STRUCTURAL LIMIT APPROACHED",
+    "tier": 2
+  },
+  {
+    "id": "returnToTheBurn",
+    "category": "pilotage",
+    "label": "PILOT CITATION: RETURN TO THE BURN",
+    "subtitle": "ENGAGEMENT SOLUTION REACQUIRED",
+    "tier": 2
+  },
+  {
+    "id": "oortReach",
+    "category": "pilotage",
+    "label": "PILOT CITATION: OORT REACH",
+    "subtitle": "BLACK ICE NAVIGATED",
+    "tier": 2
+  },
+  {
+    "id": "nodeAwakened",
+    "category": "geometry",
+    "label": "NODE AWAKENED",
+    "subtitle": "SEPHIRA RESPONDS",
+    "tier": 3
+  },
+  {
+    "id": "allSpheresLit",
+    "category": "geometry",
+    "label": "ALL SPHERES LIT",
+    "subtitle": "METATRONIC PHASE TRANSITION",
+    "tier": 3
+  },
+  {
+    "id": "corsairDescentAuthorized",
+    "category": "geometry",
+    "label": "CORSAIR DESCENT AUTHORIZED",
+    "subtitle": "COCKPIT DESCENT PERMITTED",
+    "tier": 3
+  }
+]
