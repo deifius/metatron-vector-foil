@@ -6,6 +6,7 @@ export type HUDAlert = {
   text: string;
   severity: HUDSeverity;
   flashing?: boolean;
+  subtitle?: string;
 };
 
 export type HUDRadarContact = {
@@ -38,6 +39,10 @@ export type HUDState = {
     shards: number;
     closureRate: number;
     nearestRange: number;
+    score: number;
+    chainMultiplier: number;
+    bestChainMultiplier: number;
+    citationCount: number;
   };
   radar: {
     contacts: HUDRadarContact[];

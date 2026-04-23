@@ -42,7 +42,7 @@ export function AlertBanner({
           △ {alert.text.toUpperCase()} △
         </div>
         <div style={{ marginTop: 10, fontSize: 11, color: "rgba(205,220,240,0.68)", lineHeight: 1.35 }}>
-          {controlsText}
+          {alert.subtitle ?? controlsText}
         </div>
       </div>
     </PanelFrame>

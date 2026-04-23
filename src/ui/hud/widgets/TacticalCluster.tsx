@@ -80,11 +80,13 @@ export function TacticalCluster({
   );
 }
 
-function Readout({ label, value }: { label: string; value: number }) {
+function Readout({ label, value, wide = false }: { label: string; value: number | string; wide?: boolean }) {
   return (
     <div style={{ border: "1px solid rgba(180,220,255,0.12)", borderRadius: 12, padding: "8px 10px", background: "rgba(255,255,255,0.03)" }}>
       <div style={{ color: "rgba(175,205,228,0.65)", fontSize: 10 }}>{label}</div>
-      <div style={{ marginTop: 4, color: "rgba(235,243,250,0.96)", fontSize: 18 }}>{value}</div>
+      <div style={{ marginTop: 4, color: "rgba(235,243,250,0.96)", fontSize: wide ? 16 : 18, letterSpacing: wide ? "0.06em" : undefined }}>
+        {typeof value === "number" && wide ? value.toLocaleString() : value}
+      </div>
     </div>
   );
 }
