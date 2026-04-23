@@ -19,6 +19,11 @@ export function TacticalPlotCluster({
   return (
     <PanelFrame opacity={opacity} style={style}>
       <div style={{ padding: "14px" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1.25fr 0.8fr 0.8fr", gap: 8, marginBottom: 10 }}>
+          <Mini label="SCORE" value={state.tactical.score.toLocaleString()} emphasis="score" />
+          <Mini label="CHAIN" value={`${state.tactical.chainMultiplier.toFixed(1)}×`} />
+          <Mini label="CITES" value={`${state.tactical.citationCount}`} />
+        </div>
         <svg width="100%" viewBox={`0 0 ${size} ${size}`} style={{ opacity: config.widgets.tacticalPlot.opacity }}>
           {[1, 0.74, 0.5].map((k) => (
             <circle key={k} cx={center} cy={center} r={radius * k} fill="none" stroke="rgba(180,220,255,0.12)" strokeWidth="1" />
@@ -39,11 +44,11 @@ export function TacticalPlotCluster({
   );
 }
 
-function Mini({ label, value }: { label: string; value: string }) {
+function Mini({ label, value, emphasis = "default" }: { label: string; value: string; emphasis?: "default" | "score" }) {
   return (
     <div style={{ borderRadius: 12, border: "1px solid rgba(180,220,255,0.1)", padding: "8px 10px", background: "rgba(255,255,255,0.02)" }}>
       <div style={{ fontSize: 10, color: "rgba(175,205,228,0.62)" }}>{label}</div>
-      <div style={{ marginTop: 4, fontSize: 16, color: "rgba(238,241,245,0.96)" }}>{value}</div>
+      <div style={{ marginTop: 4, fontSize: emphasis === "score" ? 15 : 16, letterSpacing: emphasis === "score" ? "0.04em" : undefined, color: emphasis === "score" ? "rgba(245,220,165,0.98)" : "rgba(238,241,245,0.96)" }}>{value}</div>
     </div>
   );
 }

@@ -66,7 +66,7 @@ export const DEFAULT_HUD_CONFIG: HUDConfig = {
 export const DEFAULT_HUD_STATE: HUDState = {
   title: "Metatron Vector FOIL",
   controlsText: "A/D rotate · W/S trim · Space shoot · Enter start · P pause · M/T/B toggles",
-  alert: { text: "STANDING BY", severity: "info" },
+  alert: { text: "STANDING BY", severity: "info", subtitle: "Awaiting insertion." },
   player: {
     shieldsPct: 100,
     fuelPct: 100,
@@ -86,6 +86,10 @@ export const DEFAULT_HUD_STATE: HUDState = {
     shards: 0,
     closureRate: 0,
     nearestRange: 0,
+    score: 0,
+    chainMultiplier: 1,
+    bestChainMultiplier: 1,
+    citationCount: 0,
   },
   radar: {
     contacts: [],
