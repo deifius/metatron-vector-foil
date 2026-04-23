@@ -1433,7 +1433,7 @@ export default function MetatronVectorFOIL() {
     const loseRun = (reason: "ship" | "sol" = "ship") => {
       if (reason === "sol") audioRef.current.solDestroyed();
       else audioRef.current.shipDestroyed();
-      resetRun(false);
+      resetRun(true);
     };
 
     const killPlayer = () => {
@@ -1503,8 +1503,8 @@ export default function MetatronVectorFOIL() {
       slingshotMinRadius = Infinity;
     };
 
-    // initial orbit
-    resetRun(false);
+    // initial setup lands on the title / insert coin screen
+    resetRun(true);
     syncMetaNodeWorldPositions();
 
     const getCommendation = (id: string) => commendationMapRef.current[id] ?? DEFAULT_COMMENDATIONS.find((item) => item.id === id);
@@ -2309,10 +2309,7 @@ export default function MetatronVectorFOIL() {
           <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
             <button onClick={() => setMode("playing")} style={btnStyle}>Resume</button>
             <button onClick={() => {
-              levelIdxRef.current = 0;
-              setLevelIdx(0);
-              modeRef.current = "menu";
-              setMode("menu");
+              resetRun(true);
             }} style={btnStyle}>Back to title</button>
           </div>
         </Overlay>
