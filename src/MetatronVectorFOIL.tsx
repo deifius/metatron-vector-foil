@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { DEFAULT_HUD_CONFIG, DEFAULT_HUD_STATE, HUD_DEV_CONTROLS } from "./ui/hud/hudConfig";
 import { HUDRoot } from "./ui/hud/HUDRoot";
 import { HUDState } from "./ui/hud/hudTypes";
@@ -935,7 +935,8 @@ export default function MetatronVectorFOIL() {
   const [flightHints, setFlightHints] = useState<string[]>(DEFAULT_FLIGHT_HINTS);
   const [insertCoinLines, setInsertCoinLines] = useState<string[]>(DEFAULT_INSERT_COIN_LINES);
   const [menuHintIdx, setMenuHintIdx] = useState(0);
-  const [startBlinkOn, setStartBlinkOn] = useState(true);
+  const [attractIdx, setAttractIdx] = useState(0);
+  const [attractPhaseTick, setAttractPhaseTick] = useState(0);
 
   const modeRef = useRef(mode);
   const levelIdxRef = useRef(levelIdx);
@@ -993,10 +994,70 @@ export default function MetatronVectorFOIL() {
     return () => window.clearInterval(id);
   }, [flightHints]);
 
+
+  const attractSequence = useMemo(() => {
+    const insertCoin = insertCoinLines[0] ?? DEFAULT_INSERT_COIN_LINES[0];
+    const pressStart = insertCoinLines[1] ?? DEFAULT_INSERT_COIN_LINES[1];
+    const remembrance = insertCoinLines[2] ?? DEFAULT_INSERT_COIN_LINES[2];
+    const motto = insertCoinLines[3] ?? DEFAULT_INSERT_COIN_LINES[3];
+    const hint = flightHints[menuHintIdx] ?? DEFAULT_FLIGHT_HINTS[0];
+    return [
+      { id: "online", label: "SYSTEM", headline: "SPHENIC CORSAIR ONLINE", subline: "VECTOR FIELD LOCKED", anim: "flicker" as const, durationMs: 1200 },
+      { id: "title", label: "CABINET", headline: "METATRON VECTOR FOIL", subline: "PILOT SCHOOL READY", anim: "typeon" as const, durationMs: 1800 },
+      { id: "insert", label: "ARCADE", headline: insertCoin, subline: motto, anim: "blink" as const, durationMs: 1300 },
+      { id: "start", label: "LAUNCH", headline: pressStart, subline: "ENTER // LAUNCH", anim: "pulse" as const, durationMs: 1900 },
+      { id: "dual", label: "ARCADE", headline: `${insertCoin} // ${pressStart}`, subline: remembrance, anim: "pulse" as const, durationMs: 2200 },
+      { id: "hint", label: "FLIGHT HINT", headline: hint.toUpperCase(), subline: "RETURN TO THE BURN", anim: "typeon" as const, durationMs: 2600 },
+    ];
+  }, [flightHints, insertCoinLines, menuHintIdx]);
+
+  const currentAttract = attractSequence[attractIdx % attractSequence.length];
+  const attractPhase = attractPhaseTick / 10;
+  const attractPulse = 0.76 + 0.24 * ((Math.sin(attractPhase * Math.PI * 2) + 1) / 2);
+  const attractBlinkOn = attractPhaseTick % 12 < 8;
+  const attractFlickerOn = ![1, 5, 11].includes(attractPhaseTick % 16);
+  const headlineChars = Math.max(1, Math.floor(attractPhaseTick * 1.8));
+  const sublineChars = Math.max(1, Math.floor(attractPhaseTick * 2.4) - 6);
+  const featuredHeadline = currentAttract.anim === "typeon"
+    ? currentAttract.headline.slice(0, headlineChars)
+    : currentAttract.headline;
+  const featuredSubline = currentAttract.anim === "typeon"
+    ? currentAttract.subline.slice(0, sublineChars)
+    : currentAttract.subline;
+  const featuredOpacity = currentAttract.anim === "blink"
+    ? (attractBlinkOn ? 1 : 0.14)
+    : currentAttract.anim === "flicker"
+      ? (attractFlickerOn ? 1 : 0.35)
+      : currentAttract.anim === "pulse"
+        ? attractPulse
+        : 0.94;
+  const featuredGlow = currentAttract.anim === "pulse"
+    ? 0.55 + 0.45 * attractPulse
+    : currentAttract.anim === "flicker"
+      ? (attractFlickerOn ? 0.9 : 0.2)
+      : currentAttract.anim === "blink"
+        ? (attractBlinkOn ? 0.85 : 0.08)
+        : 0.72;
+
   useEffect(() => {
-    const id = window.setInterval(() => setStartBlinkOn((on) => !on), 650);
-    return () => window.clearInterval(id);
-  }, []);
+    if (mode !== "menu") {
+      setAttractIdx(0);
+      setAttractPhaseTick(0);
+      return;
+    }
+    setAttractPhaseTick(0);
+    const tickId = window.setInterval(() => setAttractPhaseTick((t) => t + 1), 90);
+    return () => window.clearInterval(tickId);
+  }, [mode, attractIdx]);
+
+  useEffect(() => {
+    if (mode !== "menu") return;
+    const timeoutId = window.setTimeout(() => {
+      setAttractIdx((idx) => (idx + 1) % attractSequence.length);
+    }, currentAttract.durationMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [mode, attractSequence.length, currentAttract.durationMs, attractIdx]);
+
 
   const getLevel = (idx: number): Level => {
     const wave = idx + 1;
@@ -2188,65 +2249,119 @@ export default function MetatronVectorFOIL() {
 
       {/* Start screen */}
       {mode === "menu" && (
-        <Overlay>
-          <div style={{ display: "grid", gap: 16 }}>
-            <div style={{ display: "grid", gap: 8, justifyItems: "center", textAlign: "center" }}>
-              <div style={{ fontSize: 12, letterSpacing: "0.28em", color: "rgba(189,215,238,0.68)" }}>
-                {insertCoinLines[2] ?? DEFAULT_INSERT_COIN_LINES[2]}
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            padding: 22,
+            color: "rgba(210,238,255,0.92)",
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+            background: "linear-gradient(180deg, rgba(2,6,12,0.28), rgba(0,0,0,0.16))",
+          }}
+        >
+          <div
+            aria-hidden
+            style={{
+              position: "absolute",
+              inset: 0,
+              pointerEvents: "none",
+              opacity: 0.12,
+              backgroundImage: "repeating-linear-gradient(180deg, rgba(170,220,255,0.22) 0px, rgba(170,220,255,0.22) 1px, transparent 1px, transparent 4px)",
+              mixBlendMode: "screen",
+            }}
+          />
+          <div
+            aria-hidden
+            style={{
+              position: "absolute",
+              inset: 14,
+              pointerEvents: "none",
+              border: "1px solid rgba(152,206,255,0.08)",
+              boxShadow: "inset 0 0 28px rgba(90,150,210,0.06), 0 0 24px rgba(90,150,210,0.04)",
+            }}
+          />
+
+          <div style={{ position: "relative", zIndex: 2, display: "grid", gridTemplateRows: "auto 1fr", height: "100%" }}>
+            <div style={{ display: "grid", justifyItems: "center", gap: 8, marginTop: 48, textAlign: "center" }}>
+              <div style={{ fontSize: 10, letterSpacing: "0.38em", color: "rgba(144,198,245,0.74)" }}>{currentAttract.label}</div>
+              <div
+                style={{
+                  minHeight: 46,
+                  padding: "0 14px",
+                  fontSize: 34,
+                  letterSpacing: "0.18em",
+                  textTransform: "uppercase",
+                  color: `rgba(214,242,255,${featuredOpacity})`,
+                  textShadow: `0 0 ${18 + featuredGlow * 18}px rgba(160,220,255,${0.18 + featuredGlow * 0.28})`,
+                }}
+              >
+                {featuredHeadline}
               </div>
-              <h1 style={{ margin: 0, fontSize: 34, letterSpacing: "0.08em", textTransform: "uppercase" }}>Metatron Vector FOIL</h1>
-              <div style={{ fontSize: 15, color: "rgba(240,246,255,0.76)", maxWidth: 700, lineHeight: 1.45 }}>
-                Survive each incoming wave of Platonic solids, hold a disciplined orbit, and build score through
-                pilotage, gunnery, and awakened geometry.
+              <div
+                style={{
+                  minHeight: 18,
+                  fontSize: 12,
+                  letterSpacing: "0.24em",
+                  textTransform: "uppercase",
+                  color: `rgba(243,214,152,${0.72 + featuredGlow * 0.22})`,
+                  textShadow: `0 0 ${8 + featuredGlow * 8}px rgba(243,214,152,0.2)`,
+                }}
+              >
+                {featuredSubline}
               </div>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1.15fr 0.95fr", gap: 16, alignItems: "stretch" }}>
-              <div style={{ border: "1px solid rgba(180,220,255,0.12)", borderRadius: 16, padding: "18px 18px 16px 18px", background: "rgba(255,255,255,0.04)" }}>
-                <div style={{ fontSize: 11, letterSpacing: "0.18em", color: "rgba(180,210,255,0.66)" }}>PILOT SCHOOL // INSERT COIN</div>
-                <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
-                  <div style={{ fontSize: 22, letterSpacing: "0.18em", color: "rgba(246,219,162,0.96)", textShadow: "0 0 16px rgba(246,219,162,0.3)" }}>
-                    {insertCoinLines[0] ?? DEFAULT_INSERT_COIN_LINES[0]}
+            <div style={{ display: "grid", placeItems: "center", marginTop: 18 }}>
+              <div style={{ width: "min(980px, 95vw)", display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: 18, alignItems: "stretch" }}>
+                <VectorFrame title="PILOT SCHOOL // INSERT COIN">
+                  <div style={{ display: "grid", gap: 10 }}>
+                    <div style={{ fontSize: 22, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(243,214,152,0.96)", textShadow: "0 0 12px rgba(243,214,152,0.18)" }}>
+                      {insertCoinLines[0] ?? DEFAULT_INSERT_COIN_LINES[0]}
+                    </div>
+                    <div style={{ fontSize: 20, letterSpacing: "0.18em", textTransform: "uppercase", color: currentAttract.id === "start" || currentAttract.id === "dual" ? `rgba(176,255,218,${0.5 + featuredGlow * 0.45})` : "rgba(176,255,218,0.72)", textShadow: `0 0 ${10 + featuredGlow * 8}px rgba(145,255,212,0.24)` }}>
+                      {insertCoinLines[1] ?? DEFAULT_INSERT_COIN_LINES[1]}
+                    </div>
+                    <div style={{ fontSize: 11, letterSpacing: "0.18em", color: "rgba(170,214,248,0.72)", textTransform: "uppercase" }}>
+                      {insertCoinLines[2] ?? DEFAULT_INSERT_COIN_LINES[2]}
+                    </div>
                   </div>
-                  <div
-                    style={{
-                      minHeight: 28,
-                      fontSize: 20,
-                      letterSpacing: "0.16em",
-                      color: startBlinkOn ? "rgba(200,255,220,0.96)" : "rgba(200,255,220,0.24)",
-                      textShadow: startBlinkOn ? "0 0 16px rgba(145,255,212,0.35)" : "none",
-                      transition: "color 140ms linear, text-shadow 140ms linear",
-                    }}
-                  >
-                    {insertCoinLines[1] ?? DEFAULT_INSERT_COIN_LINES[1]}
-                  </div>
-                  <div style={{ fontSize: 12, letterSpacing: "0.12em", color: "rgba(189,215,238,0.62)" }}>
-                    {insertCoinLines[3] ?? DEFAULT_INSERT_COIN_LINES[3]}
-                  </div>
-                </div>
 
-                <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "auto 1fr", gap: 10, alignItems: "center" }}>
-                  <Keycap>Enter</Keycap><span style={{ opacity: 0.9 }}>Launch</span>
-                  <Keycap>A/D</Keycap><span style={{ opacity: 0.85 }}>Rotate the foil</span>
-                  <Keycap>W</Keycap><span style={{ opacity: 0.85 }}>Thrust and catch light</span>
-                  <Keycap>S</Keycap><span style={{ opacity: 0.85 }}>Brake with drag</span>
-                  <Keycap>Space</Keycap><span style={{ opacity: 0.85 }}>Fire a salvo</span>
-                  <Keycap>P</Keycap><span style={{ opacity: 0.85 }}>Pause / tune the universe</span>
-                </div>
-              </div>
+                  <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "auto 1fr", gap: 10, alignItems: "center" }}>
+                    <Keycap>Enter</Keycap><span style={{ opacity: 0.92 }}>Launch</span>
+                    <Keycap>A/D</Keycap><span style={{ opacity: 0.86 }}>Rotate the foil</span>
+                    <Keycap>W</Keycap><span style={{ opacity: 0.86 }}>Thrust and catch light</span>
+                    <Keycap>S</Keycap><span style={{ opacity: 0.86 }}>Brake with drag</span>
+                    <Keycap>Space</Keycap><span style={{ opacity: 0.86 }}>Fire a salvo</span>
+                    <Keycap>P</Keycap><span style={{ opacity: 0.86 }}>Pause / tune the universe</span>
+                  </div>
 
-              <div style={{ border: "1px solid rgba(180,220,255,0.12)", borderRadius: 16, padding: "16px 16px 14px 16px", background: "rgba(255,255,255,0.03)", display: "grid", alignContent: "start", gap: 10 }}>
-                <div style={{ fontSize: 11, letterSpacing: "0.18em", color: "rgba(180,210,255,0.66)" }}>FLIGHT HINT</div>
-                <div style={{ fontSize: 20, lineHeight: 1.35, color: "rgba(246,219,162,0.96)", minHeight: 86 }}>
-                  {flightHints[menuHintIdx] ?? DEFAULT_FLIGHT_HINTS[0]}
-                </div>
-                <div style={{ fontSize: 11, color: "rgba(189,215,238,0.62)", lineHeight: 1.45 }}>
-                  Burn prograde to raise apoapsis. Burn retrograde to fall inward. Slingshots reward courage and geometry.
-                </div>
+                  <div style={{ marginTop: 16, display: "grid", gap: 6, fontSize: 10, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(140,198,244,0.62)" }}>
+                    <div>Gravitic trace stable</div>
+                    <div>Solution envelope nominal</div>
+                    <div>Further in. Faster through.</div>
+                  </div>
+                </VectorFrame>
+
+                <VectorFrame title="FLIGHT HINT // ATTRACT MODE">
+                  <div style={{ minHeight: 96, display: "grid", gap: 10, alignContent: "start" }}>
+                    <div style={{ fontSize: 22, lineHeight: 1.28, color: "rgba(243,214,152,0.96)", textShadow: "0 0 10px rgba(243,214,152,0.12)" }}>
+                      {flightHints[menuHintIdx] ?? DEFAULT_FLIGHT_HINTS[0]}
+                    </div>
+                    <div style={{ fontSize: 11, lineHeight: 1.55, color: "rgba(170,214,248,0.7)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                      Burn prograde to raise apoapsis. Burn retrograde to fall inward. Slingshots reward courage and geometry.
+                    </div>
+                  </div>
+
+                  <div style={{ marginTop: 22, display: "grid", gap: 8 }}>
+                    <VectorTelemetry label="NEXT MESSAGE" value={attractSequence[(attractIdx + 1) % attractSequence.length].headline} />
+                    <VectorTelemetry label="ALERT BUS" value="PILOT INPUT REQUIRED" />
+                    <VectorTelemetry label="TREE STATUS" value="AWAKEN WHAT YOU TOUCH" />
+                  </div>
+                </VectorFrame>
               </div>
             </div>
           </div>
-        </Overlay>
+        </div>
       )}
 
       {/* Pause menu */}
@@ -2319,6 +2434,35 @@ export default function MetatronVectorFOIL() {
 }
 
 // ===================== UI COMPONENTS =====================
+function VectorFrame({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div style={{
+      position: "relative",
+      minHeight: 280,
+      border: "1px solid rgba(150,205,255,0.22)",
+      boxShadow: "inset 0 0 28px rgba(100,170,230,0.05), 0 0 18px rgba(100,170,230,0.04)",
+      background: "rgba(6,16,24,0.14)",
+      padding: "16px 18px 18px 18px",
+      overflow: "hidden",
+    }}>
+      <div aria-hidden style={{ position: "absolute", inset: 8, border: "1px solid rgba(150,205,255,0.08)", pointerEvents: "none" }} />
+      <div style={{ position: "relative", zIndex: 1 }}>
+        <div style={{ marginBottom: 14, fontSize: 11, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(150,205,255,0.7)" }}>{title}</div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function VectorTelemetry({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ display: "grid", gap: 4, borderTop: "1px solid rgba(150,205,255,0.14)", paddingTop: 8 }}>
+      <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.56)" }}>{label}</div>
+      <div style={{ fontSize: 13, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(214,242,255,0.86)" }}>{value}</div>
+    </div>
+  );
+}
+
 function Overlay({ children }: { children: React.ReactNode }) {
   return (
     <div style={{
