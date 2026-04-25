@@ -143,6 +143,7 @@ const T = {
   AUDIO_MODE_PLAYING_DRONES: 1.0,      // drone bus multiplier while playing
   AUDIO_MODE_PAUSED_DRONES: 0.38,      // drone bus multiplier while paused
   AUDIO_MODE_TRANSITION_DRONES: 0.82,  // drone bus multiplier between waves
+  AUDIO_MODE_DEBRIEF_DRONES: 0.16,     // drone bus multiplier during death/debrief ritual
 
   AUDIO_THRUST_URL: "/static/audio/thrust.wav",
   AUDIO_BLASTER_URL: "/static/audio/blaster-fire.wav",
@@ -341,6 +342,38 @@ type WaveCitationFlags = {
   periapsisKiss: boolean;
 };
 
+type DebriefPhase = "inactive" | "burn_fade" | "game_over_hold" | "plotting" | "ready";
+type DeathCauseKey = "shrapnel" | "enemy" | "well" | "sol" | "fuel" | "collapse";
+type DebriefSnapshot = {
+  causeKey: DeathCauseKey;
+  causeLabel: string;
+  score: number;
+  wave: number;
+  survivalTimeSec: number;
+  bestChain: number;
+  citations: number;
+  spheresAwakened: number;
+  totalSpheresLit: number;
+  topCitation: string;
+  bestShotDistance: number;
+  peakPseudoG: number;
+  furthestRadius: number;
+};
+type DebriefUIState = {
+  phase: DebriefPhase;
+  phaseElapsedMs: number;
+  visibleRows: number;
+  snapshot: DebriefSnapshot | null;
+};
+
+const DEBRIEF_SEQUENCE = {
+  burnFadeMs: 2250,
+  gameOverHoldMs: 3750,
+  rowRevealMs: 900,
+  readyPromptDelayMs: 1200,
+  autoReturnMs: 24000,
+} as const;
+
 const DEFAULT_INSERT_COIN_LINES = [
   "INSERT COIN",
   "PRESS START",
@@ -355,6 +388,22 @@ const DEFAULT_FLIGHT_HINTS = [
   "Return to the burn.",
   "Wide Oort excursions reset the fight on your terms.",
   "Long shots count more when the void agrees with you.",
+];
+
+const DEFAULT_DEATH_CAUSE_LINES = [
+  "DESTROYED BY SHRAPNEL",
+  "LOST TO THE WELL",
+  "SOL BREACHED",
+  "STRUCTURAL FAILURE",
+  "OUT OF FUEL",
+  "VECTOR COLLAPSE",
+];
+
+const DEFAULT_GAME_OVER_LINES = [
+  "GAME OVER",
+  "PILOT DEBRIEF",
+  "TOP CALLSIGNS APPROACH",
+  "PRESS START TO FLY AGAIN",
 ];
 
 const DEFAULT_COMMENDATIONS: CommendationDefinition[] = [
@@ -381,7 +430,7 @@ function scoreAlertSeverity(tier: 1 | 2 | 3): HUDState["alert"]["severity"] {
 }
 
 // ===================== WEB AUDIO (DRONES + SFX) =====================
-type GameMode = "menu" | "playing" | "paused" | "transition";
+type GameMode = "menu" | "playing" | "paused" | "transition" | "debrief";
 
 const AUDIO = {
   MASTER_GAIN: T.MASTER_VOL,
@@ -434,6 +483,7 @@ const AUDIO = {
     playing: T.AUDIO_MODE_PLAYING_DRONES,
     paused: T.AUDIO_MODE_PAUSED_DRONES,
     transition: T.AUDIO_MODE_TRANSITION_DRONES,
+    debrief: T.AUDIO_MODE_DEBRIEF_DRONES,
   } as const,
   FALLBACK_BUFFER_SECONDS: 6,
 };
@@ -909,6 +959,23 @@ class AudioEngine {
   }
   explode() { this.shipDestroyed(); }
 
+  cueDebriefPhase(phase: DebriefPhase) {
+    // Placeholder hooks for future music / SFX scoring of the death ritual.
+    // Keep the phase entry points explicit so a dirge, plot ticks, and leaderboard sting
+    // can be layered in later without rewriting the sequence logic.
+    if (!this.ctx || !this.sfxBus) return;
+    if (phase === "burn_fade") {
+      this.setThrust(0);
+      return;
+    }
+    if (phase === "plotting") {
+      return;
+    }
+    if (phase === "ready") {
+      return;
+    }
+  }
+
   stop() {
     if (!this.ctx) return;
     const t = this.ctx.currentTime;
@@ -927,13 +994,16 @@ export default function MetatronVectorFOIL() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // UI state
-  const [mode, setMode] = useState<"menu" | "playing" | "paused" | "transition">("menu");
+  const [mode, setMode] = useState<GameMode>("menu");
   const [levelIdx, setLevelIdx] = useState(0);
   const [toggles, setToggles] = useState({ metatron: true, trails: true, debug: T.DEBUG_TEXT });
   const [hudState, setHUDState] = useState<HUDState>(DEFAULT_HUD_STATE);
   const [hudConfig, setHUDConfig] = useState(DEFAULT_HUD_CONFIG);
   const [flightHints, setFlightHints] = useState<string[]>(DEFAULT_FLIGHT_HINTS);
   const [insertCoinLines, setInsertCoinLines] = useState<string[]>(DEFAULT_INSERT_COIN_LINES);
+  const [deathCauseLines, setDeathCauseLines] = useState<string[]>(DEFAULT_DEATH_CAUSE_LINES);
+  const [gameOverLines, setGameOverLines] = useState<string[]>(DEFAULT_GAME_OVER_LINES);
+  const [debriefUI, setDebriefUI] = useState<DebriefUIState>({ phase: "inactive", phaseElapsedMs: 0, visibleRows: 0, snapshot: null });
   const [menuHintIdx, setMenuHintIdx] = useState(0);
   const [attractIdx, setAttractIdx] = useState(0);
   const [attractPhaseTick, setAttractPhaseTick] = useState(0);
@@ -977,6 +1047,12 @@ export default function MetatronVectorFOIL() {
       .catch(() => undefined);
     loadTextLines("/static/text/insert-coin.txt")
       .then((lines) => { if (!cancelled && lines.length > 0) setInsertCoinLines(lines); })
+      .catch(() => undefined);
+    loadTextLines("/static/text/death-causes.txt")
+      .then((lines) => { if (!cancelled && lines.length > 0) setDeathCauseLines(lines); })
+      .catch(() => undefined);
+    loadTextLines("/static/text/game-over.txt")
+      .then((lines) => { if (!cancelled && lines.length > 0) setGameOverLines(lines); })
       .catch(() => undefined);
     loadJson<CommendationDefinition[]>("/static/text/commendations.json")
       .then((items) => {
@@ -1101,6 +1177,7 @@ export default function MetatronVectorFOIL() {
     window.addEventListener("resize", onResize);
 
     // ---- input ----
+    let onDebriefAdvance: (() => void) | null = null;
     const keys = keysRef.current;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === " ") e.preventDefault();
@@ -1110,10 +1187,18 @@ export default function MetatronVectorFOIL() {
       keys.add(e.key);
 
       if (e.key === "Enter") {
+        if (modeRef.current === "debrief") {
+          onDebriefAdvance?.();
+          return;
+        }
         if (modeRef.current === "menu" || modeRef.current === "paused") {
           modeRef.current = "playing";
           setMode("playing");
         }
+      }
+      if ((e.key === " " || e.key === "Space") && modeRef.current === "debrief") {
+        onDebriefAdvance?.();
+        return;
       }
       if (e.key === "p" || e.key === "P") {
         setMode((m) => {
@@ -1234,6 +1319,45 @@ export default function MetatronVectorFOIL() {
       waveActive = false;
     };
 
+    const deathCauseLabelFor = (causeKey: DeathCauseKey) => {
+      const lines = deathCauseLines.length > 0 ? deathCauseLines : DEFAULT_DEATH_CAUSE_LINES;
+      const indexByKey: Record<DeathCauseKey, number> = {
+        shrapnel: 0,
+        well: 1,
+        sol: 2,
+        enemy: 3,
+        fuel: 4,
+        collapse: 5,
+      };
+      return lines[indexByKey[causeKey]] ?? DEFAULT_DEATH_CAUSE_LINES[indexByKey[causeKey]];
+    };
+
+    const getDebriefRowTotal = (snapshot: DebriefSnapshot | null) => (snapshot ? 8 : 0);
+
+    let debriefPhase: DebriefPhase = "inactive";
+    let debriefPhaseElapsedMs = 0;
+    let debriefVisibleRows = 0;
+    let debriefSnapshot: DebriefSnapshot | null = null;
+    let debriefPublishAccumulator = 0;
+
+    const publishDebriefUI = () => {
+      setDebriefUI({
+        phase: debriefPhase,
+        phaseElapsedMs: debriefPhaseElapsedMs,
+        visibleRows: debriefVisibleRows,
+        snapshot: debriefSnapshot ? { ...debriefSnapshot } : null,
+      });
+    };
+
+    const setDebriefPhaseNow = (next: DebriefPhase) => {
+      debriefPhase = next;
+      debriefPhaseElapsedMs = 0;
+      if (next === "plotting") debriefVisibleRows = 0;
+      if (next === "ready") debriefVisibleRows = getDebriefRowTotal(debriefSnapshot);
+      audioRef.current.cueDebriefPhase(next);
+      publishDebriefUI();
+    };
+
     const resetRun = (toMenu = false) => {
       bullets.length = 0; enemies.length = 0; shards.length = 0; fuelBits.length = 0; trail.length = 0;
       resetMetaNodes();
@@ -1263,6 +1387,19 @@ export default function MetatronVectorFOIL() {
       currentBurstId = 0;
       burstStats.clear();
       allSpheresLitAwarded = false;
+      runAwakenedCount = 0;
+      bestShotDistance = 0;
+      peakPseudoG = 0;
+      furthestRadius = metaRadius;
+      topCitationId = null;
+      topCitationTier = 0;
+      topCitationScore = 0;
+      debriefPhase = "inactive";
+      debriefPhaseElapsedMs = 0;
+      debriefVisibleRows = 0;
+      debriefSnapshot = null;
+      debriefPublishAccumulator = 0;
+      setDebriefUI({ phase: "inactive", phaseElapsedMs: 0, visibleRows: 0, snapshot: null });
       resetWaveFlags();
       audioRef.current.stop();
       audioRef.current.setMode(toMenu ? "menu" : "playing");
@@ -1491,17 +1628,54 @@ export default function MetatronVectorFOIL() {
       return true;
     };
 
-    const loseRun = (reason: "ship" | "sol" = "ship") => {
-      if (reason === "sol") audioRef.current.solDestroyed();
-      else audioRef.current.shipDestroyed();
+    const buildDebriefSnapshot = (causeKey: DeathCauseKey): DebriefSnapshot => ({
+      causeKey,
+      causeLabel: deathCauseLabelFor(causeKey),
+      score: Math.round(score),
+      wave: getLevel(levelIdxRef.current).wave,
+      survivalTimeSec: runClockMs / 1000,
+      bestChain: bestChainMultiplier,
+      citations: citationCount,
+      spheresAwakened: runAwakenedCount,
+      totalSpheresLit: metaNodes.filter((node) => node.kind !== "center" && node.awakened).length,
+      topCitation: topCitationId ? (getCommendation(topCitationId)?.label ?? String(topCitationId).toUpperCase()) : "NONE LOGGED",
+      bestShotDistance,
+      peakPseudoG,
+      furthestRadius,
+    });
+
+    const enterDebrief = (causeKey: DeathCauseKey) => {
+      debriefSnapshot = buildDebriefSnapshot(causeKey);
+      debriefVisibleRows = 0;
+      debriefPublishAccumulator = 0;
+      modeRef.current = "debrief";
+      setMode("debrief");
+      setDebriefPhaseNow("burn_fade");
+    };
+
+    onDebriefAdvance = () => {
+      if (!debriefSnapshot) {
+        resetRun(true);
+        return;
+      }
+      if (debriefPhase !== "ready") {
+        setDebriefPhaseNow("ready");
+        return;
+      }
       resetRun(true);
     };
 
-    const killPlayer = () => {
-      loseRun("ship");
+    const loseRun = (reason: "ship" | "sol" = "ship", causeKey: DeathCauseKey = reason === "sol" ? "sol" : "enemy") => {
+      if (reason === "sol") audioRef.current.solDestroyed();
+      else audioRef.current.shipDestroyed();
+      enterDebrief(causeKey);
     };
 
-    const applyShipHit = (sourcePos?: V2) => {
+    const killPlayer = (causeKey: DeathCauseKey = "enemy") => {
+      loseRun("ship", causeKey);
+    };
+
+    const applyShipHit = (sourcePos?: V2, causeKey: DeathCauseKey = "enemy") => {
       if (player.hitInvuln > 0) return false;
       player.hitsTaken += 1;
       player.hitInvuln = T.SHIP_HIT_IFRAME_SEC;
@@ -1515,7 +1689,7 @@ export default function MetatronVectorFOIL() {
 
       audioRef.current.hit();
       if (player.hitsTaken >= T.SHIP_RESILIENCE) {
-        killPlayer();
+        killPlayer(causeKey);
         return true;
       }
       return false;
@@ -1554,6 +1728,13 @@ export default function MetatronVectorFOIL() {
     let slingshotEntrySpeed = 0;
     let slingshotMinRadius = Infinity;
     let lastHighGAtMs = -Infinity;
+    let runAwakenedCount = 0;
+    let bestShotDistance = 0;
+    let peakPseudoG = 0;
+    let furthestRadius = metaRadius;
+    let topCitationId: CommendationDefinition["id"] | null = null;
+    let topCitationTier = 0;
+    let topCitationScore = 0;
     let waveFlags: WaveCitationFlags = { oortReach: false, farOortReach: false, returnToTheBurn: false, periapsisKiss: false };
 
     const resetWaveFlags = () => {
@@ -1620,8 +1801,19 @@ export default function MetatronVectorFOIL() {
 
     const awardCitation = (id: CommendationDefinition["id"], category: CitationCategory) => {
       const def = getCommendation(id);
+      const citationScore = scoreForCitation(id);
       citationCount += 1;
-      return awardPoints(scoreForCitation(id), category, {
+      const tier = def?.tier ?? 1;
+      if (
+        !topCitationId ||
+        tier > topCitationTier ||
+        (tier === topCitationTier && citationScore >= topCitationScore)
+      ) {
+        topCitationId = id;
+        topCitationTier = tier;
+        topCitationScore = citationScore;
+      }
+      return awardPoints(citationScore, category, {
         showAlert: true,
         label: def?.label ?? String(id).toUpperCase(),
         subtitle: def?.subtitle,
@@ -1739,7 +1931,37 @@ export default function MetatronVectorFOIL() {
       metaPulseClock += dt;
       syncMetaNodeWorldPositions();
 
-      // handle pause/menu/transition
+      // handle pause/menu/debrief/transition
+      if (modeRef.current === "debrief") {
+        debriefPhaseElapsedMs += dt * 1000;
+        debriefPublishAccumulator += dt * 1000;
+        if (debriefPhase === "burn_fade" && debriefPhaseElapsedMs >= DEBRIEF_SEQUENCE.burnFadeMs) {
+          setDebriefPhaseNow("game_over_hold");
+        } else if (debriefPhase === "game_over_hold" && debriefPhaseElapsedMs >= DEBRIEF_SEQUENCE.gameOverHoldMs) {
+          setDebriefPhaseNow("plotting");
+        } else if (debriefPhase === "plotting") {
+          debriefVisibleRows = Math.min(
+            getDebriefRowTotal(debriefSnapshot),
+            Math.floor(debriefPhaseElapsedMs / DEBRIEF_SEQUENCE.rowRevealMs),
+          );
+          if (
+            debriefVisibleRows >= getDebriefRowTotal(debriefSnapshot) &&
+            debriefPhaseElapsedMs >= getDebriefRowTotal(debriefSnapshot) * DEBRIEF_SEQUENCE.rowRevealMs + DEBRIEF_SEQUENCE.readyPromptDelayMs
+          ) {
+            setDebriefPhaseNow("ready");
+          }
+        } else if (debriefPhase === "ready" && debriefPhaseElapsedMs >= DEBRIEF_SEQUENCE.autoReturnMs) {
+          resetRun(true);
+          return;
+        }
+        if (debriefPublishAccumulator >= 90) {
+          debriefPublishAccumulator = 0;
+          publishDebriefUI();
+        }
+        audioRef.current.updateDrones("debrief", enemies, player, T.STAR_RADIUS, oortOuter);
+        audioRef.current.setThrust(0);
+        return;
+      }
       if (modeRef.current !== "playing") {
         // still animate metatron slowly for menu vibes
         const dist = player.pos.len();
@@ -1813,6 +2035,7 @@ export default function MetatronVectorFOIL() {
 
       const accel = player.vel.copy().sub(velBefore).mul(1 / Math.max(dt, 1e-6));
       const speedNow = player.vel.len();
+      furthestRadius = Math.max(furthestRadius, player.pos.len());
       if (!waveFlags.oortReach && player.pos.len() >= SCORE_THRESHOLDS.oortReachRadius) {
         waveFlags.oortReach = true;
         awardCitation("oortReach", "pilotage");
@@ -1846,6 +2069,7 @@ export default function MetatronVectorFOIL() {
         const vhat = player.vel.copy().mul(1 / speedNow);
         const lateral = accel.copy().sub(vhat.copy().mul(accel.dot(vhat)));
         const pseudoG = lateral.len() / 250;
+        peakPseudoG = Math.max(peakPseudoG, pseudoG);
         if (pseudoG >= SCORE_THRESHOLDS.highGTurn && runClockMs - lastHighGAtMs > 4500 && (enemies.length > 0 || player.pos.len() < horizonR * 1.2)) {
           awardCitation(pseudoG >= SCORE_THRESHOLDS.extremeGTurn ? "extremeGTurn" : "highGTurn", "pilotage");
           lastHighGAtMs = runClockMs;
@@ -1857,7 +2081,7 @@ export default function MetatronVectorFOIL() {
       if (dStar < T.STAR_TRAP_RADIUS && player.vel.len() < 120) {
         player.stuckTime += dt;
         if (player.stuckTime >= T.STAR_TRAP_TIME) {
-          loseRun("ship");
+          loseRun("ship", player.fuel <= 0 ? "fuel" : "well");
           return;
         }
       } else {
@@ -1945,7 +2169,7 @@ export default function MetatronVectorFOIL() {
         const toPlayer = player.pos.copy().sub(e.pos);
         const enemyHitR = Math.max(8, e.r * T.ENEMY_HIT_RADIUS_MULT);
         if (toPlayer.len() <= T.SHIP_HIT_RADIUS + enemyHitR) {
-          if (applyShipHit(e.pos.copy())) return;
+          if (applyShipHit(e.pos.copy(), "enemy")) return;
         }
 
         const starLossR = T.STAR_RADIUS + e.r * 0.4;
@@ -1969,6 +2193,7 @@ export default function MetatronVectorFOIL() {
           if (!impact) continue;
 
           const shotDistance = impact.point.copy().sub(b.origin).len();
+          bestShotDistance = Math.max(bestShotDistance, shotDistance);
           if (shotDistance >= SCORE_THRESHOLDS.longShotDistance) {
             awardCitation(shotDistance >= SCORE_THRESHOLDS.extremeLongShotDistance ? "extremeLongShot" : "longShot", "gunnery");
           }
@@ -1976,7 +2201,10 @@ export default function MetatronVectorFOIL() {
           const overchargeSphere = e.kind === "tetra" && DOWNGRADE[e.kind] === null;
           spawnShrapnel(e, impact);
           const chargeResult = chargeMetaNodeAt(impact.point, overchargeSphere);
-          if (chargeResult.newlyAwakened) awardCitation("nodeAwakened", "geometry");
+          if (chargeResult.newlyAwakened) {
+            runAwakenedCount += 1;
+            awardCitation("nodeAwakened", "geometry");
+          }
           if (chargeResult.allLit && !allSpheresLitAwarded) {
             allSpheresLitAwarded = true;
             awardCitation("allSpheresLit", "geometry");
@@ -2003,7 +2231,7 @@ export default function MetatronVectorFOIL() {
         s.life -= dt;
 
         if (s.pos.copy().sub(player.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD) {
-          if (applyShipHit(s.pos.copy())) return;
+          if (applyShipHit(s.pos.copy(), "shrapnel")) return;
           shards.splice(i, 1);
           continue;
         }
@@ -2205,6 +2433,11 @@ export default function MetatronVectorFOIL() {
         horizonR, oortInner, oortOuter,
         waveBannerTimer,
         waveBannerText,
+        debrief: {
+          phase: debriefPhase,
+          phaseElapsedMs: debriefPhaseElapsedMs,
+          snapshot: debriefSnapshot,
+        },
       });
 
       raf = requestAnimationFrame(loop);
@@ -2224,6 +2457,10 @@ export default function MetatronVectorFOIL() {
   }, []);
 
   // ===================== UI =====================
+  const debriefHudFade = mode === "debrief"
+    ? Math.max(0, 1 - (debriefUI.phase === "burn_fade" ? debriefUI.phaseElapsedMs / DEBRIEF_SEQUENCE.burnFadeMs : 1))
+    : 1;
+
   return (
     <div
       style={{
@@ -2245,7 +2482,9 @@ export default function MetatronVectorFOIL() {
           height: "100%",
         }}
       />
-      <HUDRoot state={hudState} config={hudConfig} />
+            <div style={{ opacity: debriefHudFade, pointerEvents: debriefHudFade <= 0.001 ? "none" : undefined }}>
+        <HUDRoot state={hudState} config={hudConfig} />
+      </div>
 
       {/* Start screen */}
       {mode === "menu" && (
@@ -2364,6 +2603,16 @@ export default function MetatronVectorFOIL() {
         </div>
       )}
 
+      {mode === "debrief" && debriefUI.snapshot && (
+        <DebriefOverlay
+          ui={debriefUI}
+          headline={gameOverLines[0] ?? DEFAULT_GAME_OVER_LINES[0]}
+          subline={gameOverLines[1] ?? DEFAULT_GAME_OVER_LINES[1]}
+          footer={gameOverLines[3] ?? DEFAULT_GAME_OVER_LINES[3]}
+          tertiary={gameOverLines[2] ?? DEFAULT_GAME_OVER_LINES[2]}
+        />
+      )}
+
       {/* Pause menu */}
       {mode === "paused" && (
         <Overlay>
@@ -2463,6 +2712,81 @@ function VectorTelemetry({ label, value }: { label: string; value: string }) {
   );
 }
 
+function PlotField({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ display: "grid", gap: 6, paddingBottom: 12, borderBottom: "1px solid rgba(150,205,255,0.1)" }}>
+      <div style={{ fontSize: 10, letterSpacing: "0.26em", textTransform: "uppercase", color: "rgba(146,198,242,0.52)" }}>{label}</div>
+      <div style={{ fontSize: 18, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(222,242,255,0.9)", textShadow: "0 0 12px rgba(165,220,255,0.14)" }}>{value}</div>
+    </div>
+  );
+}
+
+function DebriefOverlay({
+  ui,
+  headline,
+  subline,
+  footer,
+  tertiary,
+}: {
+  ui: DebriefUIState;
+  headline: string;
+  subline: string;
+  footer: string;
+  tertiary: string;
+}) {
+  const snapshot = ui.snapshot;
+  if (!snapshot) return null;
+  const holdTitle = ui.phase === "game_over_hold" || ui.phase === "plotting" || ui.phase === "ready";
+  const rows = [
+    { label: "Cause of Loss", value: snapshot.causeLabel },
+    { label: "Final Score", value: snapshot.score.toLocaleString() },
+    { label: "Wave Reached", value: String(snapshot.wave) },
+    { label: "Survival Time", value: formatDurationClock(snapshot.survivalTimeSec) },
+    { label: "Best Flight Chain", value: `${snapshot.bestChain.toFixed(2)}x` },
+    { label: "Top Citation", value: snapshot.topCitation },
+    { label: "Spheres Awakened", value: `${snapshot.spheresAwakened} // TREE LIT ${snapshot.totalSpheresLit}/12` },
+    { label: "Flight Trace", value: `${snapshot.bestShotDistance.toFixed(0)}M SHOT // ${snapshot.peakPseudoG.toFixed(1)}G PEAK // ${snapshot.furthestRadius.toFixed(0)}R OUT` },
+  ];
+  const visibleRows = rows.slice(0, ui.visibleRows);
+  const promptVisible = ui.phase === "ready";
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        pointerEvents: "none",
+        color: "rgba(220,242,255,0.92)",
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        padding: "8vh 8vw",
+        display: "grid",
+        alignContent: "center",
+        justifyItems: "center",
+        gap: 18,
+      }}
+    >
+      {holdTitle && (
+        <div style={{ display: "grid", gap: 12, textAlign: "center", justifyItems: "center", minHeight: 120 }}>
+          <div style={{ fontSize: 44, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(234,246,255,0.94)", textShadow: "0 0 18px rgba(170,220,255,0.2)" }}>{headline}</div>
+          <div style={{ fontSize: 12, letterSpacing: "0.32em", textTransform: "uppercase", color: "rgba(244,216,160,0.76)", textShadow: "0 0 12px rgba(244,216,160,0.12)" }}>{subline}</div>
+        </div>
+      )}
+
+      {(ui.phase === "plotting" || ui.phase === "ready") && (
+        <div style={{ width: "min(760px, 72vw)", display: "grid", gap: 14 }}>
+          {visibleRows.map((row) => <PlotField key={row.label} label={row.label} value={row.value} />)}
+        </div>
+      )}
+
+      {promptVisible && (
+        <div style={{ marginTop: 24, display: "grid", gap: 8, justifyItems: "center", textAlign: "center" }}>
+          <div style={{ fontSize: 11, letterSpacing: "0.26em", textTransform: "uppercase", color: "rgba(146,198,242,0.52)" }}>{tertiary}</div>
+          <div style={{ fontSize: 16, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(176,255,218,0.86)", textShadow: "0 0 14px rgba(145,255,212,0.18)" }}>{footer}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Overlay({ children }: { children: React.ReactNode }) {
   return (
     <div style={{
@@ -2557,14 +2881,20 @@ function render(
     oortOuter: number;
     waveBannerTimer: number;
     waveBannerText: string;
+    debrief: { phase: DebriefPhase; phaseElapsedMs: number; snapshot: DebriefSnapshot | null };
   }
 ) {
   const w = canvas.width / dpr;
   const h = canvas.height / dpr;
+  const burnT = S.mode === "debrief" && S.debrief.phase === "burn_fade"
+    ? clamp(S.debrief.phaseElapsedMs / DEBRIEF_SEQUENCE.burnFadeMs, 0, 1)
+    : (S.mode === "debrief" ? 1 : 0);
+  const worldAlpha = S.mode === "debrief" ? Math.pow(1 - burnT, 0.58) : 1;
+  const lineAlpha = S.mode === "debrief" ? Math.pow(1 - burnT, 0.82) : 1;
 
   // background
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = S.toggles.trails ? `rgba(5,6,10,${T.BG_FADE})` : "#05060a";
+  ctx.fillStyle = S.mode === "debrief" ? `rgba(5,6,10,${0.22 + burnT * 0.78})` : (S.toggles.trails ? `rgba(5,6,10,${T.BG_FADE})` : "#05060a");
   ctx.fillRect(0, 0, w, h);
 
   // camera transform (center at star)
@@ -2574,6 +2904,7 @@ function render(
 
   // rings
   ctx.save();
+  ctx.globalAlpha = lineAlpha;
   ctx.lineWidth = 2 / S.camera.zoom;
   ctx.strokeStyle = "rgba(255,160,180,0.22)";
   ctx.beginPath(); arcSafe(ctx, 0, 0, S.horizonR); ctx.stroke();
@@ -2581,6 +2912,7 @@ function render(
 
   // oort band hint
   ctx.save();
+  ctx.globalAlpha = lineAlpha * 0.85;
   ctx.lineWidth = 1 / S.camera.zoom;
   ctx.strokeStyle = "rgba(190,225,255,0.06)";
   ctx.beginPath(); arcSafe(ctx, 0, 0, S.oortOuter); ctx.stroke();
@@ -2588,6 +2920,7 @@ function render(
 
   // star
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, T.STAR_RADIUS * 2.2);
   grad.addColorStop(0, "rgba(255,255,230,0.80)");
   grad.addColorStop(0.2, "rgba(255,210,150,0.25)");
@@ -2607,6 +2940,7 @@ function render(
 
     // edges
     ctx.save();
+    ctx.globalAlpha = lineAlpha;
     ctx.lineWidth = 0.75 / S.camera.zoom;
     ctx.strokeStyle = "rgba(180,220,255,0.12)";
     for (const [i, j] of MET_EDGES) {
@@ -2618,6 +2952,7 @@ function render(
     // circles / spheres
     const t = S.meta.pulseClock;
     ctx.save();
+    ctx.globalAlpha = worldAlpha;
     for (let i = 0; i < C2.length; i++) {
       const c = C2[i];
       const node = S.meta.nodes[i];
@@ -2658,6 +2993,7 @@ function render(
 
   // fuel bits
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   for (const b of S.entities.fuelBits) {
     ctx.fillStyle = `hsla(${Math.round(b.hue)},90%,70%,0.18)`;
     ctx.beginPath(); arcSafe(ctx, b.pos.x, b.pos.y, 12 / S.camera.zoom); ctx.fill();
@@ -2669,6 +3005,7 @@ function render(
 
   // shrapnel
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   for (const s of S.entities.shards) {
     const a = clamp(s.life / s.life0, 0, 1);
     const stroke = `hsla(${Math.round(s.hue)},90%,75%,${0.22 + 0.62 * a})`;
@@ -2690,6 +3027,7 @@ function render(
 
   // enemies
   ctx.save();
+  ctx.globalAlpha = lineAlpha;
   for (const e of S.entities.enemies) {
     const proj: { x: number; y: number }[] = [];
     const squash = Math.sin(Math.PI * clamp(e.morph, 0, 1));
@@ -2715,6 +3053,7 @@ function render(
 
   // bullets
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   ctx.lineWidth = 2 / S.camera.zoom;
   ctx.strokeStyle = "rgba(255,255,200,0.88)";
   ctx.beginPath();
@@ -2728,6 +3067,7 @@ function render(
 
   // contrail
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   ctx.lineWidth = 1.2 / S.camera.zoom;
   ctx.strokeStyle = `rgba(120,255,220,${T.TRAIL_ALPHA})`;
   ctx.beginPath();
@@ -2740,6 +3080,7 @@ function render(
 
   // ship
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   ctx.translate(S.player.pos.x, S.player.pos.y);
   ctx.rotate(S.player.angle);
   ctx.lineWidth = 2.2 / S.camera.zoom;
@@ -2778,6 +3119,13 @@ function updateCamera(camera: { pos: V2; zoom: number }, canvas: HTMLCanvasEleme
   const blend = T.CAMERA_AESTHETIC;
   const target = Math.min(keepZoom, lerp(keepZoom, aesthetic, blend));
   camera.zoom = clamp(lerp(camera.zoom, target, T.CAMERA_LERP), T.CAMERA_ZOOM_FLOOR, T.CAMERA_ZOOM_CEIL);
+}
+
+function formatDurationClock(totalSeconds: number) {
+  const whole = Math.max(0, Math.floor(totalSeconds));
+  const minutes = Math.floor(whole / 60);
+  const seconds = whole % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 function formatNum(v: number) {
