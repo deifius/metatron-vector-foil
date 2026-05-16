@@ -1221,6 +1221,20 @@ async function readJson<T>(url: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
+async function logClientEvent(csrfToken: string, eventType: string, severity: "info" | "warning" | "error", details: Record<string, unknown> = {}) {
+  if (!csrfToken) return;
+  try {
+    await fetch("/api/client-events", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ eventType, severity, details }),
+    });
+  } catch {
+    // Logging must never make gameplay worse. The little black box is useful only if it behaves itself.
+  }
+}
+
 function formatLeaderboardTime(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return "00:00";
   const s = Math.floor(seconds % 60).toString().padStart(2, "0");
@@ -1260,6 +1274,7 @@ export default function MetatronVectorFOIL() {
   const csrfTokenRef = useRef("");
   const playerIdentityRef = useRef<PublicPlayer>(DEFAULT_PLAYER);
   const submitScoreRef = useRef<(snapshot: DebriefSnapshot) => void>(() => undefined);
+  const clientStartupLoggedRef = useRef(false);
   const commendationMapRef = useRef<Record<string, CommendationDefinition>>(buildCommendationMap(DEFAULT_COMMENDATIONS));
   const [sliders, setSliders] = useState({
     gravity: T.GRAVITY_GM,
@@ -1296,8 +1311,12 @@ export default function MetatronVectorFOIL() {
     try {
       const board = await readJson<LeaderboardResponse>("/api/leaderboard?limit=10");
       setLeaderboard(board.entries ?? []);
-    } catch {
+    } catch (err) {
       setLeaderboard([]);
+      void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
+        endpoint: "/api/leaderboard",
+        message: err instanceof Error ? err.message : "unknown",
+      });
     }
   };
 
@@ -1308,6 +1327,13 @@ export default function MetatronVectorFOIL() {
       setPlayerIdentity(status.player ?? DEFAULT_PLAYER);
       setCallsignInput(status.player?.callsign ?? "");
       setCallsignMessage(status.player?.callsign ? `Pilot ${status.player.callsign} indexed.` : "Choose three letters or digits.");
+      if (!clientStartupLoggedRef.current) {
+        clientStartupLoggedRef.current = true;
+        void logClientEvent(status.csrfToken, "client.startup", "info", {
+          authProvider: status.player?.authProvider ?? "session",
+          hasCallsign: Boolean(status.player?.callsign),
+        });
+      }
     } catch {
       setCallsignMessage("Identity bus unavailable; local flight still works.");
     }
@@ -1344,7 +1370,14 @@ export default function MetatronVectorFOIL() {
         setScoreSubmitStatus("submitted");
         refreshLeaderboard();
       })
-      .catch(() => setScoreSubmitStatus("error"));
+      .catch((err) => {
+        setScoreSubmitStatus("error");
+        void logClientEvent(token, "client.score_submission_error", "warning", {
+          message: err instanceof Error ? err.message : "unknown",
+          score: snapshot.score,
+          wave: snapshot.wave,
+        });
+      });
   };
 
   const submitCallsign = async () => {
@@ -1373,6 +1406,10 @@ export default function MetatronVectorFOIL() {
         ? "That callsign is already transmitting."
         : "Callsign registration failed.";
       setCallsignMessage(msg);
+      void logClientEvent(csrfToken, "client.api_error", "warning", {
+        endpoint: "/api/player/callsign",
+        message: err instanceof Error ? err.message : "unknown",
+      });
     }
   };
 

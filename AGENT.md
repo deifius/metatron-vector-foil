@@ -60,6 +60,57 @@ Avoid storing full run telemetry unless a later anti-cheat or replay system expl
 - Keep OAuth client secrets, database paths, and Flask secrets in environment variables or service files outside git.
 - Do not log OAuth tokens, CSRF tokens, session cookies, or full callback URLs.
 
+
+### Logging and Audit Strategy
+
+Logging is part of the security boundary. Logs must help diagnose abuse, leaderboard tampering, deployment errors, and broken clients without becoming a shadow database of player identity.
+
+Principles:
+
+- Use structured JSON logs in production so Caddy/nginx, systemd-journald, fail2ban, or a future SIEM can consume them.
+- Include a request ID on every response and every structured log line.
+- Log event type, severity, method, path without query string, status code, duration, player ID when known, callsign when known, hashed IP, hashed user-agent, and sanitized event details.
+- Never log cookies, session IDs, CSRF tokens, OAuth state/nonce values, Google `sub`, ID tokens, access tokens, refresh tokens, email addresses, real names, avatars, request bodies, or full OAuth callback URLs.
+- Hash IP addresses and user-agent strings with a server-side pepper (`MVF_LOG_PEPPER`) before they enter logs or audit tables.
+- Treat logs and audit tables as sensitive operational data. They must not be served from the web root or committed to git.
+- Keep normal application logs rotating; do not let logs fill the disk and kill the arcade cabinet.
+- Keep durable audit rows for security-relevant events: rejected API requests, callsign collisions, callsign claims, score submissions, suspicious score integrity flags, client render/score errors, and unhandled server exceptions.
+- Public leaderboard APIs must never expose audit details.
+
+Implemented environment knobs:
+
+```bash
+MVF_LOG_LEVEL=INFO              # DEBUG, INFO, WARNING, ERROR, CRITICAL
+MVF_LOG_JSON=1                  # 1 = JSON lines, 0 = simple text logs
+MVF_LOG_PATH=/var/log/metatron-vector-foil/app.log
+MVF_LOG_MAX_BYTES=2097152       # rotating file size
+MVF_LOG_BACKUPS=5               # rotating backup count
+MVF_LOG_PEPPER='long-random-log-hash-pepper'
+MVF_LOG_STATIC=0                # set 1 only when debugging static asset delivery
+MVF_ACCEPT_CLIENT_DEBUG_LOGS=0  # keep debug noise off in production
+```
+
+Recommended production ownership:
+
+```bash
+sudo mkdir -p /var/log/metatron-vector-foil /var/lib/metatron-vector-foil
+sudo chown www-data:www-data /var/log/metatron-vector-foil /var/lib/metatron-vector-foil
+sudo chmod 750 /var/log/metatron-vector-foil /var/lib/metatron-vector-foil
+```
+
+Recommended production environment additions:
+
+```bash
+FLASK_SECRET_KEY='long-random-session-secret'
+MVF_LOG_PEPPER='different-long-random-log-pepper'
+MVF_DB_PATH=/var/lib/metatron-vector-foil/metatron-vector-foil.sqlite3
+MVF_LOG_PATH=/var/log/metatron-vector-foil/app.log
+MVF_COOKIE_SECURE=1
+MVF_ENABLE_HSTS=1
+```
+
+The audit trail intentionally stores hashed IP/user-agent fingerprints, not raw IP addresses or browser strings. This preserves enough correlation for abuse investigation while reducing the privacy blast radius if the database or logs are exposed.
+
 ### Google OAuth Implementation Rules
 
 When Google OAuth is implemented, use server-side Authorization Code flow rather than handling tokens entirely in browser code. Validate ID tokens server-side using a well-maintained Google/Python client library or JOSE/JWT library. Validate issuer, audience, signature, expiration, and nonce/state. Store the `sub` claim as the stable account key; do not use email as the primary account key. Do not store refresh tokens unless a future feature truly requires offline Google API access, which the arcade game should not need.
