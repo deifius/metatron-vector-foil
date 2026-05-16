@@ -107,8 +107,8 @@ const T = {
   // Oort cloud constellations / hazards
   OORT_CONSTELLATIONS_ENABLED: true,    // draw and simulate the procedural Oort cloud
   OORT_CLUSTER_COUNT: 420,              // cheap procedural three-node constellations; not full physics bodies
-  OORT_CONSTELLATION_INNER_MULT: 2.92,  // inner constellation band, measured from current Oort outer radius
-  OORT_CONSTELLATION_OUTER_MULT: 4.15,  // outer constellation band, measured from current Oort outer radius
+  OORT_CONSTELLATION_INNER_MULT: 0.92,  // inner constellation band, measured from current Oort outer radius
+  OORT_CONSTELLATION_OUTER_MULT: 2.15,  // outer constellation band, measured from current Oort outer radius
   OORT_GLYPH_RADIUS_MIN: 5.0,           // local three-node constellation radius
   OORT_GLYPH_RADIUS_MAX: 18.0,          // local three-node constellation radius
   OORT_ORBIT_SPEED_MIN: 0.00055,        // parametric orbit speed, radians/s
@@ -197,6 +197,9 @@ const T = {
   AUDIO_SHIP_DESTROYED_URL: "/static/audio/ship-destroyed.wav",
   AUDIO_SOL_DESTROYED_URL: "/static/audio/sol-destroyed.wav",
   AUDIO_NEXT_WAVE_URL: "/static/audio/next-wave.wav",
+  AUDIO_OORT_BREAK_URL: "/static/audio/oort-break.wav",
+  AUDIO_OORT_STRIKE_URL: "/static/audio/oort-strike.wav",
+  AUDIO_OORT_DUST_URL: "/static/audio/oort-dust.wav",
 
   AUDIO_THRUST_SAMPLE_GAIN: 0.18,      // level of looped thrust.wav when present
   AUDIO_THRUST_RATE_MIN: 0.92,         // idle playback rate for thrust.wav
@@ -208,6 +211,10 @@ const T = {
   AUDIO_SHIP_DESTROYED_GAIN: 0.12,     // one-shot gain for ship-destroyed.wav
   AUDIO_SOL_DESTROYED_GAIN: 0.45,      // one-shot gain for sol-destroyed.wav
   AUDIO_NEXT_WAVE_GAIN: 0.14,           // one-shot gain for next-wave.wav
+  AUDIO_OORT_BREAK_GAIN: 0.10,          // one-shot gain for oort-break.wav
+  AUDIO_OORT_STRIKE_GAIN: 0.16,         // one-shot gain for oort-strike.wav
+  AUDIO_OORT_DUST_GAIN: 0.12,           // max gain for looped oort-dust.wav while abrading shields
+  AUDIO_OORT_DUST_FILTER_HZ: 2600,      // high, icy dust tone when the optional loop is present
 };
 
 const TAU = Math.PI * 2;
@@ -753,6 +760,16 @@ class EnemyDroneVoice {
   }
 }
 
+type AudioSampleKey =
+  | "thrust"
+  | "blaster"
+  | "shipDestroyed"
+  | "solDestroyed"
+  | "nextWave"
+  | "oortBreak"
+  | "oortStrike"
+  | "oortDust";
+
 class AudioEngine {
   ctx: AudioContext | null = null;
   master: GainNode | null = null;
@@ -767,14 +784,21 @@ class AudioEngine {
   thrustSampleGain: GainNode | null = null;
   thrustSampleFilter: BiquadFilterNode | null = null;
 
-  sampleBuffers: Record<"thrust" | "blaster" | "shipDestroyed" | "solDestroyed" | "nextWave", AudioBuffer | null> = {
+  oortDustSrc: AudioBufferSourceNode | null = null;
+  oortDustGain: GainNode | null = null;
+  oortDustFilter: BiquadFilterNode | null = null;
+
+  sampleBuffers: Record<AudioSampleKey, AudioBuffer | null> = {
     thrust: null,
     blaster: null,
     shipDestroyed: null,
     solDestroyed: null,
     nextWave: null,
+    oortBreak: null,
+    oortStrike: null,
+    oortDust: null,
   };
-  sampleLoads = new Set<"thrust" | "blaster" | "shipDestroyed" | "solDestroyed" | "nextWave">();
+  sampleLoads = new Set<AudioSampleKey>();
 
   droneBuffer: AudioBuffer | null = null;
   droneLoadPromise: Promise<AudioBuffer> | null = null;
@@ -839,6 +863,9 @@ class AudioEngine {
     this.loadSample("shipDestroyed", T.AUDIO_SHIP_DESTROYED_URL);
     this.loadSample("solDestroyed", T.AUDIO_SOL_DESTROYED_URL);
     this.loadSample("nextWave", T.AUDIO_NEXT_WAVE_URL);
+    this.loadSample("oortBreak", T.AUDIO_OORT_BREAK_URL);
+    this.loadSample("oortStrike", T.AUDIO_OORT_STRIKE_URL);
+    this.loadSample("oortDust", T.AUDIO_OORT_DUST_URL);
   }
 
   async ensureDroneBuffer() {
@@ -894,7 +921,7 @@ class AudioEngine {
     );
   }
 
-  private loadSample(key: keyof AudioEngine["sampleBuffers"], url: string) {
+  private loadSample(key: AudioSampleKey, url: string) {
     if (!this.ctx || this.sampleBuffers[key] || this.sampleLoads.has(key)) return;
     this.sampleLoads.add(key);
     fetch(url)
@@ -906,6 +933,7 @@ class AudioEngine {
       .then((decoded) => {
         this.sampleBuffers[key] = decoded;
         if (key === "thrust") this.ensureThrustSampleLoop();
+        if (key === "oortDust") this.ensureOortDustLoop();
       })
       .catch(() => {})
       .finally(() => this.sampleLoads.delete(key));
@@ -936,7 +964,32 @@ class AudioEngine {
     this.thrustSampleGain = gain;
   }
 
-  private playSample(key: keyof AudioEngine["sampleBuffers"], gainValue = 0.2, playbackRate = 1): boolean {
+  private ensureOortDustLoop() {
+    if (!this.ctx || !this.sfxBus || this.oortDustSrc || !this.sampleBuffers.oortDust) return;
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.sampleBuffers.oortDust;
+    src.loop = true;
+    src.playbackRate.value = 1;
+
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = "highpass";
+    filter.frequency.value = T.AUDIO_OORT_DUST_FILTER_HZ;
+
+    const gain = this.ctx.createGain();
+    gain.gain.value = 0;
+
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.sfxBus);
+    src.start();
+
+    this.oortDustSrc = src;
+    this.oortDustFilter = filter;
+    this.oortDustGain = gain;
+  }
+
+  private playSample(key: AudioSampleKey, gainValue = 0.2, playbackRate = 1): boolean {
     if (!this.ctx || !this.sfxBus) return false;
     const buf = this.sampleBuffers[key];
     if (!buf) return false;
@@ -962,6 +1015,7 @@ class AudioEngine {
 
   setMode(mode: GameMode) {
     if (!this.ctx || !this.droneBus) return;
+    if (mode !== "playing") this.setOortDust(0);
     const now = this.ctx.currentTime;
     const target = AUDIO.DRONE_BUS_GAIN * AUDIO.MODE[mode];
     const param = this.droneBus.gain;
@@ -1028,6 +1082,15 @@ class AudioEngine {
     this.thrustGain.gain.setTargetAtTime(a * AUDIO.THRUST.GAIN_MAX, t, 0.03);
   }
 
+  setOortDust(amount01: number) {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const a = clamp(amount01, 0, 1);
+    this.ensureOortDustLoop();
+    if (!this.oortDustGain) return; // optional WAV absent: preserve the previous silent dust-abrasion behavior
+    this.oortDustGain.gain.setTargetAtTime(a * T.AUDIO_OORT_DUST_GAIN, t, 0.12);
+  }
+
   blip(freq: number, dur = 0.06, gain = 0.18) {
     if (!this.ctx || !this.sfxBus) return;
     const t0 = this.ctx.currentTime;
@@ -1072,6 +1135,16 @@ class AudioEngine {
     if (!this.playSample("blaster", T.AUDIO_BLASTER_GAIN)) this.blip(880, 0.05, 0.16);
   }
   hit() { this.noiseBurst(0.14, 0.22, 520); this.blip(220, 0.12, 0.14); }
+  oortBreak() {
+    if (!this.playSample("oortBreak", T.AUDIO_OORT_BREAK_GAIN, rand(0.96, 1.04))) {
+      this.blip(840 + rand(-110, 170), 0.035, 0.10);
+    }
+  }
+  oortStrike() {
+    if (!this.playSample("oortStrike", T.AUDIO_OORT_STRIKE_GAIN, rand(0.94, 1.06))) {
+      this.hit();
+    }
+  }
   nextWave() {
     if (!this.playSample("nextWave", T.AUDIO_NEXT_WAVE_GAIN)) {
       this.blip(660, 0.08, 0.16);
@@ -1116,9 +1189,14 @@ class AudioEngine {
     try { this.thrustGain?.gain.setTargetAtTime(0, t, 0.02); } catch {}
     try { this.thrustSampleGain?.gain.setTargetAtTime(0, t, 0.03); } catch {}
     try { this.thrustSampleSrc?.stop(t + 0.06); } catch {}
+    try { this.oortDustGain?.gain.setTargetAtTime(0, t, 0.03); } catch {}
+    try { this.oortDustSrc?.stop(t + 0.06); } catch {}
     this.thrustSampleSrc = null;
     this.thrustSampleGain = null;
     this.thrustSampleFilter = null;
+    this.oortDustSrc = null;
+    this.oortDustGain = null;
+    this.oortDustFilter = null;
     this.clearEnemyDrones();
   }
 }
@@ -1905,7 +1983,8 @@ export default function MetatronVectorFOIL() {
         if (away.len() > 0.0001) player.vel.add(away.norm().mul(knockback));
       }
 
-      audioRef.current.hit();
+      if (causeKey === "oort") audioRef.current.oortStrike();
+      else audioRef.current.hit();
       if (player.hitsTaken >= T.SHIP_RESILIENCE) {
         killPlayer(causeKey);
         return true;
@@ -2140,12 +2219,22 @@ export default function MetatronVectorFOIL() {
     };
 
     const applyOortAmbientAbrasion = (dt: number, timeSec: number) => {
-      if (!T.OORT_CONSTELLATIONS_ENABLED || T.OORT_DUST_DAMAGE_PER_SECOND <= 0) return false;
+      if (!T.OORT_CONSTELLATIONS_ENABLED || T.OORT_DUST_DAMAGE_PER_SECOND <= 0) {
+        audioRef.current.setOortDust(0);
+        return false;
+      }
       const density = oortDustDensityAt(player.pos, timeSec);
-      if (density <= 0.015) return false;
+      if (density <= 0.015) {
+        audioRef.current.setOortDust(0);
+        return false;
+      }
       const speedFactor = 0.38 + player.vel.len() * T.OORT_DUST_SPEED_SCALE;
       const damage = density * T.OORT_DUST_DAMAGE_PER_SECOND * speedFactor * dt;
-      if (damage <= 0) return false;
+      if (damage <= 0) {
+        audioRef.current.setOortDust(0);
+        return false;
+      }
+      audioRef.current.setOortDust(clamp(density * speedFactor * 0.85, 0, 1));
       player.hitsTaken += damage;
       waveDamageTaken += damage;
       if (player.hitsTaken >= T.SHIP_RESILIENCE) {
@@ -2203,7 +2292,7 @@ export default function MetatronVectorFOIL() {
     const breakOortCluster = (c: OortCluster, timeSec: number) => {
       c.brokenUntil = timeSec + T.OORT_REFORM_SECONDS;
       c.pulseUntil = timeSec + 0.62;
-      audioRef.current.blip(840 + rand(-110, 170), 0.035, 0.10);
+      audioRef.current.oortBreak();
     };
 
     const handleOortProjectileHits = () => {
