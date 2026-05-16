@@ -1,4 +1,11 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { DEFAULT_HUD_CONFIG, DEFAULT_HUD_STATE, HUD_DEV_CONTROLS } from "./ui/hud/hudConfig";
+import { HUDRoot } from "./ui/hud/HUDRoot";
+import { HUDState } from "./ui/hud/hudTypes";
+import { loadJson, loadTextLines } from "./data/textLoader";
+import { scoreForCitation, scoreForEnemy, scoreForPerfectWave, scoreForWaveClear } from "./config/scoring";
+import { SCORE_THRESHOLDS } from "./config/thresholds";
+import type { CitationCategory, CommendationDefinition } from "./types/scoring";
 
 /**
  * Metatron Vector FOIL
@@ -10,7 +17,8 @@ import React, { useEffect, useRef, useState } from "react";
 // ===================== TUNABLES =====================
 const T = {
   // World
-  META_RADIUS: 120,                    // central Metatron circle radius (world units)
+  META_CIRCLE_RADIUS: 72,              // visible Metatron circle radius (world units)
+  META_CIRCLE_TOUCH_SCALE: 1.0,        // center spacing = radius * 2 * this; 1.0 = perimeter tangency
   HORIZON_MULT: 2.0,                   // red ring radius multiplier
   OORT_INNER_MULT: 1.28,               // fuel-bit settlement inner band
   OORT_OUTER_MULT: 1.55,               // fuel-bit settlement outer band
@@ -95,12 +103,37 @@ const T = {
   SHRAPNEL_LIFE_MIN: 7.9,              // shrapnel life min
   SHRAPNEL_LIFE_MAX: 18.9,              // shrapnel life max
 
-  // Metatron animation
+  // Metatron animation / node gameplay
   META_BASE_SPIN: 0.03,                // base spin
   META_SPIN_GAIN: 0.22,                // spin increases with distance
   META_DWELL: 0.82,                    // dwell damping toward readable pose
+  META_ALIGN_START_COUNT: 1,           // begin flattening the lattice after this many awakened nodes
+  META_ALIGN_COMPLETE_COUNT: 3,        // fully face-on by this many awakened nodes
+  META_DEPTH_WOBBLE: 8,                // early-game z offset for occult not-quite-flat projection
   META_SPHERE_PULSE: 8.0,              // seconds per pulse
-  META_SPHERE_CHANCE: 0.16,            // chance a circle becomes a "sphere"
+  META_LINE_ALPHA: 0.16,               // resting opacity of awakened-node connections
+  META_LINE_PULSE_ALPHA: 0.50,         // extra opacity during new-node pulse
+  META_LINE_WIDTH: 1.0,                // resting line width for awakened-node connections
+  META_LINE_PULSE_WIDTH: 2.2,          // extra line width during new-node pulse
+  META_LINE_PULSE_SEC: 0.85,           // duration of newly awakened connection pulse
+  META_NODE_CORE_RADIUS: 22,           // actual gameplay radius around a Metatron-node center
+  META_NODE_TRIGGER_RADIUS: 90,        // hit must land this close to the nearest node to awaken it
+  META_NODE_FUEL_INNER: 3.5,           // small passive fuel trickle in inner-node cores
+  META_NODE_FUEL_OUTER: 5.0,           // small passive fuel trickle in outer-node cores
+  META_SPHERE_FUEL_INNER: 14.0,        // bonus fuel regen inside an awakened inner sphere core
+  META_SPHERE_FUEL_OUTER: 18.0,        // bonus fuel regen inside an awakened outer sphere core
+  META_SPHERE_SHIELD_REGEN: 0.14,      // shield repair per second while holding an awakened inner sphere
+  META_SPHERE_SHIELD_REGEN_OUTER: 0.20,// stronger shield repair per second in awakened outer spheres
+  META_NODE_CHARGE_SEC: 5.5,           // base duration added by any bullet hit on a polyhedron
+  META_NODE_OVERCHARGE_SEC: 9.0,       // bonus duration when a tetrahedron is destroyed in a node
+  META_NODE_MAX_CHARGE_SEC: 18.0,      // cap so repeated hits do not make a node permanent
+  META_ACTIVE_NODE_GRAVITY_MULT: 0.055,// awakened node gravity strength as a fraction of current Sol GM
+  META_ACTIVE_NODE_GRAVITY_SOFTEN: 72, // softening distance for awakened node gravity
+  META_ACTIVE_NODE_GRAVITY_MAX: 95,    // max acceleration from awakened node gravity per node
+  META_NODE_GRAVITY_AFFECTS_PLAYER: true,
+  META_NODE_GRAVITY_AFFECTS_BULLETS: true,
+  META_NODE_GRAVITY_AFFECTS_ENEMIES: true,
+  META_NODE_GRAVITY_AFFECTS_SHRAPNEL: true,
 
   // Door / progression
   ALIGN_THRESHOLD: 0.11,               // angle error threshold for "aligned"
@@ -126,6 +159,7 @@ const T = {
   AUDIO_MODE_PLAYING_DRONES: 1.0,      // drone bus multiplier while playing
   AUDIO_MODE_PAUSED_DRONES: 0.38,      // drone bus multiplier while paused
   AUDIO_MODE_TRANSITION_DRONES: 0.82,  // drone bus multiplier between waves
+  AUDIO_MODE_DEBRIEF_DRONES: 0.16,     // drone bus multiplier during death/debrief ritual
 
   AUDIO_THRUST_URL: "/static/audio/thrust.wav",
   AUDIO_BLASTER_URL: "/static/audio/blaster-fire.wav",
@@ -146,8 +180,13 @@ const T = {
 };
 
 const TAU = Math.PI * 2;
+const HUD_UPDATE_INTERVAL = 1 / HUD_DEV_CONTROLS.refreshHz;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+const smoothstep = (edge0: number, edge1: number, x: number) => {
+  const t = clamp((x - edge0) / Math.max(0.0001, edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+};
 const rand = (a = 0, b = 1) => a + Math.random() * (b - a);
 
 class V2 {
@@ -189,18 +228,41 @@ function arcSafe(ctx: CanvasRenderingContext2D, x: number, y: number, r: number,
   ctx.arc(x, y, R, start, end);
 }
 
-function metatronCenters(radius: number) {
-  const pts: { x: number; y: number }[] = [{ x: 0, y: 0 }];
-  for (let i = 0; i < 6; i++) {
-    const a = (i * TAU) / 6;
-    pts.push({ x: Math.cos(a) * radius, y: Math.sin(a) * radius });
-  }
-  for (let i = 0; i < 6; i++) {
-    const a = ((i + 0.5) * TAU) / 6;
-    pts.push({ x: Math.cos(a) * radius * 2, y: Math.sin(a) * radius * 2 });
-  }
-  return pts;
+function axialToWorld(q: number, r: number, spacing: number) {
+  return {
+    x: spacing * (q + r / 2),
+    y: spacing * (Math.sqrt(3) / 2) * r,
+  };
 }
+
+function metatronCenters(circleRadius: number, touchScale: number) {
+  const spacing = circleRadius * 2 * touchScale;
+  const axial = [
+    { q: 0, r: 0 },
+    { q: 1, r: 0 },
+    { q: 0, r: 1 },
+    { q: -1, r: 1 },
+    { q: -1, r: 0 },
+    { q: 0, r: -1 },
+    { q: 1, r: -1 },
+    { q: 2, r: 0 },
+    { q: 0, r: 2 },
+    { q: -2, r: 2 },
+    { q: -2, r: 0 },
+    { q: 0, r: -2 },
+    { q: 2, r: -2 },
+  ];
+  return axial.map(({ q, r }) => axialToWorld(q, r, spacing));
+}
+
+function metatronAlignmentFor(activeCount: number) {
+  return smoothstep(T.META_ALIGN_START_COUNT, T.META_ALIGN_COMPLETE_COUNT, activeCount);
+}
+
+function isMetaNodeLit(node: MetaNode | undefined) {
+  return !!node && (node.kind === "center" || node.awakened);
+}
+
 const MET_EDGES = (() => { const e: number[][] = []; for (let i = 0; i < 13; i++) for (let j = i + 1; j < 13; j++) e.push([i, j]); return e; })();
 
 // ===================== POLYHEDRA =====================
@@ -279,7 +341,7 @@ const DOWNGRADE: Record<SolidKind, SolidKind | null> = {
 };
 
 // ===================== GAME TYPES =====================
-type Bullet = { pos: V2; prevPos: V2; vel: V2; life: number; mass: number };
+type Bullet = { pos: V2; prevPos: V2; vel: V2; life: number; mass: number; origin: V2; firedAtMs: number; burstId: number };
 type FuelBit = { pos: V2; vel: V2; life: number; hue: number; };
 type Shard = { pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
 
@@ -295,6 +357,16 @@ type Enemy = {
   nextKind: SolidKind | null;
 };
 
+type MetaNodeKind = "center" | "inner" | "outer";
+type MetaNode = {
+  index: number;
+  kind: MetaNodeKind;
+  charge: number;
+  awakened: boolean;
+  overcharged: boolean;
+  activatedAt: number;
+};
+
 type Level = {
   name: string;
   wave: number;
@@ -304,8 +376,105 @@ type Level = {
   enemyKind: SolidKind;
 };
 
+
+type ScoreAlert = HUDState["alert"] & { duration: number };
+type BurstStats = { shots: number; hits: number; active: number; startedAtMs: number; awardedSalvo: boolean; awardedFull: boolean };
+type WaveCitationFlags = {
+  oortReach: boolean;
+  farOortReach: boolean;
+  returnToTheBurn: boolean;
+  periapsisKiss: boolean;
+};
+
+type DebriefPhase = "inactive" | "burn_fade" | "game_over_hold" | "plotting" | "ready";
+type DeathCauseKey = "shrapnel" | "enemy" | "well" | "sol" | "fuel" | "collapse";
+type DebriefSnapshot = {
+  causeKey: DeathCauseKey;
+  causeLabel: string;
+  score: number;
+  wave: number;
+  survivalTimeSec: number;
+  bestChain: number;
+  citations: number;
+  spheresAwakened: number;
+  totalSpheresLit: number;
+  topCitation: string;
+  bestShotDistance: number;
+  peakPseudoG: number;
+  furthestRadius: number;
+};
+type DebriefUIState = {
+  phase: DebriefPhase;
+  phaseElapsedMs: number;
+  visibleRows: number;
+  snapshot: DebriefSnapshot | null;
+};
+
+const DEBRIEF_SEQUENCE = {
+  burnFadeMs: 2250,
+  gameOverHoldMs: 3750,
+  rowRevealMs: 900,
+  readyPromptDelayMs: 1200,
+  autoReturnMs: 24000,
+} as const;
+
+const DEFAULT_INSERT_COIN_LINES = [
+  "INSERT COIN",
+  "PRESS START",
+  "THE TREE REMEMBERS EVERY SPHERE YOU AWAKEN",
+  "FURTHER IN. FASTER THROUGH.",
+];
+
+const DEFAULT_FLIGHT_HINTS = [
+  "Stable orbit requires sideways velocity.",
+  "Burn prograde to raise apoapsis.",
+  "A close pass by Sol can buy speed or death.",
+  "Return to the burn.",
+  "Wide Oort excursions reset the fight on your terms.",
+  "Long shots count more when the void agrees with you.",
+];
+
+const DEFAULT_DEATH_CAUSE_LINES = [
+  "DESTROYED BY SHRAPNEL",
+  "LOST TO THE WELL",
+  "SOL BREACHED",
+  "STRUCTURAL FAILURE",
+  "OUT OF FUEL",
+  "VECTOR COLLAPSE",
+];
+
+const DEFAULT_GAME_OVER_LINES = [
+  "GAME OVER",
+  "PILOT DEBRIEF",
+  "TOP CALLSIGNS APPROACH",
+  "PRESS START TO FLY AGAIN",
+];
+
+const DEFAULT_COMMENDATIONS: CommendationDefinition[] = [
+  { id: "longShot", category: "gunnery", label: "GUNNERY CITATION: LONG SHOT", subtitle: "RANGING SOLUTION CONFIRMED", tier: 2 },
+  { id: "salvoConnect", category: "gunnery", label: "GUNNERY CITATION: SALVO CONNECT", subtitle: "MULTIPLE ROUNDS AGREED", tier: 2 },
+  { id: "fullSalvo", category: "gunnery", label: "GUNNERY CITATION: FULL SALVO", subtitle: "EVERY ROUND FOUND ITS DOCTRINE", tier: 2 },
+  { id: "slingshot", category: "pilotage", label: "PILOT CITATION: SLINGSHOT", subtitle: "TRAJECTORY ADVANTAGE", tier: 2 },
+  { id: "highGTurn", category: "pilotage", label: "PILOT CITATION: HIGH-G TURN", subtitle: "STRUCTURAL LIMIT APPROACHED", tier: 2 },
+  { id: "returnToTheBurn", category: "pilotage", label: "PILOT CITATION: RETURN TO THE BURN", subtitle: "ENGAGEMENT SOLUTION REACQUIRED", tier: 2 },
+  { id: "oortReach", category: "pilotage", label: "PILOT CITATION: OORT REACH", subtitle: "BLACK ICE NAVIGATED", tier: 2 },
+  { id: "periapsisKiss", category: "pilotage", label: "PILOT CITATION: PERIAPSIS KISS", subtitle: "CLOSE SOL PASS SURVIVED", tier: 2 },
+  { id: "nodeAwakened", category: "geometry", label: "NODE AWAKENED", subtitle: "SEPHIRA RESPONDS", tier: 3 },
+  { id: "allSpheresLit", category: "geometry", label: "ALL SPHERES LIT", subtitle: "METATRONIC PHASE TRANSITION", tier: 3 },
+];
+
+function buildCommendationMap(items: CommendationDefinition[]) {
+  return Object.fromEntries(items.map((item) => [item.id, item])) as Record<string, CommendationDefinition>;
+}
+
+function scoreAlertSeverity(tier: 1 | 2 | 3): HUDState["alert"]["severity"] {
+  if (tier === 3) return "critical";
+  if (tier === 2) return "warning";
+  return "info";
+}
+
 // ===================== WEB AUDIO (DRONES + SFX) =====================
-type GameMode = "menu" | "playing" | "paused" | "transition";
+type GameMode = "menu" | "playing" | "paused" | "transition" | "debrief";
 
 const AUDIO = {
   MASTER_GAIN: T.MASTER_VOL,
@@ -358,6 +527,7 @@ const AUDIO = {
     playing: T.AUDIO_MODE_PLAYING_DRONES,
     paused: T.AUDIO_MODE_PAUSED_DRONES,
     transition: T.AUDIO_MODE_TRANSITION_DRONES,
+    debrief: T.AUDIO_MODE_DEBRIEF_DRONES,
   } as const,
   FALLBACK_BUFFER_SECONDS: 6,
 };
@@ -833,6 +1003,23 @@ class AudioEngine {
   }
   explode() { this.shipDestroyed(); }
 
+  cueDebriefPhase(phase: DebriefPhase) {
+    // Placeholder hooks for future music / SFX scoring of the death ritual.
+    // Keep the phase entry points explicit so a dirge, plot ticks, and leaderboard sting
+    // can be layered in later without rewriting the sequence logic.
+    if (!this.ctx || !this.sfxBus) return;
+    if (phase === "burn_fade") {
+      this.setThrust(0);
+      return;
+    }
+    if (phase === "plotting") {
+      return;
+    }
+    if (phase === "ready") {
+      return;
+    }
+  }
+
   stop() {
     if (!this.ctx) return;
     const t = this.ctx.currentTime;
@@ -851,27 +1038,45 @@ export default function MetatronVectorFOIL() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // UI state
-  const [mode, setMode] = useState<"menu" | "playing" | "paused" | "transition">("menu");
+  const [mode, setMode] = useState<GameMode>("menu");
   const [levelIdx, setLevelIdx] = useState(0);
   const [toggles, setToggles] = useState({ metatron: true, trails: true, debug: T.DEBUG_TEXT });
+  const [hudState, setHUDState] = useState<HUDState>(DEFAULT_HUD_STATE);
+  const [hudConfig, setHUDConfig] = useState(DEFAULT_HUD_CONFIG);
+  const [flightHints, setFlightHints] = useState<string[]>(DEFAULT_FLIGHT_HINTS);
+  const [insertCoinLines, setInsertCoinLines] = useState<string[]>(DEFAULT_INSERT_COIN_LINES);
+  const [deathCauseLines, setDeathCauseLines] = useState<string[]>(DEFAULT_DEATH_CAUSE_LINES);
+  const [gameOverLines, setGameOverLines] = useState<string[]>(DEFAULT_GAME_OVER_LINES);
+  const [debriefUI, setDebriefUI] = useState<DebriefUIState>({ phase: "inactive", phaseElapsedMs: 0, visibleRows: 0, snapshot: null });
+  const [menuHintIdx, setMenuHintIdx] = useState(0);
+  const [attractIdx, setAttractIdx] = useState(0);
+  const [attractPhaseTick, setAttractPhaseTick] = useState(0);
 
   const modeRef = useRef(mode);
   const levelIdxRef = useRef(levelIdx);
   const togglesRef = useRef(toggles);
+  const commendationMapRef = useRef<Record<string, CommendationDefinition>>(buildCommendationMap(DEFAULT_COMMENDATIONS));
   const [sliders, setSliders] = useState({
     gravity: T.GRAVITY_GM,
     thrust: T.THRUST_FORCE,
     trail: T.TRAIL_SAMPLES,
     master: AUDIO.MASTER_GAIN,
     solar: T.SOLAR_PRESSURE,
+    hudScale: DEFAULT_HUD_CONFIG.scale,
+    hudOpacity: DEFAULT_HUD_CONFIG.opacity,
   });
 
   const audioRef = useRef(new AudioEngine());
   const keysRef = useRef(new Set<string>());
+  const resetToMenuRef = useRef<(() => void) | null>(null);
 
   // Keep slider values available inside the loop without rerenders
   const slidersRef = useRef(sliders);
-  useEffect(() => { slidersRef.current = sliders; audioRef.current.setMaster(sliders.master); }, [sliders]);
+  useEffect(() => {
+    slidersRef.current = sliders;
+    audioRef.current.setMaster(sliders.master);
+    setHUDConfig((cfg) => ({ ...cfg, scale: sliders.hudScale, opacity: sliders.hudOpacity }));
+  }, [sliders]);
   useEffect(() => {
     modeRef.current = mode;
     audioRef.current.setMode(mode);
@@ -879,6 +1084,101 @@ export default function MetatronVectorFOIL() {
   }, [mode]);
   useEffect(() => { levelIdxRef.current = levelIdx; }, [levelIdx]);
   useEffect(() => { togglesRef.current = toggles; }, [toggles]);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadTextLines("/static/text/flight-hints.txt")
+      .then((lines) => { if (!cancelled && lines.length > 0) setFlightHints(lines); })
+      .catch(() => undefined);
+    loadTextLines("/static/text/insert-coin.txt")
+      .then((lines) => { if (!cancelled && lines.length > 0) setInsertCoinLines(lines); })
+      .catch(() => undefined);
+    loadTextLines("/static/text/death-causes.txt")
+      .then((lines) => { if (!cancelled && lines.length > 0) setDeathCauseLines(lines); })
+      .catch(() => undefined);
+    loadTextLines("/static/text/game-over.txt")
+      .then((lines) => { if (!cancelled && lines.length > 0) setGameOverLines(lines); })
+      .catch(() => undefined);
+    loadJson<CommendationDefinition[]>("/static/text/commendations.json")
+      .then((items) => {
+        if (cancelled || items.length === 0) return;
+        commendationMapRef.current = buildCommendationMap(items);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setMenuHintIdx((idx) => (flightHints.length > 0 ? (idx + 1) % flightHints.length : 0));
+    }, 4600);
+    return () => window.clearInterval(id);
+  }, [flightHints]);
+
+
+  const attractSequence = useMemo(() => {
+    const insertCoin = insertCoinLines[0] ?? DEFAULT_INSERT_COIN_LINES[0];
+    const pressStart = insertCoinLines[1] ?? DEFAULT_INSERT_COIN_LINES[1];
+    const remembrance = insertCoinLines[2] ?? DEFAULT_INSERT_COIN_LINES[2];
+    const motto = insertCoinLines[3] ?? DEFAULT_INSERT_COIN_LINES[3];
+    const hint = flightHints[menuHintIdx] ?? DEFAULT_FLIGHT_HINTS[0];
+    return [
+      { id: "online", label: "SYSTEM", headline: "SPHENIC CORSAIR ONLINE", subline: "VECTOR FIELD LOCKED", anim: "flicker" as const, durationMs: 1200 },
+      { id: "title", label: "CABINET", headline: "METATRON VECTOR FOIL", subline: "PILOT SCHOOL READY", anim: "typeon" as const, durationMs: 1800 },
+      { id: "insert", label: "ARCADE", headline: insertCoin, subline: motto, anim: "blink" as const, durationMs: 1300 },
+      { id: "start", label: "LAUNCH", headline: pressStart, subline: "ENTER // LAUNCH", anim: "pulse" as const, durationMs: 1900 },
+      { id: "dual", label: "ARCADE", headline: `${insertCoin} // ${pressStart}`, subline: remembrance, anim: "pulse" as const, durationMs: 2200 },
+      { id: "hint", label: "FLIGHT HINT", headline: hint.toUpperCase(), subline: "RETURN TO THE BURN", anim: "typeon" as const, durationMs: 2600 },
+    ];
+  }, [flightHints, insertCoinLines, menuHintIdx]);
+
+  const currentAttract = attractSequence[attractIdx % attractSequence.length];
+  const attractPhase = attractPhaseTick / 10;
+  const attractPulse = 0.76 + 0.24 * ((Math.sin(attractPhase * Math.PI * 2) + 1) / 2);
+  const attractBlinkOn = attractPhaseTick % 12 < 8;
+  const attractFlickerOn = ![1, 5, 11].includes(attractPhaseTick % 16);
+  const headlineChars = Math.max(1, Math.floor(attractPhaseTick * 1.8));
+  const sublineChars = Math.max(1, Math.floor(attractPhaseTick * 2.4) - 6);
+  const featuredHeadline = currentAttract.anim === "typeon"
+    ? currentAttract.headline.slice(0, headlineChars)
+    : currentAttract.headline;
+  const featuredSubline = currentAttract.anim === "typeon"
+    ? currentAttract.subline.slice(0, sublineChars)
+    : currentAttract.subline;
+  const featuredOpacity = currentAttract.anim === "blink"
+    ? (attractBlinkOn ? 1 : 0.14)
+    : currentAttract.anim === "flicker"
+      ? (attractFlickerOn ? 1 : 0.35)
+      : currentAttract.anim === "pulse"
+        ? attractPulse
+        : 0.94;
+  const featuredGlow = currentAttract.anim === "pulse"
+    ? 0.55 + 0.45 * attractPulse
+    : currentAttract.anim === "flicker"
+      ? (attractFlickerOn ? 0.9 : 0.2)
+      : currentAttract.anim === "blink"
+        ? (attractBlinkOn ? 0.85 : 0.08)
+        : 0.72;
+
+  useEffect(() => {
+    if (mode !== "menu") {
+      setAttractIdx(0);
+      setAttractPhaseTick(0);
+      return;
+    }
+    setAttractPhaseTick(0);
+    const tickId = window.setInterval(() => setAttractPhaseTick((t) => t + 1), 90);
+    return () => window.clearInterval(tickId);
+  }, [mode, attractIdx]);
+
+  useEffect(() => {
+    if (mode !== "menu") return;
+    const timeoutId = window.setTimeout(() => {
+      setAttractIdx((idx) => (idx + 1) % attractSequence.length);
+    }, currentAttract.durationMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [mode, attractSequence.length, currentAttract.durationMs, attractIdx]);
+
 
   const getLevel = (idx: number): Level => {
     const wave = idx + 1;
@@ -922,6 +1222,7 @@ export default function MetatronVectorFOIL() {
     window.addEventListener("resize", onResize);
 
     // ---- input ----
+    let onDebriefAdvance: (() => void) | null = null;
     const keys = keysRef.current;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === " ") e.preventDefault();
@@ -931,10 +1232,18 @@ export default function MetatronVectorFOIL() {
       keys.add(e.key);
 
       if (e.key === "Enter") {
+        if (modeRef.current === "debrief") {
+          onDebriefAdvance?.();
+          return;
+        }
         if (modeRef.current === "menu" || modeRef.current === "paused") {
           modeRef.current = "playing";
           setMode("playing");
         }
+      }
+      if ((e.key === " " || e.key === "Space") && modeRef.current === "debrief") {
+        onDebriefAdvance?.();
+        return;
       }
       if (e.key === "p" || e.key === "P") {
         setMode((m) => {
@@ -954,13 +1263,23 @@ export default function MetatronVectorFOIL() {
     window.addEventListener("pointerdown", onPointerDown, { passive: true });
 
     // ---- world ----
-    const metaRadius = T.META_RADIUS;
+    const metaCircleRadius = T.META_CIRCLE_RADIUS;
+    const metaRadius = metaCircleRadius * 2 * T.META_CIRCLE_TOUCH_SCALE;
     const horizonR = metaRadius * T.HORIZON_MULT;
     const oortInner = horizonR * T.OORT_INNER_MULT;
     const oortOuter = horizonR * T.OORT_OUTER_MULT;
 
-    const centers2 = metatronCenters(metaRadius);
-    const centers3 = centers2.map((c, i) => new V3(c.x, c.y, (i % 2 === 0 ? 1 : -1) * 8));
+    const centers2 = metatronCenters(metaCircleRadius, T.META_CIRCLE_TOUCH_SCALE);
+    const centers3 = centers2.map((c, i) => new V3(c.x, c.y, (i % 2 === 0 ? 1 : -1) * T.META_DEPTH_WOBBLE));
+    const metaNodes: MetaNode[] = centers2.map((_, i) => ({
+      index: i,
+      kind: i === 0 ? "center" : (i <= 6 ? "inner" : "outer"),
+      charge: i === 0 ? T.META_NODE_MAX_CHARGE_SEC : 0,
+      awakened: i === 0,
+      overcharged: i === 0,
+      activatedAt: i === 0 ? 0 : -Infinity,
+    }));
+    let metaNodeWorld: V2[] = centers2.map((c) => new V2(c.x, c.y));
 
     // entities
     const camera = { pos: new V2(0, 0), zoom: 1 };
@@ -984,6 +1303,7 @@ export default function MetatronVectorFOIL() {
 
     // metatron angles
     let metaAx = 0, metaAy = 0, metaAz = 0;
+    let metaPulseClock = 0;
 
     // timers / wave state
     let gunCD = 0;
@@ -991,8 +1311,62 @@ export default function MetatronVectorFOIL() {
     let waveBannerText = "";
     let waveActive = false;
     let pendingWaveIdx = 0;
+    let hudPublishAccumulator = 0;
 
     // reset helper
+    const getAwakenedMetaNodeCount = () => metaNodes.filter((node) => node.kind !== "center" && node.awakened).length;
+
+    const syncMetaNodeWorldPositions = () => {
+      const alignT = metatronAlignmentFor(getAwakenedMetaNodeCount());
+      const tiltT = 1 - alignT;
+      metaNodeWorld = centers3.map((v0) => {
+        let v = new V3(v0.x, v0.y, v0.z * tiltT);
+        v = rotX(v, metaAx * tiltT);
+        v = rotY(v, metaAy * tiltT);
+        v = rotZ(v, metaAz);
+        const p = project(v, 1, 220 / 240);
+        return new V2(p.x, p.y);
+      });
+    };
+
+    const resetMetaNodes = () => {
+      for (const node of metaNodes) {
+        const isCenter = node.kind === "center";
+        node.charge = isCenter ? T.META_NODE_MAX_CHARGE_SEC : 0;
+        node.awakened = isCenter;
+        node.overcharged = isCenter;
+        node.activatedAt = isCenter ? 0 : -Infinity;
+      }
+      syncMetaNodeWorldPositions();
+    };
+
+    const findNearestMetaNode = (point: V2) => {
+      let bestNode: MetaNode | null = null;
+      let bestDist = Infinity;
+      for (const node of metaNodes) {
+        if (node.kind === "center") continue;
+        const d = point.copy().sub(metaNodeWorld[node.index]).len();
+        if (d < bestDist) {
+          bestDist = d;
+          bestNode = node;
+        }
+      }
+      if (!bestNode || bestDist > T.META_NODE_TRIGGER_RADIUS) return null;
+      return bestNode;
+    };
+
+    const chargeMetaNodeAt = (point: V2, overcharge = false) => {
+      const node = findNearestMetaNode(point);
+      if (!node) return { charged: false, newlyAwakened: false, allLit: false, nodeIndex: -1 };
+      const wasDark = !node.awakened;
+      node.awakened = true;
+      node.charge = T.META_NODE_MAX_CHARGE_SEC;
+      node.overcharged = node.overcharged || overcharge;
+      if (wasDark) node.activatedAt = metaPulseClock;
+      const allLit = metaNodes.filter((n) => n.kind !== "center").every((n) => n.awakened);
+      return { charged: true, newlyAwakened: wasDark, allLit, nodeIndex: node.index };
+    };
+
     const queueWaveBanner = (waveIdx: number) => {
       const wave = getLevel(waveIdx).wave;
       waveBannerText = `Prepare for Wave ${wave}`;
@@ -1001,8 +1375,48 @@ export default function MetatronVectorFOIL() {
       waveActive = false;
     };
 
+    const deathCauseLabelFor = (causeKey: DeathCauseKey) => {
+      const lines = deathCauseLines.length > 0 ? deathCauseLines : DEFAULT_DEATH_CAUSE_LINES;
+      const indexByKey: Record<DeathCauseKey, number> = {
+        shrapnel: 0,
+        well: 1,
+        sol: 2,
+        enemy: 3,
+        fuel: 4,
+        collapse: 5,
+      };
+      return lines[indexByKey[causeKey]] ?? DEFAULT_DEATH_CAUSE_LINES[indexByKey[causeKey]];
+    };
+
+    const getDebriefRowTotal = (snapshot: DebriefSnapshot | null) => (snapshot ? 8 : 0);
+
+    let debriefPhase: DebriefPhase = "inactive";
+    let debriefPhaseElapsedMs = 0;
+    let debriefVisibleRows = 0;
+    let debriefSnapshot: DebriefSnapshot | null = null;
+    let debriefPublishAccumulator = 0;
+
+    const publishDebriefUI = () => {
+      setDebriefUI({
+        phase: debriefPhase,
+        phaseElapsedMs: debriefPhaseElapsedMs,
+        visibleRows: debriefVisibleRows,
+        snapshot: debriefSnapshot ? { ...debriefSnapshot } : null,
+      });
+    };
+
+    const setDebriefPhaseNow = (next: DebriefPhase) => {
+      debriefPhase = next;
+      debriefPhaseElapsedMs = 0;
+      if (next === "plotting") debriefVisibleRows = 0;
+      if (next === "ready") debriefVisibleRows = getDebriefRowTotal(debriefSnapshot);
+      audioRef.current.cueDebriefPhase(next);
+      publishDebriefUI();
+    };
+
     const resetRun = (toMenu = false) => {
       bullets.length = 0; enemies.length = 0; shards.length = 0; fuelBits.length = 0; trail.length = 0;
+      resetMetaNodes();
       player.pos = new V2(metaRadius, 0);
       // orbit init
       const gm = slidersRef.current.gravity;
@@ -1015,25 +1429,68 @@ export default function MetatronVectorFOIL() {
       player.hitInvuln = 0;
       gunCD = 0;
       nextEnemyId = 1;
-      metaAx = 0; metaAy = 0; metaAz = 0;
+      metaAx = 0; metaAy = 0; metaAz = 0; metaPulseClock = 0;
+      score = 0;
+      chainMultiplier = 1;
+      bestChainMultiplier = 1;
+      citationCount = 0;
+      runClockMs = 0;
+      scoreIdleMs = 0;
+      lastScoreCategory = null;
+      activeScoringAlert = null;
+      scoringAlertQueue.length = 0;
+      lastShotAtMs = -Infinity;
+      currentBurstId = 0;
+      burstStats.clear();
+      allSpheresLitAwarded = false;
+      runAwakenedCount = 0;
+      bestShotDistance = 0;
+      peakPseudoG = 0;
+      furthestRadius = metaRadius;
+      topCitationId = null;
+      topCitationTier = 0;
+      topCitationScore = 0;
+      debriefPhase = "inactive";
+      debriefPhaseElapsedMs = 0;
+      debriefVisibleRows = 0;
+      debriefSnapshot = null;
+      debriefPublishAccumulator = 0;
+      setDebriefUI({ phase: "inactive", phaseElapsedMs: 0, visibleRows: 0, snapshot: null });
+      resetWaveFlags();
       audioRef.current.stop();
       audioRef.current.setMode(toMenu ? "menu" : "playing");
       levelIdxRef.current = 0;
       setLevelIdx(0);
       queueWaveBanner(0);
+      syncMetaNodeWorldPositions();
       const nextMode = toMenu ? "menu" : "playing";
       modeRef.current = nextMode;
       setMode(nextMode);
     };
-
-    // initial orbit
-    resetRun(false);
+    resetToMenuRef.current = () => resetRun(true);
 
     // helpers
     const gravityAt = (p: V2, gm: number) => {
       const toC = new V2(-p.x, -p.y);
       const d = Math.max(T.GRAVITY_SOFTEN, toC.len());
       return toC.norm().mul(gm / (d * d));
+    };
+
+    const activeMetaNodeGravityAt = (p: V2, gm: number) => {
+      const acc = new V2(0, 0);
+      const nodeGm = gm * T.META_ACTIVE_NODE_GRAVITY_MULT;
+      if (nodeGm <= 0) return acc;
+      for (const node of metaNodes) {
+        if (node.kind === "center" || !node.awakened) continue;
+        const nodePos = metaNodeWorld[node.index];
+        if (!nodePos) continue;
+        const toNode = nodePos.copy().sub(p);
+        const d = Math.max(T.META_ACTIVE_NODE_GRAVITY_SOFTEN, toNode.len());
+        let a = nodeGm / (d * d);
+        if (T.META_ACTIVE_NODE_GRAVITY_MAX > 0) a = Math.min(a, T.META_ACTIVE_NODE_GRAVITY_MAX);
+        if (toNode.len() > 0.0001) acc.add(toNode.norm().mul(a));
+      }
+      return acc;
     };
 
     const solarSailAt = (p: V2, shipAngle: number, solarPressure: number) => {
@@ -1054,11 +1511,11 @@ export default function MetatronVectorFOIL() {
       return out.mul(k * press).add(tang.mul(k * tangAmt));
     };
 
-    const makeBullet = () => {
+    const makeBullet = (burstId: number) => {
       const muzzle = V2.fromAngle(player.angle, 18);
       const pos = player.pos.copy().add(muzzle);
       const vel = V2.fromAngle(player.angle, T.BULLET_SPEED).add(player.vel.copy());
-      return { pos, prevPos: pos.copy(), vel, life: T.BULLET_LIFE, mass: T.BULLET_MASS };
+      return { pos, prevPos: pos.copy(), vel, life: T.BULLET_LIFE, mass: T.BULLET_MASS, origin: pos.copy(), firedAtMs: runClockMs, burstId };
     };
 
     const spawnEnemy = (kind: SolidKind, waveIdx: number, index: number, total: number) => {
@@ -1093,6 +1550,7 @@ export default function MetatronVectorFOIL() {
     const startWave = (waveIdx: number) => {
       const lvl = getLevel(waveIdx);
       enemies.length = 0;
+      resetWaveFlags();
       for (let i = 0; i < lvl.enemyCount; i++) {
         enemies.push(spawnEnemy(lvl.enemyKind, waveIdx, i, lvl.enemyCount));
       }
@@ -1244,20 +1702,59 @@ export default function MetatronVectorFOIL() {
       return true;
     };
 
-    const loseRun = (reason: "ship" | "sol" = "ship") => {
+    const buildDebriefSnapshot = (causeKey: DeathCauseKey): DebriefSnapshot => ({
+      causeKey,
+      causeLabel: deathCauseLabelFor(causeKey),
+      score: Math.round(score),
+      wave: getLevel(levelIdxRef.current).wave,
+      survivalTimeSec: runClockMs / 1000,
+      bestChain: bestChainMultiplier,
+      citations: citationCount,
+      spheresAwakened: runAwakenedCount,
+      totalSpheresLit: metaNodes.filter((node) => node.kind !== "center" && node.awakened).length,
+      topCitation: topCitationId ? (getCommendation(topCitationId)?.label ?? String(topCitationId).toUpperCase()) : "NONE LOGGED",
+      bestShotDistance,
+      peakPseudoG,
+      furthestRadius,
+    });
+
+    const enterDebrief = (causeKey: DeathCauseKey) => {
+      debriefSnapshot = buildDebriefSnapshot(causeKey);
+      debriefVisibleRows = 0;
+      debriefPublishAccumulator = 0;
+      modeRef.current = "debrief";
+      setMode("debrief");
+      setDebriefPhaseNow("burn_fade");
+    };
+
+    onDebriefAdvance = () => {
+      if (!debriefSnapshot) {
+        resetRun(true);
+        return;
+      }
+      if (debriefPhase !== "ready") {
+        setDebriefPhaseNow("ready");
+        return;
+      }
+      resetRun(true);
+    };
+
+    const loseRun = (reason: "ship" | "sol" = "ship", causeKey: DeathCauseKey = reason === "sol" ? "sol" : "enemy") => {
       if (reason === "sol") audioRef.current.solDestroyed();
       else audioRef.current.shipDestroyed();
-      resetRun(false);
+      enterDebrief(causeKey);
     };
 
-    const killPlayer = () => {
-      loseRun("ship");
+    const killPlayer = (causeKey: DeathCauseKey = "enemy") => {
+      loseRun("ship", causeKey);
     };
 
-    const applyShipHit = (sourcePos?: V2) => {
+    const applyShipHit = (sourcePos?: V2, causeKey: DeathCauseKey = "enemy") => {
       if (player.hitInvuln > 0) return false;
       player.hitsTaken += 1;
       player.hitInvuln = T.SHIP_HIT_IFRAME_SEC;
+      waveDamageTaken += 1;
+      chainMultiplier = Math.max(1, chainMultiplier - SCORE_THRESHOLDS.chainDamagePenalty);
 
       if (sourcePos) {
         const away = player.pos.copy().sub(sourcePos);
@@ -1266,7 +1763,7 @@ export default function MetatronVectorFOIL() {
 
       audioRef.current.hit();
       if (player.hitsTaken >= T.SHIP_RESILIENCE) {
-        killPlayer();
+        killPlayer(causeKey);
         return true;
       }
       return false;
@@ -1285,6 +1782,178 @@ export default function MetatronVectorFOIL() {
       }
 
       e.vel.add(dir.mul(impulseMag));
+    };
+
+    let score = 0;
+    let chainMultiplier = 1;
+    let bestChainMultiplier = 1;
+    let citationCount = 0;
+    let runClockMs = 0;
+    let scoreIdleMs = 0;
+    let lastScoreCategory: CitationCategory | null = null;
+    let activeScoringAlert: ScoreAlert | null = null;
+    const scoringAlertQueue: ScoreAlert[] = [];
+    let lastShotAtMs = -Infinity;
+    let currentBurstId = 0;
+    const burstStats = new Map<number, BurstStats>();
+    let waveDamageTaken = 0;
+    let allSpheresLitAwarded = false;
+    let slingshotArmed = false;
+    let slingshotEntrySpeed = 0;
+    let slingshotMinRadius = Infinity;
+    let lastHighGAtMs = -Infinity;
+    let runAwakenedCount = 0;
+    let bestShotDistance = 0;
+    let peakPseudoG = 0;
+    let furthestRadius = metaRadius;
+    let topCitationId: CommendationDefinition["id"] | null = null;
+    let topCitationTier = 0;
+    let topCitationScore = 0;
+    let waveFlags: WaveCitationFlags = { oortReach: false, farOortReach: false, returnToTheBurn: false, periapsisKiss: false };
+
+    const resetWaveFlags = () => {
+      waveFlags = { oortReach: false, farOortReach: false, returnToTheBurn: false, periapsisKiss: false };
+      waveDamageTaken = 0;
+      slingshotArmed = false;
+      slingshotEntrySpeed = 0;
+      slingshotMinRadius = Infinity;
+    };
+
+    // initial setup lands on the title / insert coin screen
+    resetRun(true);
+    syncMetaNodeWorldPositions();
+
+    const getCommendation = (id: string) => commendationMapRef.current[id] ?? DEFAULT_COMMENDATIONS.find((item) => item.id === id);
+
+    const enqueueAlert = (alert: ScoreAlert) => {
+      scoringAlertQueue.push(alert);
+    };
+
+    const updateAlertQueue = (dt: number) => {
+      if (activeScoringAlert) {
+        activeScoringAlert.duration -= dt;
+        if (activeScoringAlert.duration <= 0) activeScoringAlert = null;
+      }
+      if (!activeScoringAlert && scoringAlertQueue.length > 0) {
+        activeScoringAlert = scoringAlertQueue.shift() ?? null;
+      }
+    };
+
+    const advanceChain = (category: CitationCategory) => {
+      const categoryBonus = lastScoreCategory && lastScoreCategory !== category ? SCORE_THRESHOLDS.chainCategoryBonus : 0;
+      chainMultiplier = clamp(chainMultiplier + SCORE_THRESHOLDS.chainAddPerFeat + categoryBonus, 1, SCORE_THRESHOLDS.chainMax);
+      bestChainMultiplier = Math.max(bestChainMultiplier, chainMultiplier);
+      lastScoreCategory = category;
+      scoreIdleMs = 0;
+    };
+
+    const awardPoints = (basePoints: number, category: CitationCategory, options?: {
+      showAlert?: boolean;
+      label?: string;
+      subtitle?: string;
+      severity?: HUDState["alert"]["severity"];
+      flashing?: boolean;
+      duration?: number;
+      countsTowardChain?: boolean;
+    }) => {
+      if (basePoints <= 0) return 0;
+      const usedChain = chainMultiplier;
+      const awarded = Math.round(basePoints * usedChain);
+      score += awarded;
+      if (options?.countsTowardChain !== false) advanceChain(category);
+      if (options?.showAlert && options.label) {
+        enqueueAlert({
+          text: `${options.label} +${awarded.toLocaleString()}`,
+          subtitle: options.subtitle,
+          severity: options.severity ?? "info",
+          flashing: options.flashing,
+          duration: options.duration ?? 1.85,
+        });
+      }
+      return awarded;
+    };
+
+    const awardCitation = (id: CommendationDefinition["id"], category: CitationCategory) => {
+      const def = getCommendation(id);
+      const citationScore = scoreForCitation(id);
+      citationCount += 1;
+      const tier = def?.tier ?? 1;
+      if (
+        !topCitationId ||
+        tier > topCitationTier ||
+        (tier === topCitationTier && citationScore >= topCitationScore)
+      ) {
+        topCitationId = id;
+        topCitationTier = tier;
+        topCitationScore = citationScore;
+      }
+      return awardPoints(citationScore, category, {
+        showAlert: true,
+        label: def?.label ?? String(id).toUpperCase(),
+        subtitle: def?.subtitle,
+        severity: def ? scoreAlertSeverity(def.tier) : "warning",
+        flashing: def?.tier === 3,
+        duration: def?.tier === 3 ? 2.6 : 1.9,
+      });
+    };
+
+    const resolveBurst = (burstId: number, wasHit: boolean) => {
+      const stats = burstStats.get(burstId);
+      if (!stats) return;
+      if (wasHit) stats.hits += 1;
+      stats.active = Math.max(0, stats.active - 1);
+      if (stats.active > 0) return;
+      if (!stats.awardedFull && stats.shots >= 3 && stats.hits === stats.shots) {
+        stats.awardedFull = true;
+        awardCitation("fullSalvo", "gunnery");
+      } else if (!stats.awardedSalvo && stats.hits >= 3) {
+        stats.awardedSalvo = true;
+        awardCitation("salvoConnect", "gunnery");
+      }
+      burstStats.delete(burstId);
+    };
+
+    const beginShotBurstIfNeeded = () => {
+      if (runClockMs - lastShotAtMs > SCORE_THRESHOLDS.salvoWindowMs) {
+        currentBurstId += 1;
+        burstStats.set(currentBurstId, { shots: 0, hits: 0, active: 0, startedAtMs: runClockMs, awardedSalvo: false, awardedFull: false });
+      }
+      lastShotAtMs = runClockMs;
+      return currentBurstId;
+    };
+
+    const awardEnemyShellHit = (kind: SolidKind, pos: V2, extra = 0) => {
+      const key = kind === "tetra" ? "tetrahedron" : kind === "cube" ? "cube" : kind === "octa" ? "octahedron" : kind === "dodeca" ? "dodecahedron" : "icosahedron";
+      const nearSolBonus = pos.len() < horizonR * 1.1 ? 150 : 0;
+      return awardPoints(scoreForEnemy(key) + nearSolBonus + extra, "destruction", { countsTowardChain: true });
+    };
+
+    const getMetaNodeBonuses = () => {
+      let passiveFuel = 0;
+      let sphereFuel = 0;
+      let shieldRepair = 0;
+      let occupiedNode = -1;
+
+      for (const node of metaNodes) {
+        if (node.kind === "center") continue;
+        const nodePos = metaNodeWorld[node.index];
+        if (!nodePos) continue;
+        const d = player.pos.copy().sub(nodePos).len();
+        if (d > T.META_NODE_CORE_RADIUS) continue;
+
+        occupiedNode = node.index;
+        const passive = node.kind === "outer" ? T.META_NODE_FUEL_OUTER : T.META_NODE_FUEL_INNER;
+        passiveFuel = Math.max(passiveFuel, passive);
+
+        if (node.awakened) {
+          const sphereFuelRate = node.kind === "outer" ? T.META_SPHERE_FUEL_OUTER : T.META_SPHERE_FUEL_INNER;
+          const shieldRateBase = node.kind === "outer" ? T.META_SPHERE_SHIELD_REGEN_OUTER : T.META_SPHERE_SHIELD_REGEN;
+          sphereFuel = Math.max(sphereFuel, sphereFuelRate);
+          shieldRepair = Math.max(shieldRepair, node.overcharged ? shieldRateBase * 1.35 : shieldRateBase);
+        }
+      }
+
+      return { passiveFuel, sphereFuel, shieldRepair, occupiedNode };
     };
 
     const settleFuelBitsFromShards = (dt: number) => {
@@ -1325,7 +1994,48 @@ export default function MetatronVectorFOIL() {
       const thrust = slidersRef.current.thrust;
       const solar = slidersRef.current.solar;
 
-      // handle pause/menu/transition
+      runClockMs += dt * 1000;
+      scoreIdleMs += dt * 1000;
+      if (scoreIdleMs >= SCORE_THRESHOLDS.chainDecayMs) {
+        chainMultiplier = 1;
+        lastScoreCategory = null;
+      }
+      updateAlertQueue(dt);
+
+      metaPulseClock += dt;
+      syncMetaNodeWorldPositions();
+
+      // handle pause/menu/debrief/transition
+      if (modeRef.current === "debrief") {
+        debriefPhaseElapsedMs += dt * 1000;
+        debriefPublishAccumulator += dt * 1000;
+        if (debriefPhase === "burn_fade" && debriefPhaseElapsedMs >= DEBRIEF_SEQUENCE.burnFadeMs) {
+          setDebriefPhaseNow("game_over_hold");
+        } else if (debriefPhase === "game_over_hold" && debriefPhaseElapsedMs >= DEBRIEF_SEQUENCE.gameOverHoldMs) {
+          setDebriefPhaseNow("plotting");
+        } else if (debriefPhase === "plotting") {
+          debriefVisibleRows = Math.min(
+            getDebriefRowTotal(debriefSnapshot),
+            Math.floor(debriefPhaseElapsedMs / DEBRIEF_SEQUENCE.rowRevealMs),
+          );
+          if (
+            debriefVisibleRows >= getDebriefRowTotal(debriefSnapshot) &&
+            debriefPhaseElapsedMs >= getDebriefRowTotal(debriefSnapshot) * DEBRIEF_SEQUENCE.rowRevealMs + DEBRIEF_SEQUENCE.readyPromptDelayMs
+          ) {
+            setDebriefPhaseNow("ready");
+          }
+        } else if (debriefPhase === "ready" && debriefPhaseElapsedMs >= DEBRIEF_SEQUENCE.autoReturnMs) {
+          resetRun(true);
+          return;
+        }
+        if (debriefPublishAccumulator >= 90) {
+          debriefPublishAccumulator = 0;
+          publishDebriefUI();
+        }
+        audioRef.current.updateDrones("debrief", enemies, player, T.STAR_RADIUS, oortOuter);
+        audioRef.current.setThrust(0);
+        return;
+      }
       if (modeRef.current !== "playing") {
         // still animate metatron slowly for menu vibes
         const dist = player.pos.len();
@@ -1333,9 +2043,16 @@ export default function MetatronVectorFOIL() {
         metaAz += spin * dt;
         metaAx += spin * 0.6 * dt;
         metaAy += spin * 0.4 * dt;
+        syncMetaNodeWorldPositions();
         audioRef.current.updateDrones(modeRef.current as GameMode, enemies, player, T.STAR_RADIUS, oortOuter);
         audioRef.current.setThrust(0);
         return;
+      }
+
+      for (const node of metaNodes) {
+        if (node.awakened) {
+          node.charge = T.META_NODE_MAX_CHARGE_SEC;
+        }
       }
 
       player.hitInvuln = Math.max(0, player.hitInvuln - dt);
@@ -1352,10 +2069,20 @@ export default function MetatronVectorFOIL() {
       const outside = dist > horizonR;
       const use = Math.max(0, player.thrust);
       if (use > 0.03 && player.fuel > 0) player.fuel = Math.max(0, player.fuel - T.FUEL_BURN * use * dt);
-      if (!outside) player.fuel = Math.min(T.FUEL_MAX, player.fuel + T.FUEL_REGEN_INNER * dt);
+
+      const nodeBonuses = getMetaNodeBonuses();
+      const baseFuelRegen = outside ? T.FUEL_REGEN_OUTER : T.FUEL_REGEN_INNER;
+      const totalFuelRegen = baseFuelRegen + nodeBonuses.passiveFuel + nodeBonuses.sphereFuel;
+      if (totalFuelRegen > 0) player.fuel = Math.min(T.FUEL_MAX, player.fuel + totalFuelRegen * dt);
+      if (nodeBonuses.shieldRepair > 0 && player.hitInvuln <= 0) {
+        player.hitsTaken = Math.max(0, player.hitsTaken - nodeBonuses.shieldRepair * dt);
+      }
+
+      const velBefore = player.vel.copy();
 
       // Forces
       const g = gravityAt(player.pos, lvl.gravityGM);
+      const nodeG = T.META_NODE_GRAVITY_AFFECTS_PLAYER ? activeMetaNodeGravityAt(player.pos, lvl.gravityGM) : new V2(0, 0);
       const sail = solarSailAt(player.pos, player.angle, lvl.solarPressure * (solar / T.SOLAR_PRESSURE));
       const fwd = V2.fromAngle(player.angle, 1);
 
@@ -1363,6 +2090,7 @@ export default function MetatronVectorFOIL() {
       const engine = fwd.copy().mul((player.fuel > 0 ? 1 : 0) * Math.max(0, player.thrust) * thrust);
       // acceleration = (g + sail + engine/mass)
       player.vel.add(g.mul(dt));
+      player.vel.add(nodeG.mul(dt));
       player.vel.add(sail.mul(dt / T.SHIP_MASS));
       player.vel.add(engine.mul(dt / T.SHIP_MASS));
 
@@ -1381,12 +2109,55 @@ export default function MetatronVectorFOIL() {
 
       player.pos.add(player.vel.copy().mul(dt));
 
+      const accel = player.vel.copy().sub(velBefore).mul(1 / Math.max(dt, 1e-6));
+      const speedNow = player.vel.len();
+      furthestRadius = Math.max(furthestRadius, player.pos.len());
+      if (!waveFlags.oortReach && player.pos.len() >= SCORE_THRESHOLDS.oortReachRadius) {
+        waveFlags.oortReach = true;
+        awardCitation("oortReach", "pilotage");
+      }
+      if (!waveFlags.returnToTheBurn && waveFlags.oortReach && player.pos.len() >= SCORE_THRESHOLDS.returnToBurnOuterRadius) {
+        waveFlags.returnToTheBurn = true;
+      }
+      if (waveFlags.returnToTheBurn && player.pos.len() <= SCORE_THRESHOLDS.returnToBurnInnerRadius && speedNow > 280) {
+        waveFlags.returnToTheBurn = false;
+        awardCitation("returnToTheBurn", "pilotage");
+      }
+      if (!waveFlags.periapsisKiss && player.pos.len() <= T.STAR_TRAP_RADIUS * 1.55 && speedNow > 220) {
+        waveFlags.periapsisKiss = true;
+        awardCitation("periapsisKiss", "pilotage");
+      }
+      if (!slingshotArmed && player.pos.len() <= horizonR * 1.05) {
+        slingshotArmed = true;
+        slingshotEntrySpeed = speedNow;
+        slingshotMinRadius = player.pos.len();
+      } else if (slingshotArmed) {
+        slingshotMinRadius = Math.min(slingshotMinRadius, player.pos.len());
+        if (player.pos.len() >= horizonR * 1.25) {
+          if (slingshotMinRadius <= horizonR * 0.9 && speedNow >= slingshotEntrySpeed * 1.18) {
+            awardCitation("slingshot", "pilotage");
+          }
+          slingshotArmed = false;
+          slingshotMinRadius = Infinity;
+        }
+      }
+      if (speedNow > 120) {
+        const vhat = player.vel.copy().mul(1 / speedNow);
+        const lateral = accel.copy().sub(vhat.copy().mul(accel.dot(vhat)));
+        const pseudoG = lateral.len() / 250;
+        peakPseudoG = Math.max(peakPseudoG, pseudoG);
+        if (pseudoG >= SCORE_THRESHOLDS.highGTurn && runClockMs - lastHighGAtMs > 4500 && (enemies.length > 0 || player.pos.len() < horizonR * 1.2)) {
+          awardCitation(pseudoG >= SCORE_THRESHOLDS.extremeGTurn ? "extremeGTurn" : "highGTurn", "pilotage");
+          lastHighGAtMs = runClockMs;
+        }
+      }
+
       // "stuck in well" explosion check
       const dStar = player.pos.len();
       if (dStar < T.STAR_TRAP_RADIUS && player.vel.len() < 120) {
         player.stuckTime += dt;
         if (player.stuckTime >= T.STAR_TRAP_TIME) {
-          loseRun("ship");
+          loseRun("ship", player.fuel <= 0 ? "fuel" : "well");
           return;
         }
       } else {
@@ -1396,7 +2167,13 @@ export default function MetatronVectorFOIL() {
       // ---- gun ----
       gunCD -= dt;
       if ((keys.has(" ") || keys.has("Space")) && gunCD <= 0) {
-        bullets.push(makeBullet());
+        const burstId = beginShotBurstIfNeeded();
+        const stats = burstStats.get(burstId);
+        if (stats) {
+          stats.shots += 1;
+          stats.active += 1;
+        }
+        bullets.push(makeBullet(burstId));
         audioRef.current.shoot();
         gunCD = T.FIRE_RATE;
       }
@@ -1405,10 +2182,16 @@ export default function MetatronVectorFOIL() {
       for (let i = bullets.length - 1; i >= 0; i--) {
         const b = bullets[i];
         b.prevPos = b.pos.copy();
-        if (b.mass > 0) b.vel.add(gravityAt(b.pos, lvl.gravityGM * b.mass).mul(dt));
+        if (b.mass > 0) {
+          b.vel.add(gravityAt(b.pos, lvl.gravityGM * b.mass).mul(dt));
+          if (T.META_NODE_GRAVITY_AFFECTS_BULLETS) b.vel.add(activeMetaNodeGravityAt(b.pos, lvl.gravityGM * b.mass).mul(dt));
+        }
         b.pos.add(b.vel.copy().mul(dt));
         b.life -= dt;
-        if (b.life <= 0 || Math.abs(b.pos.x) > oortOuter * 3 || Math.abs(b.pos.y) > oortOuter * 3) bullets.splice(i, 1);
+        if (b.life <= 0 || Math.abs(b.pos.x) > oortOuter * 3 || Math.abs(b.pos.y) > oortOuter * 3) {
+          resolveBurst(b.burstId, false);
+          bullets.splice(i, 1);
+        }
       }
 
       if (waveBannerTimer > 0) {
@@ -1442,6 +2225,9 @@ export default function MetatronVectorFOIL() {
 
         // stellar gravity keeps them diving inward instead of simply crossing the centerline ballistically
         e.vel.add(gravityAt(e.pos, lvl.gravityGM * T.ENEMY_GRAVITY_MULT).mul(dt));
+        if (T.META_NODE_GRAVITY_AFFECTS_ENEMIES) {
+          e.vel.add(activeMetaNodeGravityAt(e.pos, lvl.gravityGM * T.ENEMY_GRAVITY_MULT).mul(dt));
+        }
 
         e.vel.mul(0.999);
         e.pos.add(e.vel.copy().mul(dt));
@@ -1465,7 +2251,7 @@ export default function MetatronVectorFOIL() {
         const toPlayer = player.pos.copy().sub(e.pos);
         const enemyHitR = Math.max(8, e.r * T.ENEMY_HIT_RADIUS_MULT);
         if (toPlayer.len() <= T.SHIP_HIT_RADIUS + enemyHitR) {
-          if (applyShipHit(e.pos.copy())) return;
+          if (applyShipHit(e.pos.copy(), "enemy")) return;
         }
 
         const starLossR = T.STAR_RADIUS + e.r * 0.4;
@@ -1487,11 +2273,30 @@ export default function MetatronVectorFOIL() {
           if (e.morphing) continue;
           const impact = findBulletEnemyImpact(b, e);
           if (!impact) continue;
+
+          const shotDistance = impact.point.copy().sub(b.origin).len();
+          bestShotDistance = Math.max(bestShotDistance, shotDistance);
+          if (shotDistance >= SCORE_THRESHOLDS.longShotDistance) {
+            awardCitation(shotDistance >= SCORE_THRESHOLDS.extremeLongShotDistance ? "extremeLongShot" : "longShot", "gunnery");
+          }
+
+          const overchargeSphere = e.kind === "tetra" && DOWNGRADE[e.kind] === null;
           spawnShrapnel(e, impact);
+          const chargeResult = chargeMetaNodeAt(impact.point, overchargeSphere);
+          if (chargeResult.newlyAwakened) {
+            runAwakenedCount += 1;
+            awardCitation("nodeAwakened", "geometry");
+          }
+          if (chargeResult.allLit && !allSpheresLitAwarded) {
+            allSpheresLitAwarded = true;
+            awardCitation("allSpheresLit", "geometry");
+          }
+          awardEnemyShellHit(e.kind, e.pos);
           const outward = e.pos.copy();
           applyEnemyImpulse(e, outward, T.ENEMY_HIT_DEFLECT_IMPULSE, T.ENEMY_HIT_DEFLECT_TANGENTIAL);
           audioRef.current.hit();
           b.life = -1;
+          resolveBurst(b.burstId, true);
           if (!downgradeEnemy(e)) enemies.splice(ei, 1);
           hit = true;
           break;
@@ -1503,12 +2308,15 @@ export default function MetatronVectorFOIL() {
       for (let i = shards.length - 1; i >= 0; i--) {
         const s = shards[i];
         s.vel.add(gravityAt(s.pos, lvl.gravityGM * T.SHRAPNEL_GRAVITY_MULT).mul(dt));
+        if (T.META_NODE_GRAVITY_AFFECTS_SHRAPNEL) {
+          s.vel.add(activeMetaNodeGravityAt(s.pos, lvl.gravityGM * T.SHRAPNEL_GRAVITY_MULT).mul(dt));
+        }
         s.pos.add(s.vel.copy().mul(dt));
         s.ang += s.spin * dt;
         s.life -= dt;
 
         if (s.pos.copy().sub(player.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD) {
-          if (applyShipHit(s.pos.copy())) return;
+          if (applyShipHit(s.pos.copy(), "shrapnel")) return;
           shards.splice(i, 1);
           continue;
         }
@@ -1563,8 +2371,26 @@ export default function MetatronVectorFOIL() {
       metaAx -= metaAx * dwell * dt;
       metaAy -= metaAy * dwell * dt;
       metaAz -= metaAz * dwell * 0.35 * dt; // let az keep motion
+      syncMetaNodeWorldPositions();
 
       if (waveActive && enemies.length === 0 && shards.length === 0) {
+        const waveNumber = getLevel(levelIdxRef.current).wave;
+        awardPoints(scoreForWaveClear(waveNumber), "wave", {
+          showAlert: true,
+          label: `WAVE ${waveNumber} CLEARED`,
+          subtitle: waveDamageTaken <= 0 ? "PERFECT DEFLECTION WINDOW" : "ALIGNMENT WINDOW OPEN",
+          severity: "info",
+          duration: 1.8,
+        });
+        if (waveDamageTaken <= 0) {
+          awardPoints(scoreForPerfectWave(waveNumber), "wave", {
+            showAlert: true,
+            label: "PERFECT WAVE",
+            subtitle: "NO HITS TAKEN",
+            severity: "warning",
+            duration: 1.8,
+          });
+        }
         audioRef.current.levelUp();
         queueWaveBanner(levelIdxRef.current + 1);
       }
@@ -1574,6 +2400,100 @@ export default function MetatronVectorFOIL() {
       // audio continuous
       audioRef.current.updateDrones(modeRef.current as GameMode, enemies, player, T.STAR_RADIUS, oortOuter);
       audioRef.current.setThrust(Math.max(0, player.thrust) * (player.fuel > 0 ? 1 : 0));
+
+      hudPublishAccumulator += dt;
+      if (hudPublishAccumulator >= HUD_UPDATE_INTERVAL) {
+        hudPublishAccumulator = 0;
+        const effectiveShipResilience = Math.max(1, T.SHIP_RESILIENCE);
+        const shieldsPct = clamp(((effectiveShipResilience - player.hitsTaken) * 100) / effectiveShipResilience, 0, 100);
+        const hitsRemaining = Math.max(0, Math.ceil(effectiveShipResilience - player.hitsTaken));
+        const speed = player.vel.len();
+        const radialDir = player.pos.copy().norm();
+        const closureRate = enemies.length > 0
+          ? enemies.reduce((best, e) => {
+              const toPlayer = player.pos.copy().sub(e.pos);
+              const dist = toPlayer.len() || 1;
+              const towardPlayer = toPlayer.copy().mul(1 / dist);
+              const relVel = player.vel.copy().sub(e.vel);
+              const close = relVel.dot(towardPlayer);
+              return close > best ? close : best;
+            }, -Infinity)
+          : 0;
+        const nearestRange = enemies.length > 0
+          ? enemies.reduce((best, e) => Math.min(best, e.pos.copy().sub(player.pos).len()), Infinity)
+          : 0;
+        const radarContacts = enemies.slice(0, 10).map((e) => {
+          const rel = e.pos.copy().sub(player.pos);
+          return {
+            bearingRad: Math.atan2(rel.y, rel.x),
+            distanceNorm: clamp(rel.len() / (oortOuter * 1.2), 0.08, 1),
+            kind: e.kind,
+            threat: 1 + (e.kind === "icosa" ? 3 : e.kind === "dodeca" ? 2 : 1),
+          };
+        });
+        let alertText = "SYSTEM STABLE";
+        let alertSeverity: HUDState["alert"]["severity"] = "info";
+        let alertSubtitle = "Hold your line and let the field do the work.";
+        let flashing = false;
+        if (activeScoringAlert) {
+          alertText = activeScoringAlert.text;
+          alertSeverity = activeScoringAlert.severity;
+          alertSubtitle = activeScoringAlert.subtitle ?? alertSubtitle;
+          flashing = activeScoringAlert.flashing ?? false;
+        } else if (waveBannerTimer > 0 && waveBannerText) {
+          alertText = waveBannerText;
+          alertSubtitle = "Establish your next approach.";
+        } else if (shieldsPct <= 25) {
+          alertText = "SHIELDS CRITICAL";
+          alertSeverity = "critical";
+          alertSubtitle = "Break contact or hold a charged sphere.";
+          flashing = true;
+        } else if (player.pos.len() < horizonR * 0.9) {
+          alertText = "APPROACHING INNER ORBIT";
+          alertSeverity = "warning";
+          alertSubtitle = "Mind your periapsis.";
+        } else if (enemies.length > 0) {
+          alertText = `HOSTILES INBOUND × ${enemies.length}`;
+          alertSeverity = "warning";
+          alertSubtitle = "Keep the flight chain alive.";
+        }
+        const trimVec = V2.fromAngle(player.angle, 1);
+        const trimDeg = Math.atan2(trimVec.x * radialDir.y - trimVec.y * radialDir.x, trimVec.dot(radialDir)) * 180 / Math.PI;
+        setHUDState({
+          title: `Metatron Vector FOIL · SCORE ${Math.round(score).toLocaleString()}`,
+          controlsText: "A/D rotate · W/S trim · Space shoot · Enter start · P pause · M/T/B toggles",
+          alert: { text: alertText, severity: alertSeverity, flashing, subtitle: alertSubtitle },
+          player: {
+            shieldsPct,
+            fuelPct: clamp((player.fuel / T.FUEL_MAX) * 100, 0, 100),
+            hitsRemaining,
+            speed,
+            driftSpeed: Math.abs(player.vel.dot(radialDir)),
+            trimDeg,
+            gravFieldStrength: gravityAt(player.pos, slidersRef.current.gravity).len(),
+            phaseState: player.pos.len() < horizonR ? "INNER" : (player.pos.len() < oortInner ? "TRANSFER" : "OUTER"),
+          },
+          tactical: {
+            waveNumber: getLevel(levelIdxRef.current).wave,
+            currentEnemyLabel: getLevel(levelIdxRef.current).enemyKind,
+            incomingCount: getLevel(levelIdxRef.current).enemyCount,
+            bullets: bullets.length,
+            enemies: enemies.length,
+            shards: shards.length,
+            closureRate: Number.isFinite(closureRate) ? closureRate : 0,
+            nearestRange: Number.isFinite(nearestRange) ? nearestRange : 0,
+            score: Math.round(score),
+            chainMultiplier,
+            bestChainMultiplier,
+            citationCount,
+          },
+          radar: {
+            contacts: radarContacts,
+            placeholderSweepDeg: ((performance.now() / 22) % 360),
+            enabled: true,
+          },
+        });
+      }
     };
 
     function loop() {
@@ -1592,12 +2512,17 @@ export default function MetatronVectorFOIL() {
         mode: modeRef.current,
         level: getLevel(levelIdxRef.current),
         player, camera,
-        meta: { ax: metaAx, ay: metaAy, az: metaAz, centers3 },
+        meta: { ax: metaAx, ay: metaAy, az: metaAz, centers3, nodes: metaNodes, pulseClock: metaPulseClock },
         entities: { bullets, enemies, shards, fuelBits, trail },
         toggles: togglesRef.current,
         horizonR, oortInner, oortOuter,
         waveBannerTimer,
         waveBannerText,
+        debrief: {
+          phase: debriefPhase,
+          phaseElapsedMs: debriefPhaseElapsedMs,
+          snapshot: debriefSnapshot,
+        },
       });
 
       raf = requestAnimationFrame(loop);
@@ -1606,6 +2531,7 @@ export default function MetatronVectorFOIL() {
     raf = requestAnimationFrame(loop);
 
     return () => {
+      resetToMenuRef.current = null;
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onKeyDown as any);
@@ -1617,6 +2543,10 @@ export default function MetatronVectorFOIL() {
   }, []);
 
   // ===================== UI =====================
+  const debriefHudFade = mode === "debrief"
+    ? Math.max(0, 1 - (debriefUI.phase === "burn_fade" ? debriefUI.phaseElapsedMs / DEBRIEF_SEQUENCE.burnFadeMs : 1))
+    : 1;
+
   return (
     <div
       style={{
@@ -1638,40 +2568,135 @@ export default function MetatronVectorFOIL() {
           height: "100%",
         }}
       />
-
-      {/* HUD box */}
-      <div style={{
-        position: "absolute", top: 12, right: 12,
-        fontFamily: "ui-monospace, Menlo, monospace",
-        fontSize: 12, color: "rgba(255,255,255,.86)",
-        background: "rgba(255,255,255,.05)", border: "1px solid rgba(255,255,255,.10)",
-        backdropFilter: "blur(10px)", borderRadius: 14, padding: "10px 12px",
-        maxWidth: 360,
-      }}>
-        <div style={{ fontWeight: 700, color: "rgba(255,255,255,.95)" }}>Metatron Vector FOIL</div>
-        <div style={{ opacity: .9 }}>A/D rotate • W/S trim • Space shoot</div>
-        <div style={{ opacity: .75 }}>Enter start • P pause • M/T/B toggles</div>
+            <div style={{ opacity: debriefHudFade, pointerEvents: debriefHudFade <= 0.001 ? "none" : undefined }}>
+        <HUDRoot state={hudState} config={hudConfig} />
       </div>
 
       {/* Start screen */}
       {mode === "menu" && (
-        <Overlay>
-          <h1 style={{ margin: 0, fontSize: 28 }}>Metatron Vector FOIL</h1>
-          <p style={{ maxWidth: 680, opacity: 0.9, lineHeight: 1.35 }}>
-            You are a foil-ship riding gravity and starlight. Survive each incoming wave of Platonic solids,
-            hold your orbit, and be ready when the next formation arrives.
-          </p>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <Keycap>Enter</Keycap><span style={{ opacity: 0.85 }}>Start</span>
-            <Keycap>A/D</Keycap><span style={{ opacity: 0.85 }}>Rotate</span>
-            <Keycap>W</Keycap><span style={{ opacity: 0.85 }}>Catch light + thrust</span>
-            <Keycap>Space</Keycap><span style={{ opacity: 0.85 }}>Shoot</span>
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            padding: 22,
+            color: "rgba(210,238,255,0.92)",
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+            background: "linear-gradient(180deg, rgba(2,6,12,0.28), rgba(0,0,0,0.16))",
+          }}
+        >
+          <div
+            aria-hidden
+            style={{
+              position: "absolute",
+              inset: 0,
+              pointerEvents: "none",
+              opacity: 0.12,
+              backgroundImage: "repeating-linear-gradient(180deg, rgba(170,220,255,0.22) 0px, rgba(170,220,255,0.22) 1px, transparent 1px, transparent 4px)",
+              mixBlendMode: "screen",
+            }}
+          />
+          <div
+            aria-hidden
+            style={{
+              position: "absolute",
+              inset: 14,
+              pointerEvents: "none",
+              border: "1px solid rgba(152,206,255,0.08)",
+              boxShadow: "inset 0 0 28px rgba(90,150,210,0.06), 0 0 24px rgba(90,150,210,0.04)",
+            }}
+          />
+
+          <div style={{ position: "relative", zIndex: 2, display: "grid", gridTemplateRows: "auto 1fr", height: "100%" }}>
+            <div style={{ display: "grid", justifyItems: "center", gap: 8, marginTop: 48, textAlign: "center" }}>
+              <div style={{ fontSize: 10, letterSpacing: "0.38em", color: "rgba(144,198,245,0.74)" }}>{currentAttract.label}</div>
+              <div
+                style={{
+                  minHeight: 46,
+                  padding: "0 14px",
+                  fontSize: 34,
+                  letterSpacing: "0.18em",
+                  textTransform: "uppercase",
+                  color: `rgba(214,242,255,${featuredOpacity})`,
+                  textShadow: `0 0 ${18 + featuredGlow * 18}px rgba(160,220,255,${0.18 + featuredGlow * 0.28})`,
+                }}
+              >
+                {featuredHeadline}
+              </div>
+              <div
+                style={{
+                  minHeight: 18,
+                  fontSize: 12,
+                  letterSpacing: "0.24em",
+                  textTransform: "uppercase",
+                  color: `rgba(243,214,152,${0.72 + featuredGlow * 0.22})`,
+                  textShadow: `0 0 ${8 + featuredGlow * 8}px rgba(243,214,152,0.2)`,
+                }}
+              >
+                {featuredSubline}
+              </div>
+            </div>
+
+            <div style={{ display: "grid", placeItems: "center", marginTop: 18 }}>
+              <div style={{ width: "min(980px, 95vw)", display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: 18, alignItems: "stretch" }}>
+                <VectorFrame title="PILOT SCHOOL // INSERT COIN">
+                  <div style={{ display: "grid", gap: 10 }}>
+                    <div style={{ fontSize: 22, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(243,214,152,0.96)", textShadow: "0 0 12px rgba(243,214,152,0.18)" }}>
+                      {insertCoinLines[0] ?? DEFAULT_INSERT_COIN_LINES[0]}
+                    </div>
+                    <div style={{ fontSize: 20, letterSpacing: "0.18em", textTransform: "uppercase", color: currentAttract.id === "start" || currentAttract.id === "dual" ? `rgba(176,255,218,${0.5 + featuredGlow * 0.45})` : "rgba(176,255,218,0.72)", textShadow: `0 0 ${10 + featuredGlow * 8}px rgba(145,255,212,0.24)` }}>
+                      {insertCoinLines[1] ?? DEFAULT_INSERT_COIN_LINES[1]}
+                    </div>
+                    <div style={{ fontSize: 11, letterSpacing: "0.18em", color: "rgba(170,214,248,0.72)", textTransform: "uppercase" }}>
+                      {insertCoinLines[2] ?? DEFAULT_INSERT_COIN_LINES[2]}
+                    </div>
+                  </div>
+
+                  <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "auto 1fr", gap: 10, alignItems: "center" }}>
+                    <Keycap>Enter</Keycap><span style={{ opacity: 0.92 }}>Launch</span>
+                    <Keycap>A/D</Keycap><span style={{ opacity: 0.86 }}>Rotate the foil</span>
+                    <Keycap>W</Keycap><span style={{ opacity: 0.86 }}>Thrust and catch light</span>
+                    <Keycap>S</Keycap><span style={{ opacity: 0.86 }}>Brake with drag</span>
+                    <Keycap>Space</Keycap><span style={{ opacity: 0.86 }}>Fire a salvo</span>
+                    <Keycap>P</Keycap><span style={{ opacity: 0.86 }}>Pause / tune the universe</span>
+                  </div>
+
+                  <div style={{ marginTop: 16, display: "grid", gap: 6, fontSize: 10, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(140,198,244,0.62)" }}>
+                    <div>Gravitic trace stable</div>
+                    <div>Solution envelope nominal</div>
+                    <div>Further in. Faster through.</div>
+                  </div>
+                </VectorFrame>
+
+                <VectorFrame title="FLIGHT HINT // ATTRACT MODE">
+                  <div style={{ minHeight: 96, display: "grid", gap: 10, alignContent: "start" }}>
+                    <div style={{ fontSize: 22, lineHeight: 1.28, color: "rgba(243,214,152,0.96)", textShadow: "0 0 10px rgba(243,214,152,0.12)" }}>
+                      {flightHints[menuHintIdx] ?? DEFAULT_FLIGHT_HINTS[0]}
+                    </div>
+                    <div style={{ fontSize: 11, lineHeight: 1.55, color: "rgba(170,214,248,0.7)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                      Burn prograde to raise apoapsis. Burn retrograde to fall inward. Slingshots reward courage and geometry.
+                    </div>
+                  </div>
+
+                  <div style={{ marginTop: 22, display: "grid", gap: 8 }}>
+                    <VectorTelemetry label="NEXT MESSAGE" value={attractSequence[(attractIdx + 1) % attractSequence.length].headline} />
+                    <VectorTelemetry label="ALERT BUS" value="PILOT INPUT REQUIRED" />
+                    <VectorTelemetry label="TREE STATUS" value="AWAKEN WHAT YOU TOUCH" />
+                  </div>
+                </VectorFrame>
+              </div>
+            </div>
           </div>
-          <p style={{ opacity: 0.72, marginTop: 12 }}>
-            Tip: collect drifting fuel bits in the Oort band. Try “tacking” by angling the foil relative to the star,
-            and use the quiet between waves to set up your next approach.
-          </p>
-        </Overlay>
+        </div>
+      )}
+
+      {mode === "debrief" && debriefUI.snapshot && (
+        <DebriefOverlay
+          ui={debriefUI}
+          headline={gameOverLines[0] ?? DEFAULT_GAME_OVER_LINES[0]}
+          subline={gameOverLines[1] ?? DEFAULT_GAME_OVER_LINES[1]}
+          footer={gameOverLines[3] ?? DEFAULT_GAME_OVER_LINES[3]}
+          tertiary={gameOverLines[2] ?? DEFAULT_GAME_OVER_LINES[2]}
+        />
       )}
 
       {/* Pause menu */}
@@ -1711,6 +2736,18 @@ export default function MetatronVectorFOIL() {
               min={0} max={1} step={0.01}
               onChange={(v) => setSliders((s) => ({ ...s, master: v }))}
             />
+            <SliderRow
+              label="HUD scale"
+              value={sliders.hudScale}
+              min={0.7} max={1.4} step={0.01}
+              onChange={(v) => setSliders((s) => ({ ...s, hudScale: v }))}
+            />
+            <SliderRow
+              label="HUD opacity"
+              value={sliders.hudOpacity}
+              min={0.35} max={1} step={0.01}
+              onChange={(v) => setSliders((s) => ({ ...s, hudOpacity: v }))}
+            />
 
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
               <Toggle label="Metatron" checked={toggles.metatron} onChange={() => setToggles(t => ({...t, metatron: !t.metatron}))} />
@@ -1722,10 +2759,7 @@ export default function MetatronVectorFOIL() {
           <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
             <button onClick={() => setMode("playing")} style={btnStyle}>Resume</button>
             <button onClick={() => {
-              levelIdxRef.current = 0;
-              setLevelIdx(0);
-              modeRef.current = "menu";
-              setMode("menu");
+              resetToMenuRef.current?.();
             }} style={btnStyle}>Back to title</button>
           </div>
         </Overlay>
@@ -1735,6 +2769,110 @@ export default function MetatronVectorFOIL() {
 }
 
 // ===================== UI COMPONENTS =====================
+function VectorFrame({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div style={{
+      position: "relative",
+      minHeight: 280,
+      border: "1px solid rgba(150,205,255,0.22)",
+      boxShadow: "inset 0 0 28px rgba(100,170,230,0.05), 0 0 18px rgba(100,170,230,0.04)",
+      background: "rgba(6,16,24,0.14)",
+      padding: "16px 18px 18px 18px",
+      overflow: "hidden",
+    }}>
+      <div aria-hidden style={{ position: "absolute", inset: 8, border: "1px solid rgba(150,205,255,0.08)", pointerEvents: "none" }} />
+      <div style={{ position: "relative", zIndex: 1 }}>
+        <div style={{ marginBottom: 14, fontSize: 11, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(150,205,255,0.7)" }}>{title}</div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function VectorTelemetry({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ display: "grid", gap: 4, borderTop: "1px solid rgba(150,205,255,0.14)", paddingTop: 8 }}>
+      <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.56)" }}>{label}</div>
+      <div style={{ fontSize: 13, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(214,242,255,0.86)" }}>{value}</div>
+    </div>
+  );
+}
+
+function PlotField({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ display: "grid", gap: 6, paddingBottom: 12, borderBottom: "1px solid rgba(150,205,255,0.1)" }}>
+      <div style={{ fontSize: 10, letterSpacing: "0.26em", textTransform: "uppercase", color: "rgba(146,198,242,0.52)" }}>{label}</div>
+      <div style={{ fontSize: 18, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(222,242,255,0.9)", textShadow: "0 0 12px rgba(165,220,255,0.14)" }}>{value}</div>
+    </div>
+  );
+}
+
+function DebriefOverlay({
+  ui,
+  headline,
+  subline,
+  footer,
+  tertiary,
+}: {
+  ui: DebriefUIState;
+  headline: string;
+  subline: string;
+  footer: string;
+  tertiary: string;
+}) {
+  const snapshot = ui.snapshot;
+  if (!snapshot) return null;
+  const holdTitle = ui.phase === "game_over_hold" || ui.phase === "plotting" || ui.phase === "ready";
+  const rows = [
+    { label: "Cause of Loss", value: snapshot.causeLabel },
+    { label: "Final Score", value: snapshot.score.toLocaleString() },
+    { label: "Wave Reached", value: String(snapshot.wave) },
+    { label: "Survival Time", value: formatDurationClock(snapshot.survivalTimeSec) },
+    { label: "Best Flight Chain", value: `${snapshot.bestChain.toFixed(2)}x` },
+    { label: "Top Citation", value: snapshot.topCitation },
+    { label: "Spheres Awakened", value: `${snapshot.spheresAwakened} // TREE LIT ${snapshot.totalSpheresLit}/12` },
+    { label: "Flight Trace", value: `${snapshot.bestShotDistance.toFixed(0)}M SHOT // ${snapshot.peakPseudoG.toFixed(1)}G PEAK // ${snapshot.furthestRadius.toFixed(0)}R OUT` },
+  ];
+  const visibleRows = rows.slice(0, ui.visibleRows);
+  const promptVisible = ui.phase === "ready";
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        pointerEvents: "none",
+        color: "rgba(220,242,255,0.92)",
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        padding: "8vh 8vw",
+        display: "grid",
+        alignContent: "center",
+        justifyItems: "center",
+        gap: 18,
+      }}
+    >
+      {holdTitle && (
+        <div style={{ display: "grid", gap: 12, textAlign: "center", justifyItems: "center", minHeight: 120 }}>
+          <div style={{ fontSize: 44, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(234,246,255,0.94)", textShadow: "0 0 18px rgba(170,220,255,0.2)" }}>{headline}</div>
+          <div style={{ fontSize: 12, letterSpacing: "0.32em", textTransform: "uppercase", color: "rgba(244,216,160,0.76)", textShadow: "0 0 12px rgba(244,216,160,0.12)" }}>{subline}</div>
+        </div>
+      )}
+
+      {(ui.phase === "plotting" || ui.phase === "ready") && (
+        <div style={{ width: "min(760px, 72vw)", display: "grid", gap: 14 }}>
+          {visibleRows.map((row) => <PlotField key={row.label} label={row.label} value={row.value} />)}
+        </div>
+      )}
+
+      {promptVisible && (
+        <div style={{ marginTop: 24, display: "grid", gap: 8, justifyItems: "center", textAlign: "center" }}>
+          <div style={{ fontSize: 11, letterSpacing: "0.26em", textTransform: "uppercase", color: "rgba(146,198,242,0.52)" }}>{tertiary}</div>
+          <div style={{ fontSize: 16, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(176,255,218,0.86)", textShadow: "0 0 14px rgba(145,255,212,0.18)" }}>{footer}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Overlay({ children }: { children: React.ReactNode }) {
   return (
     <div style={{
@@ -1817,11 +2955,11 @@ function render(
   canvas: HTMLCanvasElement,
   dpr: number,
   S: {
-    mode: "menu" | "playing" | "paused" | "transition";
+    mode: GameMode;
     level: Level;
     player: { pos: V2; vel: V2; angle: number; thrust: number; fuel: number; stuckTime: number; hitsTaken: number; hitInvuln: number };
     camera: { pos: V2; zoom: number };
-    meta: { ax: number; ay: number; az: number; centers3: V3[] };
+    meta: { ax: number; ay: number; az: number; centers3: V3[]; nodes: MetaNode[]; pulseClock: number };
     entities: { bullets: Bullet[]; enemies: Enemy[]; shards: Shard[]; fuelBits: FuelBit[]; trail: V2[] };
     toggles: { metatron: boolean; trails: boolean; debug: boolean };
     horizonR: number;
@@ -1829,14 +2967,20 @@ function render(
     oortOuter: number;
     waveBannerTimer: number;
     waveBannerText: string;
+    debrief: { phase: DebriefPhase; phaseElapsedMs: number; snapshot: DebriefSnapshot | null };
   }
 ) {
   const w = canvas.width / dpr;
   const h = canvas.height / dpr;
+  const burnT = S.mode === "debrief" && S.debrief.phase === "burn_fade"
+    ? clamp(S.debrief.phaseElapsedMs / DEBRIEF_SEQUENCE.burnFadeMs, 0, 1)
+    : (S.mode === "debrief" ? 1 : 0);
+  const worldAlpha = S.mode === "debrief" ? Math.pow(1 - burnT, 0.58) : 1;
+  const lineAlpha = S.mode === "debrief" ? Math.pow(1 - burnT, 0.82) : 1;
 
   // background
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = S.toggles.trails ? `rgba(5,6,10,${T.BG_FADE})` : "#05060a";
+  ctx.fillStyle = S.mode === "debrief" ? `rgba(5,6,10,${0.22 + burnT * 0.78})` : (S.toggles.trails ? `rgba(5,6,10,${T.BG_FADE})` : "#05060a");
   ctx.fillRect(0, 0, w, h);
 
   // camera transform (center at star)
@@ -1846,6 +2990,7 @@ function render(
 
   // rings
   ctx.save();
+  ctx.globalAlpha = lineAlpha;
   ctx.lineWidth = 2 / S.camera.zoom;
   ctx.strokeStyle = "rgba(255,160,180,0.22)";
   ctx.beginPath(); arcSafe(ctx, 0, 0, S.horizonR); ctx.stroke();
@@ -1853,6 +2998,7 @@ function render(
 
   // oort band hint
   ctx.save();
+  ctx.globalAlpha = lineAlpha * 0.85;
   ctx.lineWidth = 1 / S.camera.zoom;
   ctx.strokeStyle = "rgba(190,225,255,0.06)";
   ctx.beginPath(); arcSafe(ctx, 0, 0, S.oortOuter); ctx.stroke();
@@ -1860,6 +3006,7 @@ function render(
 
   // star
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, T.STAR_RADIUS * 2.2);
   grad.addColorStop(0, "rgba(255,255,230,0.80)");
   grad.addColorStop(0.2, "rgba(255,210,150,0.25)");
@@ -1870,44 +3017,77 @@ function render(
 
   // metatron (animated)
   if (S.toggles.metatron) {
+    const awakenedCount = S.meta.nodes.filter((node) => node.kind !== "center" && node.awakened).length;
+    const alignT = metatronAlignmentFor(awakenedCount);
+    const tiltT = 1 - alignT;
     const C2: { x: number; y: number }[] = [];
     for (const v0 of S.meta.centers3) {
-      let v = v0;
-      v = rotX(v, S.meta.ax); v = rotY(v, S.meta.ay); v = rotZ(v, S.meta.az);
+      let v = new V3(v0.x, v0.y, v0.z * tiltT);
+      v = rotX(v, S.meta.ax * tiltT);
+      v = rotY(v, S.meta.ay * tiltT);
+      v = rotZ(v, S.meta.az);
       C2.push(project(v, 1, 220 / 240));
     }
 
-    // edges
+    // awakened connections: the cube is revealed by play, not merely drawn at it
+    const t = S.meta.pulseClock;
     ctx.save();
-    ctx.lineWidth = 0.75 / S.camera.zoom;
-    ctx.strokeStyle = "rgba(180,220,255,0.12)";
+    ctx.globalAlpha = lineAlpha;
+    ctx.lineCap = "round";
     for (const [i, j] of MET_EDGES) {
+      const nodeA = S.meta.nodes[i];
+      const nodeB = S.meta.nodes[j];
+      if (!isMetaNodeLit(nodeA) || !isMetaNodeLit(nodeB)) continue;
       const a = C2[i], b = C2[j];
+      if (!a || !b) continue;
+      const ageA = nodeA ? t - nodeA.activatedAt : Infinity;
+      const ageB = nodeB ? t - nodeB.activatedAt : Infinity;
+      const pulseAge = Math.min(ageA, ageB);
+      const pulseT = pulseAge >= 0 && pulseAge <= T.META_LINE_PULSE_SEC
+        ? 1 - pulseAge / T.META_LINE_PULSE_SEC
+        : 0;
+      ctx.lineWidth = (T.META_LINE_WIDTH + T.META_LINE_PULSE_WIDTH * pulseT) / S.camera.zoom;
+      ctx.strokeStyle = `rgba(185,225,255,${T.META_LINE_ALPHA + T.META_LINE_PULSE_ALPHA * pulseT})`;
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
     ctx.restore();
 
     // circles / spheres
-    const t = performance.now() / 1000;
     ctx.save();
+    ctx.globalAlpha = worldAlpha;
     for (let i = 0; i < C2.length; i++) {
       const c = C2[i];
+      const node = S.meta.nodes[i];
       const pulse = 0.12 + 0.05 * Math.sin((t + i * 0.37) * (TAU / T.META_SPHERE_PULSE));
-      const makeSphere = (Math.sin(t * 0.7 + i) * 0.5 + 0.5) < T.META_SPHERE_CHANCE;
-      if (makeSphere) {
-        const g = ctx.createRadialGradient(c.x - 6 / S.camera.zoom, c.y - 6 / S.camera.zoom, 2 / S.camera.zoom, c.x, c.y, T.META_RADIUS * (1.0 + pulse));
-        g.addColorStop(0, "rgba(210,235,255,0.15)");
-        g.addColorStop(0.5, "rgba(170,210,255,0.07)");
-        g.addColorStop(1, "rgba(150,190,240,0.02)");
+      const active = isMetaNodeLit(node);
+      const overcharged = !!node && node.overcharged;
+      const sphereStrength = node ? clamp(node.charge / T.META_NODE_MAX_CHARGE_SEC, 0, 1) : 0;
+
+      if (active) {
+        const glowAlpha = overcharged ? 0.22 : 0.16;
+        const g = ctx.createRadialGradient(c.x - 6 / S.camera.zoom, c.y - 6 / S.camera.zoom, 2 / S.camera.zoom, c.x, c.y, T.META_CIRCLE_RADIUS * (1.0 + pulse));
+        g.addColorStop(0, `rgba(220,242,255,${glowAlpha + sphereStrength * 0.08})`);
+        g.addColorStop(0.45, `rgba(175,220,255,${0.08 + sphereStrength * 0.08})`);
+        g.addColorStop(1, `rgba(150,190,240,${0.03 + sphereStrength * 0.03})`);
         ctx.fillStyle = g;
-        ctx.beginPath(); arcSafe(ctx, c.x, c.y, T.META_RADIUS * (0.96 + pulse)); ctx.fill();
-        ctx.lineWidth = 0.9 / S.camera.zoom;
-        ctx.strokeStyle = "rgba(170,210,255,0.20)";
-        ctx.beginPath(); arcSafe(ctx, c.x, c.y, T.META_RADIUS * (0.96 + pulse)); ctx.stroke();
+        ctx.beginPath(); arcSafe(ctx, c.x, c.y, T.META_CIRCLE_RADIUS * (0.96 + pulse)); ctx.fill();
+        ctx.lineWidth = 1.1 / S.camera.zoom;
+        ctx.strokeStyle = overcharged ? `rgba(235,248,255,${0.28 + sphereStrength * 0.24})` : `rgba(185,225,255,${0.22 + sphereStrength * 0.18})`;
+        ctx.beginPath(); arcSafe(ctx, c.x, c.y, T.META_CIRCLE_RADIUS * (0.96 + pulse)); ctx.stroke();
       } else {
         ctx.lineWidth = 0.9 / S.camera.zoom;
         ctx.strokeStyle = `rgba(170,210,255,${0.12 + pulse * 0.6})`;
-        ctx.beginPath(); arcSafe(ctx, c.x, c.y, T.META_RADIUS * (1.0 + pulse * 0.15)); ctx.stroke();
+        ctx.beginPath(); arcSafe(ctx, c.x, c.y, T.META_CIRCLE_RADIUS * (1.0 + pulse * 0.15)); ctx.stroke();
+      }
+
+      if (node && node.kind !== "center") {
+        const coreR = T.META_NODE_CORE_RADIUS;
+        const coreAlpha = active ? (overcharged ? 0.42 : 0.34) : 0.12;
+        ctx.lineWidth = 1.05 / S.camera.zoom;
+        ctx.strokeStyle = active
+          ? `rgba(235,250,255,${coreAlpha})`
+          : `rgba(145,195,255,${coreAlpha})`;
+        ctx.beginPath(); arcSafe(ctx, c.x, c.y, coreR); ctx.stroke();
       }
     }
     ctx.restore();
@@ -1915,6 +3095,7 @@ function render(
 
   // fuel bits
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   for (const b of S.entities.fuelBits) {
     ctx.fillStyle = `hsla(${Math.round(b.hue)},90%,70%,0.18)`;
     ctx.beginPath(); arcSafe(ctx, b.pos.x, b.pos.y, 12 / S.camera.zoom); ctx.fill();
@@ -1926,6 +3107,7 @@ function render(
 
   // shrapnel
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   for (const s of S.entities.shards) {
     const a = clamp(s.life / s.life0, 0, 1);
     const stroke = `hsla(${Math.round(s.hue)},90%,75%,${0.22 + 0.62 * a})`;
@@ -1947,6 +3129,7 @@ function render(
 
   // enemies
   ctx.save();
+  ctx.globalAlpha = lineAlpha;
   for (const e of S.entities.enemies) {
     const proj: { x: number; y: number }[] = [];
     const squash = Math.sin(Math.PI * clamp(e.morph, 0, 1));
@@ -1972,6 +3155,7 @@ function render(
 
   // bullets
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   ctx.lineWidth = 2 / S.camera.zoom;
   ctx.strokeStyle = "rgba(255,255,200,0.88)";
   ctx.beginPath();
@@ -1985,6 +3169,7 @@ function render(
 
   // contrail
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   ctx.lineWidth = 1.2 / S.camera.zoom;
   ctx.strokeStyle = `rgba(120,255,220,${T.TRAIL_ALPHA})`;
   ctx.beginPath();
@@ -1997,6 +3182,7 @@ function render(
 
   // ship
   ctx.save();
+  ctx.globalAlpha = worldAlpha;
   ctx.translate(S.player.pos.x, S.player.pos.y);
   ctx.rotate(S.player.angle);
   ctx.lineWidth = 2.2 / S.camera.zoom;
@@ -2007,38 +3193,7 @@ function render(
   ctx.stroke();
   ctx.restore();
 
-  // screen-space HUD
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = "rgba(255,255,255,0.88)";
-  ctx.font = T.UI_FONT;
 
-  const spd = S.player.vel.len();
-  const effectiveShipResilience = Math.max(1, T.SHIP_RESILIENCE);
-  const shieldPct = clamp(((effectiveShipResilience - S.player.hitsTaken) * 100) / effectiveShipResilience, 0, 100);
-  const hitsRemaining = Math.max(0, effectiveShipResilience - S.player.hitsTaken);
-  ctx.fillText(`${S.level.name}`, 12, 18);
-  ctx.fillText(`Fuel ${S.player.fuel.toFixed(0)} / ${T.FUEL_MAX}  |  speed ${spd.toFixed(1)}  |  incoming ${S.level.enemyKind} × ${S.level.enemyCount}`, 12, 34);
-  ctx.fillText(`Shields ${shieldPct.toFixed(0)}%  |  hits remaining ${hitsRemaining}/${effectiveShipResilience}`, 12, 50);
-
-  if (S.toggles.debug) {
-    ctx.fillStyle = "rgba(255,255,255,0.74)";
-    ctx.fillText(`zoom ${S.camera.zoom.toFixed(3)}  ship (${S.player.pos.x.toFixed(1)}, ${S.player.pos.y.toFixed(1)})  r=${S.player.pos.len().toFixed(1)}  bulletMass ${T.BULLET_MASS.toFixed(2)}  hitInvuln ${S.player.hitInvuln.toFixed(2)}`, 12, 68);
-    ctx.fillText(`bullets ${S.entities.bullets.length}  enemies ${S.entities.enemies.length}  shards ${S.entities.shards.length}  fuelbits ${S.entities.fuelBits.length}  hitsTaken ${S.player.hitsTaken}`, 12, 84);
-  }
-
-  if (S.waveBannerTimer > 0 && S.waveBannerText) {
-    const alpha = clamp(Math.min(1, S.waveBannerTimer / 0.45), 0, 1) * (0.72 + 0.28 * Math.sin(performance.now() / 120));
-    ctx.save();
-    ctx.font = "28px ui-monospace, Menlo, monospace";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.strokeStyle = `rgba(200,230,255,${0.25 * alpha})`;
-    ctx.lineWidth = 2;
-    ctx.strokeText(S.waveBannerText, w / 2, h * 0.24);
-    ctx.fillStyle = `rgba(235,245,255,${0.12 * alpha})`;
-    ctx.fillText(S.waveBannerText, w / 2, h * 0.24);
-    ctx.restore();
-  }
 }
 
 function updateCamera(camera: { pos: V2; zoom: number }, canvas: HTMLCanvasElement, dpr: number, shipPos: V2, shipVel: V2, horizonR: number) {
@@ -2066,6 +3221,13 @@ function updateCamera(camera: { pos: V2; zoom: number }, canvas: HTMLCanvasEleme
   const blend = T.CAMERA_AESTHETIC;
   const target = Math.min(keepZoom, lerp(keepZoom, aesthetic, blend));
   camera.zoom = clamp(lerp(camera.zoom, target, T.CAMERA_LERP), T.CAMERA_ZOOM_FLOOR, T.CAMERA_ZOOM_CEIL);
+}
+
+function formatDurationClock(totalSeconds: number) {
+  const whole = Math.max(0, Math.floor(totalSeconds));
+  const minutes = Math.floor(whole / 60);
+  const seconds = whole % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 function formatNum(v: number) {
