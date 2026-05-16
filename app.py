@@ -11,9 +11,9 @@ import time
 import uuid
 from functools import wraps
 from typing import Any, Callable, TypeVar
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
-from flask import Flask, Response, abort, g, jsonify, render_template, request, session
+from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request, session
 from werkzeug.exceptions import HTTPException, InternalServerError
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -30,6 +30,18 @@ from app_config import (
     DB_PATH,
     ENABLE_HSTS,
     FLASK_SECRET_KEY,
+    GOOGLE_ISSUERS,
+    GOOGLE_OAUTH_ALLOWED_HD,
+    GOOGLE_OAUTH_AUTH_ENDPOINT,
+    GOOGLE_OAUTH_CLIENT_ID,
+    GOOGLE_OAUTH_CLIENT_SECRET,
+    GOOGLE_OAUTH_ENABLED,
+    GOOGLE_OAUTH_REDIRECT_URI,
+    GOOGLE_OAUTH_SCOPES,
+    GOOGLE_OAUTH_STATE_TTL_SECONDS,
+    GOOGLE_OAUTH_TOKEN_ENDPOINT,
+    GOOGLE_OAUTH_TOKEN_TIMEOUT_SECONDS,
+    IDENTITY_PEPPER,
     LEADERBOARD_DEFAULT_LIMIT,
     LEADERBOARD_MAX_LIMIT,
     LOG_BACKUPS,
@@ -44,6 +56,7 @@ from app_config import (
     LOG_STATIC_REQUESTS,
     LOG_STRING_MAX_CHARS,
     MAX_CONTENT_LENGTH_BYTES,
+    OAUTH_LOGIN_RATE_LIMIT_SECONDS,
     PERMISSIONS_POLICY,
     REQUEST_ID_RE,
     SCORE_SUBMIT_RATE_LIMIT_SECONDS,
@@ -145,6 +158,46 @@ def stable_hash(value: str | None, purpose: str) -> str | None:
         return None
     digest = hmac.new(log_secret(), f"{purpose}:{value}".encode("utf-8", "replace"), hashlib.sha256).hexdigest()
     return digest[:32]
+
+
+def identity_secret() -> bytes:
+    configured = IDENTITY_PEPPER or app.secret_key
+    return str(configured).encode("utf-8")
+
+
+def google_subject_identity_key(issuer: str, subject: str) -> str:
+    """Return a non-reversible account key for a Google issuer+sub pair.
+
+    Google's raw `sub` claim is stable and unique, but storing only a
+    server-peppered HMAC reduces the blast radius of a database leak.
+    Changing MVF_IDENTITY_PEPPER will intentionally orphan existing Google
+    account mappings unless the database is migrated.
+    """
+    digest = hmac.new(identity_secret(), f"google:{issuer}:{subject}".encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"google:{digest}"
+
+
+def google_redirect_uri() -> str:
+    if GOOGLE_OAUTH_REDIRECT_URI:
+        return GOOGLE_OAUTH_REDIRECT_URI
+    return f"{request.host_url.rstrip('/')}/auth/google/callback"
+
+
+def safe_next_path(raw: str | None) -> str:
+    if not raw:
+        return "/"
+    raw = str(raw).strip()
+    if not raw.startswith("/") or raw.startswith("//") or "\\" in raw:
+        return "/"
+    parsed = urlsplit(raw)
+    if parsed.scheme or parsed.netloc:
+        return "/"
+    return raw or "/"
+
+
+def redirect_with_auth_failure(reason: str) -> Response:
+    log_event("auth.google_failed", "warning", details={"reason": reason}, persist=True)
+    return redirect("/?auth=failed", code=303)
 
 
 def request_id() -> str:
@@ -585,6 +638,153 @@ def parse_float(data: dict[str, Any], name: str, default: float, low: float, hig
     return value
 
 
+@app.get("/auth/google/start")
+def google_oauth_start():
+    if not GOOGLE_OAUTH_ENABLED:
+        abort(404, "google_oauth_not_configured")
+    if not GOOGLE_OAUTH_CLIENT_ID or not GOOGLE_OAUTH_CLIENT_SECRET:
+        log_event("auth.google_misconfigured", "error", details={"missing": "client_id_or_secret"}, persist=True)
+        abort(500, "google_oauth_misconfigured")
+
+    session_rate_limit("oauth_login", OAUTH_LOGIN_RATE_LIMIT_SECONDS)
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    session["oauth_google_state"] = state
+    session["oauth_google_nonce"] = nonce
+    session["oauth_google_started_at"] = time.time()
+    session["oauth_google_next"] = safe_next_path(request.args.get("next"))
+    session.modified = True
+
+    params = {
+        "client_id": GOOGLE_OAUTH_CLIENT_ID,
+        "redirect_uri": google_redirect_uri(),
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_OAUTH_SCOPES),
+        "state": state,
+        "nonce": nonce,
+        "access_type": "online",
+        "include_granted_scopes": "false",
+    }
+    return redirect(f"{GOOGLE_OAUTH_AUTH_ENDPOINT}?{urlencode(params)}", code=302)
+
+
+@app.get("/auth/google/callback")
+def google_oauth_callback():
+    if not GOOGLE_OAUTH_ENABLED:
+        abort(404, "google_oauth_not_configured")
+
+    next_path = safe_next_path(session.get("oauth_google_next"))
+    expected_state = str(session.pop("oauth_google_state", ""))
+    expected_nonce = str(session.pop("oauth_google_nonce", ""))
+    started_at = float(session.pop("oauth_google_started_at", 0.0) or 0.0)
+    session.pop("oauth_google_next", None)
+    session.modified = True
+
+    if request.args.get("error"):
+        log_event(
+            "auth.google_denied",
+            "warning",
+            details={"google_error": str(request.args.get("error", "unknown"))[:80]},
+            persist=True,
+        )
+        return redirect("/?auth=denied", code=303)
+
+    sent_state = str(request.args.get("state", ""))
+    if not expected_state or not sent_state or not secrets.compare_digest(expected_state, sent_state):
+        return redirect_with_auth_failure("state_mismatch")
+    if not expected_nonce:
+        return redirect_with_auth_failure("missing_nonce")
+    if time.time() - started_at > GOOGLE_OAUTH_STATE_TTL_SECONDS:
+        return redirect_with_auth_failure("state_expired")
+
+    code = str(request.args.get("code", ""))
+    if not code:
+        return redirect_with_auth_failure("missing_code")
+
+    try:
+        import requests as http_requests
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token as google_id_token
+    except Exception:
+        log_event("auth.google_dependency_missing", "error", persist=True)
+        return redirect_with_auth_failure("oauth_dependency_missing")
+
+    try:
+        token_resp = http_requests.post(
+            GOOGLE_OAUTH_TOKEN_ENDPOINT,
+            data={
+                "code": code,
+                "client_id": GOOGLE_OAUTH_CLIENT_ID,
+                "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+                "redirect_uri": google_redirect_uri(),
+                "grant_type": "authorization_code",
+            },
+            headers={"Accept": "application/json"},
+            timeout=GOOGLE_OAUTH_TOKEN_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        log_event("auth.google_token_exchange_exception", "error", persist=True)
+        return redirect_with_auth_failure("token_exchange_exception")
+
+    if token_resp.status_code != 200:
+        log_event(
+            "auth.google_token_exchange_failed",
+            "warning",
+            details={"status_code": token_resp.status_code},
+            persist=True,
+        )
+        return redirect_with_auth_failure("token_exchange_failed")
+
+    token_payload = token_resp.json() if token_resp.content else {}
+    id_token_jwt = token_payload.get("id_token") if isinstance(token_payload, dict) else None
+    if not isinstance(id_token_jwt, str) or not id_token_jwt:
+        return redirect_with_auth_failure("missing_id_token")
+
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            id_token_jwt,
+            google_requests.Request(),
+            GOOGLE_OAUTH_CLIENT_ID,
+        )
+    except Exception:
+        log_event("auth.google_id_token_invalid", "warning", persist=True)
+        return redirect_with_auth_failure("invalid_id_token")
+
+    issuer = str(claims.get("iss", ""))
+    subject = str(claims.get("sub", ""))
+    nonce = str(claims.get("nonce", ""))
+    hosted_domain = str(claims.get("hd", ""))
+
+    if issuer not in GOOGLE_ISSUERS:
+        return redirect_with_auth_failure("bad_issuer")
+    if not subject:
+        return redirect_with_auth_failure("missing_subject")
+    if not nonce or not secrets.compare_digest(expected_nonce, nonce):
+        return redirect_with_auth_failure("nonce_mismatch")
+    if GOOGLE_OAUTH_ALLOWED_HD and hosted_domain != GOOGLE_OAUTH_ALLOWED_HD:
+        log_event("auth.google_hd_rejected", "warning", details={"has_hd": bool(hosted_domain)}, persist=True)
+        return redirect("/?auth=domain_denied", code=303)
+
+    old_anon = session.get("anonymous_id")
+    identity_key = google_subject_identity_key(issuer, subject)
+
+    session.clear()
+    session["csrf_token"] = secrets.token_urlsafe(32)
+    session["anonymous_id"] = old_anon or secrets.token_urlsafe(24)
+    session["google_sub"] = identity_key
+    session["auth_provider"] = "google"
+    session.modified = True
+
+    player = authenticated_player(create=True)
+    log_event(
+        "auth.google_login",
+        "info",
+        player=player,
+        details={"hosted_domain_present": bool(hosted_domain), "allowed_domain_required": bool(GOOGLE_OAUTH_ALLOWED_HD)},
+        persist=True,
+    )
+    return redirect(next_path, code=303)
+
 
 @app.post("/api/client-events")
 @require_csrf
@@ -623,12 +823,14 @@ def security_status():
             "csrfToken": session["csrf_token"],
             "player": public_player_payload(row),
             "devAuthEnabled": DEV_AUTH_ENABLED,
+            "googleAuthEnabled": GOOGLE_OAUTH_ENABLED,
+            "googleLoginUrl": "/auth/google/start" if GOOGLE_OAUTH_ENABLED else None,
             "identityPolicy": {
                 "publicIdentifier": "3-character case-sensitive callsign",
                 "callsignClaiming": "requires authenticated account and no existing callsign",
                 "publicFields": ["callsign", "score", "wave", "survivalTimeSec", "createdAt"],
-                "googleDataStored": ["sub only, when Google OAuth is enabled"],
-                "googleDataNotStored": ["email", "name", "avatar", "access_token", "refresh_token"],
+                "googleDataStored": ["server-peppered HMAC of issuer plus sub, when Google OAuth is enabled"],
+                "googleDataNotStored": ["raw sub", "email", "name", "avatar", "access_token", "refresh_token", "id_token"],
             },
         }
     )

@@ -900,7 +900,7 @@ class AudioEngine {
 // ===================== PLAYER IDENTITY + LEADERBOARD API =====================
 type PublicPlayer = { authenticated: boolean; authProvider: string; callsign: string | null; canChooseCallsign: boolean };
 type LeaderboardEntry = { rank: number; callsign: string; score: number; wave: number; survivalTimeSec: number; createdAt: string };
-type SecurityStatus = { ok: boolean; csrfToken: string; player: PublicPlayer; devAuthEnabled?: boolean };
+type SecurityStatus = { ok: boolean; csrfToken: string; player: PublicPlayer; devAuthEnabled?: boolean; googleAuthEnabled?: boolean; googleLoginUrl?: string | null };
 type LeaderboardResponse = { ok: boolean; entries: LeaderboardEntry[] };
 type ScoreSubmitStatus = "idle" | "submitting" | "submitted" | "needs_login" | "needs_callsign" | "error";
 
@@ -962,6 +962,8 @@ export default function MetatronVectorFOIL() {
   const [callsignInput, setCallsignInput] = useState("");
   const [callsignMessage, setCallsignMessage] = useState("Log in before choosing a callsign.");
   const [devAuthEnabled, setDevAuthEnabled] = useState(false);
+  const [googleAuthEnabled, setGoogleAuthEnabled] = useState(false);
+  const [googleLoginUrl, setGoogleLoginUrl] = useState<string | null>(null);
   const [devHandle, setDevHandle] = useState("dev");
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [scoreSubmitStatus, setScoreSubmitStatus] = useState<ScoreSubmitStatus>("idle");
@@ -1027,6 +1029,8 @@ export default function MetatronVectorFOIL() {
       setCsrfToken(status.csrfToken);
       setPlayerIdentity(status.player ?? DEFAULT_PLAYER);
       setDevAuthEnabled(Boolean(status.devAuthEnabled));
+      setGoogleAuthEnabled(Boolean(status.googleAuthEnabled));
+      setGoogleLoginUrl(status.googleLoginUrl ?? null);
       setCallsignInput(status.player?.callsign ?? "");
       setCallsignMessage(callsignStatusMessage(status.player ?? DEFAULT_PLAYER));
       if (!clientStartupLoggedRef.current) {
@@ -1130,6 +1134,11 @@ export default function MetatronVectorFOIL() {
         message: error,
       });
     }
+  };
+
+  const googleLogin = () => {
+    if (!googleAuthEnabled) return;
+    window.location.assign(googleLoginUrl || "/auth/google/start");
   };
 
   const devLogin = async () => {
@@ -2934,11 +2943,13 @@ export default function MetatronVectorFOIL() {
                     authenticated={playerIdentity.authenticated}
                     authProvider={playerIdentity.authProvider}
                     canChoose={playerIdentity.canChooseCallsign}
+                    googleAuthEnabled={googleAuthEnabled}
                     devAuthEnabled={devAuthEnabled}
                     devHandle={devHandle}
                     message={callsignMessage}
                     onChange={setCallsignInput}
                     onSubmit={submitCallsign}
+                    onGoogleLogin={googleLogin}
                     onDevHandleChange={setDevHandle}
                     onDevLogin={devLogin}
                     onLogout={logoutPlayer}
@@ -3099,11 +3110,13 @@ function CallsignConsole({
   authenticated,
   authProvider,
   canChoose,
+  googleAuthEnabled,
   devAuthEnabled,
   devHandle,
   message,
   onChange,
   onSubmit,
+  onGoogleLogin,
   onDevHandleChange,
   onDevLogin,
   onLogout,
@@ -3113,11 +3126,13 @@ function CallsignConsole({
   authenticated: boolean;
   authProvider: string;
   canChoose: boolean;
+  googleAuthEnabled: boolean;
   devAuthEnabled: boolean;
   devHandle: string;
   message: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  onGoogleLogin: () => void;
   onDevHandleChange: (value: string) => void;
   onDevLogin: () => void;
   onLogout: () => void;
@@ -3170,47 +3185,79 @@ function CallsignConsole({
         </div>
       )}
 
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <input
-          value={value}
-          maxLength={3}
-          spellCheck={false}
-          autoComplete="off"
-          inputMode="text"
-          aria-label="Three character callsign"
-          disabled={!authenticated || !canChoose}
-          onChange={(e) => onChange(e.target.value.replace(/[^A-Za-z0-9]/g, "").slice(0, 3))}
-          onKeyDown={(e) => {
-            e.stopPropagation();
-            if (e.key === "Enter") {
-              e.preventDefault();
-              onSubmit();
-            }
-          }}
-          style={{
-            width: 76,
-            padding: "6px 8px",
-            border: "1px solid rgba(150,205,255,0.24)",
-            borderRadius: 0,
-            background: "rgba(0,0,0,0.36)",
-            color: "rgba(232,248,255,0.94)",
-            fontFamily: "ui-monospace, Menlo, monospace",
-            fontSize: 24,
-            letterSpacing: "0.14em",
-            textTransform: "none",
-            outline: "none",
-            opacity: authenticated && canChoose ? 1 : 0.46,
-          }}
-        />
-        <button
-          type="button"
-          onClick={onSubmit}
-          disabled={!canSubmit}
-          style={{ ...btnStyle, opacity: canSubmit ? 1 : 0.44, cursor: canSubmit ? "pointer" : "not-allowed" }}
-        >
-          Set callsign
-        </button>
-      </div>
+      {!authenticated ? (
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {googleAuthEnabled ? (
+            <button
+              type="button"
+              onClick={onGoogleLogin}
+              style={{
+                ...btnStyle,
+                padding: "7px 11px",
+                fontSize: 10,
+                borderColor: "rgba(176,255,218,0.30)",
+                color: "rgba(212,255,230,0.92)",
+                boxShadow: "0 0 16px rgba(145,255,212,0.08)",
+              }}
+            >
+              Login with Google
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled
+              style={{ ...btnStyle, opacity: 0.42, cursor: "not-allowed" }}
+            >
+              Login unavailable
+            </button>
+          )}
+          <span style={{ fontSize: 10, letterSpacing: "0.10em", textTransform: "uppercase", color: "rgba(170,214,248,0.58)" }}>
+            Then claim a 3-character callsign.
+          </span>
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input
+            value={value}
+            maxLength={3}
+            spellCheck={false}
+            autoComplete="off"
+            inputMode="text"
+            aria-label="Three character callsign"
+            disabled={!canChoose}
+            onChange={(e) => onChange(e.target.value.replace(/[^A-Za-z0-9]/g, "").slice(0, 3))}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") {
+                e.preventDefault();
+                onSubmit();
+              }
+            }}
+            style={{
+              width: 76,
+              padding: "6px 8px",
+              border: "1px solid rgba(150,205,255,0.24)",
+              borderRadius: 0,
+              background: "rgba(0,0,0,0.36)",
+              color: "rgba(232,248,255,0.94)",
+              fontFamily: "ui-monospace, Menlo, monospace",
+              fontSize: 24,
+              letterSpacing: "0.14em",
+              textTransform: "none",
+              outline: "none",
+              opacity: canChoose ? 1 : 0.46,
+            }}
+          />
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={!canSubmit}
+            style={{ ...btnStyle, opacity: canSubmit ? 1 : 0.44, cursor: canSubmit ? "pointer" : "not-allowed" }}
+          >
+            Set callsign
+          </button>
+        </div>
+      )}
       <div style={{ fontSize: 10, lineHeight: 1.45, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(170,214,248,0.64)" }}>
         {message} Public board stores callsign and score, not Google name or email.
       </div>

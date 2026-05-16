@@ -25,7 +25,7 @@ Metatron Vector FOIL should treat identity as a minimal badge, not a data hose. 
 openid email profile
 ```
 
-Even when `email` and `profile` are present in the ID token, the app should store only the stable Google `sub` claim unless there is a specific product requirement to do otherwise. Do not store Google access tokens, refresh tokens, profile photos, real names, or email addresses for leaderboard purposes. Use the player-chosen callsign as the public identity.
+Even when `email` and `profile` are present in the ID token, the app should not store those profile fields for leaderboard purposes. The production implementation derives a server-peppered HMAC from Google's stable issuer + `sub` pair and stores that non-reversible identity key instead of the raw Google `sub`. Do not store Google access tokens, refresh tokens, ID tokens, profile photos, real names, or email addresses for the arcade game. Use the player-chosen callsign as the public identity.
 
 ### Public Player Identity
 
@@ -35,6 +35,7 @@ Even when `email` and `profile` are present in the ID token, the app should stor
 - Callsigns are display identifiers, not login secrets. Never authenticate a player by callsign alone.
 - Callsign claiming requires an authenticated account. Anonymous/browser-session visitors may play locally but may not reserve public callsigns or publish persistent scores.
 - Callsigns are account-bound and immutable from the arcade UI once assigned; admin/manual database repair is the only expected change path.
+- Login controls belong only inside the Pilot Callsign console on the press-start/attract screen. Do not add a persistent top-right account widget, and do not show Google/dev login controls during active gameplay or debrief presentation.
 - Public leaderboards may show only callsign, score, wave, survival time, and submission time.
 - Do not expose email, Google display name, Google avatar URL, IP address, user-agent, session ID, OAuth token, or raw telemetry in public leaderboard responses.
 
@@ -42,7 +43,7 @@ Even when `email` and `profile` are present in the ID token, the app should stor
 
 Store the minimum viable data:
 
-- `google_sub` when OAuth is enabled.
+- A server-peppered HMAC identity key derived from Google issuer + `sub` when OAuth is enabled.
 - Anonymous session identifier only for CSRF/session continuity, not for public callsign ownership.
 - Player callsign, only after authentication.
 - Score, wave, survival duration, and small run-summary values needed for leaderboard ranking.
@@ -92,6 +93,7 @@ MVF_LOG_PEPPER='long-random-log-hash-pepper'
 MVF_LOG_STATIC=0                # set 1 only when debugging static asset delivery
 MVF_ACCEPT_CLIENT_DEBUG_LOGS=0  # keep debug noise off in production
 MVF_DEV_AUTH_ENABLED=0        # production must remain 0; dev-only fake account login
+MVF_IDENTITY_PEPPER='long-random-identity-hash-pepper'
 ```
 
 Recommended production ownership:
@@ -106,18 +108,48 @@ Recommended production environment additions:
 
 ```bash
 FLASK_SECRET_KEY='long-random-session-secret'
+MVF_IDENTITY_PEPPER='different-long-random-identity-pepper'
 MVF_LOG_PEPPER='different-long-random-log-pepper'
 MVF_DB_PATH=/var/lib/metatron-vector-foil/metatron-vector-foil.sqlite3
 MVF_LOG_PATH=/var/log/metatron-vector-foil/app.log
 MVF_COOKIE_SECURE=1
 MVF_ENABLE_HSTS=1
+GOOGLE_OAUTH_CLIENT_ID='your Google OAuth web client ID'
+GOOGLE_OAUTH_CLIENT_SECRET='your Google OAuth client secret'
+GOOGLE_OAUTH_REDIRECT_URI='https://metatron.inasra.me/auth/google/callback'
 ```
 
 The audit trail intentionally stores hashed IP/user-agent fingerprints, not raw IP addresses or browser strings. This preserves enough correlation for abuse investigation while reducing the privacy blast radius if the database or logs are exposed.
 
 ### Google OAuth Implementation Rules
 
-When Google OAuth is implemented, use server-side Authorization Code flow rather than handling tokens entirely in browser code. Validate ID tokens server-side using a well-maintained Google/Python client library or JOSE/JWT library. Validate issuer, audience, signature, expiration, and nonce/state. Store the `sub` claim as the stable account key; do not use email as the primary account key. Do not store refresh tokens unless a future feature truly requires offline Google API access, which the arcade game should not need.
+Production login uses server-side Google OpenID Connect / OAuth Authorization Code flow. The browser never receives or stores Google OAuth tokens; it only navigates to `/auth/google/start` and returns through `/auth/google/callback`. The Flask server exchanges the authorization code, validates the ID token with Google's Python verification library, checks issuer, audience, signature, expiration, state, and nonce, then derives the private account key as `HMAC(MVF_IDENTITY_PEPPER, issuer + sub)`. Email, display name, avatar, raw `sub`, ID token, access token, and refresh token are not stored.
+
+Required Google Console settings:
+
+- OAuth client type: **Web application**.
+- Authorized JavaScript origins: the production origin, for example `https://metatron.inasra.me`.
+- Authorized redirect URI: the exact callback URL, for example `https://metatron.inasra.me/auth/google/callback`.
+- OAuth consent scopes: only `openid`, `email`, and `profile`.
+
+Production environment variables:
+
+```bash
+GOOGLE_OAUTH_CLIENT_ID='your Google OAuth web client ID'
+GOOGLE_OAUTH_CLIENT_SECRET='your Google OAuth client secret'
+GOOGLE_OAUTH_REDIRECT_URI='https://metatron.inasra.me/auth/google/callback'
+MVF_GOOGLE_OAUTH_ENABLED=1
+MVF_IDENTITY_PEPPER='long-random-identity-hash-pepper'
+MVF_DEV_AUTH_ENABLED=0
+```
+
+Optional Google Workspace gate:
+
+```bash
+GOOGLE_OAUTH_ALLOWED_HD='example.com'
+```
+
+Only set `GOOGLE_OAUTH_ALLOWED_HD` if the game should reject consumer Gmail accounts and only allow accounts from a specific Workspace domain. The public arcade should normally leave this unset.
 
 Development builds may set `MVF_DEV_AUTH_ENABLED=1` to expose `/api/dev-login` for fake account sessions. This endpoint must remain disabled in production and must never be treated as a replacement for Google OAuth.
 

@@ -132,3 +132,35 @@ You are not just dodging enemies in space. You are defending a metaphysical mach
 - **TypeScript**
 - **esbuild**
 - **Flask** for lightweight local serving during development
+
+## Production Google Login
+
+Production authentication is handled server-side with Google OpenID Connect / OAuth Authorization Code flow. The browser never receives Google OAuth tokens; it only visits `/auth/google/start` and returns through `/auth/google/callback`. The server validates the ID token and stores a server-peppered HMAC identity key, not the player's raw Google `sub`, email, name, avatar, access token, refresh token, or ID token.
+
+The login button is intentionally shown only inside the **Pilot Callsign** console on the press-start/attract screen. There is no persistent top-right account button during gameplay; once the run begins, the arcade view stays clean and the public identity is reduced to the callsign/leaderboard system.
+
+In the Google Cloud Console, configure the OAuth client as a **Web application** and add the exact production origin and callback URL:
+
+```text
+Authorized JavaScript origin: https://metatron.inasra.me
+Authorized redirect URI:     https://metatron.inasra.me/auth/google/callback
+```
+
+Production environment example:
+
+```bash
+FLASK_SECRET_KEY='long-random-session-secret'
+MVF_IDENTITY_PEPPER='different-long-random-identity-pepper'
+MVF_LOG_PEPPER='different-long-random-log-pepper'
+MVF_DB_PATH=/var/lib/metatron-vector-foil/metatron-vector-foil.sqlite3
+MVF_LOG_PATH=/var/log/metatron-vector-foil/app.log
+MVF_COOKIE_SECURE=1
+MVF_ENABLE_HSTS=1
+MVF_DEV_AUTH_ENABLED=0
+GOOGLE_OAUTH_CLIENT_ID='your Google OAuth web client ID'
+GOOGLE_OAUTH_CLIENT_SECRET='your Google OAuth client secret'
+GOOGLE_OAUTH_REDIRECT_URI='https://metatron.inasra.me/auth/google/callback'
+MVF_GOOGLE_OAUTH_ENABLED=1
+```
+
+Only set `GOOGLE_OAUTH_ALLOWED_HD` if you intentionally want to restrict login to a single Google Workspace domain. Public arcade deployments should usually leave it unset.
