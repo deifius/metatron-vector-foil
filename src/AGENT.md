@@ -16,6 +16,63 @@ The player pilots a sphenic gravjammer around Sol, defending the Metatron lattic
 - UI should feel like old tactical instrumentation, oscilloscopes, vector scopes, avionics, and arcade cabinet overlays.
 - Prefer tunable constants over hard-coded magic numbers.
 
+
+## Security, Identity, and Leaderboard Strategy
+
+Metatron Vector FOIL should treat identity as a minimal badge, not a data hose. The game may use Google sign-in in production, but Google should only prove that a returning pilot is the same account holder. Do not request Drive, Gmail, Calendar, Contacts, YouTube, or other Google API scopes for the arcade game. The intended Google OIDC scope set is only:
+
+```text
+openid email profile
+```
+
+Even when `email` and `profile` are present in the ID token, the app should store only the stable Google `sub` claim unless there is a specific product requirement to do otherwise. Do not store Google access tokens, refresh tokens, profile photos, real names, or email addresses for leaderboard purposes. Use the player-chosen callsign as the public identity.
+
+### Public Player Identity
+
+- Players choose an exact 3-character callsign.
+- Callsigns are case-sensitive: `ABC`, `Abc`, and `abc` are different callsigns.
+- For security and legibility, callsigns are restricted to ASCII letters and digits: `A-Z`, `a-z`, `0-9`.
+- Public leaderboards may show only callsign, score, wave, survival time, and submission time.
+- Do not expose email, Google display name, Google avatar URL, IP address, user-agent, session ID, OAuth token, or raw telemetry in public leaderboard responses.
+
+### Data Collection Minimization
+
+Store the minimum viable data:
+
+- `google_sub` when OAuth is enabled.
+- Anonymous session identifier for local/dev/non-OAuth play.
+- Player callsign.
+- Score, wave, survival duration, and small run-summary values needed for leaderboard ranking.
+
+Avoid storing full run telemetry unless a later anti-cheat or replay system explicitly requires it. If such telemetry is added, it must be clearly separated from public leaderboard data and protected as private player data.
+
+### Server Hardening Rules
+
+- Serve production only over HTTPS.
+- Set `FLASK_SECRET_KEY` in the environment; never commit it.
+- Set `MVF_COOKIE_SECURE=1` in production so session cookies are sent only over HTTPS.
+- Enable HSTS in production with `MVF_ENABLE_HSTS=1` after HTTPS is confirmed stable.
+- Keep session cookies `HttpOnly` and `SameSite=Lax` or stricter.
+- Require CSRF tokens for state-changing API routes.
+- Validate Origin on state-changing API routes.
+- Return `Cache-Control: no-store` for API responses that include player/session state.
+- Send defensive headers: CSP, Referrer-Policy, X-Content-Type-Options, X-Frame-Options, Permissions-Policy.
+- Keep OAuth client secrets, database paths, and Flask secrets in environment variables or service files outside git.
+- Do not log OAuth tokens, CSRF tokens, session cookies, or full callback URLs.
+
+### Google OAuth Implementation Rules
+
+When Google OAuth is implemented, use server-side Authorization Code flow rather than handling tokens entirely in browser code. Validate ID tokens server-side using a well-maintained Google/Python client library or JOSE/JWT library. Validate issuer, audience, signature, expiration, and nonce/state. Store the `sub` claim as the stable account key; do not use email as the primary account key. Do not store refresh tokens unless a future feature truly requires offline Google API access, which the arcade game should not need.
+
+### Leaderboard Security Rules
+
+- Require a callsign before accepting persistent score submissions.
+- Rate-limit callsign changes and score submissions.
+- Validate submitted score payloads server-side for type, range, and shape.
+- Treat browser-submitted scores as untrusted. The current leaderboard is an arcade honor board, not a cryptographically authoritative tournament system.
+- Prefer one best score per player on the public board so a single pilot cannot flood the list.
+- Keep public leaderboard payloads tiny and intentionally boring. The weirdness belongs in the game, not in exposed identity data.
+
 ## Important Files
 
 - `src/MetatronVectorFOIL.tsx`

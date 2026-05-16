@@ -1201,6 +1201,34 @@ class AudioEngine {
   }
 }
 
+
+// ===================== PLAYER IDENTITY + LEADERBOARD API =====================
+type PublicPlayer = { authenticated: boolean; authProvider: string; callsign: string | null };
+type LeaderboardEntry = { rank: number; callsign: string; score: number; wave: number; survivalTimeSec: number; createdAt: string };
+type SecurityStatus = { ok: boolean; csrfToken: string; player: PublicPlayer };
+type LeaderboardResponse = { ok: boolean; entries: LeaderboardEntry[] };
+type ScoreSubmitStatus = "idle" | "submitting" | "submitted" | "needs_callsign" | "error";
+
+const DEFAULT_PLAYER: PublicPlayer = { authenticated: false, authProvider: "session", callsign: null };
+
+async function readJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, { credentials: "same-origin", ...init });
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const message = typeof payload?.error === "string" ? payload.error : `request_failed_${res.status}`;
+    throw new Error(message);
+  }
+  return payload as T;
+}
+
+function formatLeaderboardTime(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "00:00";
+  const s = Math.floor(seconds % 60).toString().padStart(2, "0");
+  const m = Math.floor((seconds / 60) % 60).toString().padStart(2, "0");
+  const h = Math.floor(seconds / 3600);
+  return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
+}
+
 // ===================== MAIN COMPONENT =====================
 export default function MetatronVectorFOIL() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -1216,6 +1244,12 @@ export default function MetatronVectorFOIL() {
   const [deathCauseLines, setDeathCauseLines] = useState<string[]>(DEFAULT_DEATH_CAUSE_LINES);
   const [gameOverLines, setGameOverLines] = useState<string[]>(DEFAULT_GAME_OVER_LINES);
   const [debriefUI, setDebriefUI] = useState<DebriefUIState>({ phase: "inactive", phaseElapsedMs: 0, visibleRows: 0, snapshot: null });
+  const [playerIdentity, setPlayerIdentity] = useState<PublicPlayer>(DEFAULT_PLAYER);
+  const [csrfToken, setCsrfToken] = useState("");
+  const [callsignInput, setCallsignInput] = useState("");
+  const [callsignMessage, setCallsignMessage] = useState("Choose three letters or digits.");
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [scoreSubmitStatus, setScoreSubmitStatus] = useState<ScoreSubmitStatus>("idle");
   const [menuHintIdx, setMenuHintIdx] = useState(0);
   const [attractIdx, setAttractIdx] = useState(0);
   const [attractPhaseTick, setAttractPhaseTick] = useState(0);
@@ -1223,6 +1257,9 @@ export default function MetatronVectorFOIL() {
   const modeRef = useRef(mode);
   const levelIdxRef = useRef(levelIdx);
   const togglesRef = useRef(toggles);
+  const csrfTokenRef = useRef("");
+  const playerIdentityRef = useRef<PublicPlayer>(DEFAULT_PLAYER);
+  const submitScoreRef = useRef<(snapshot: DebriefSnapshot) => void>(() => undefined);
   const commendationMapRef = useRef<Record<string, CommendationDefinition>>(buildCommendationMap(DEFAULT_COMMENDATIONS));
   const [sliders, setSliders] = useState({
     gravity: T.GRAVITY_GM,
@@ -1252,6 +1289,92 @@ export default function MetatronVectorFOIL() {
   }, [mode]);
   useEffect(() => { levelIdxRef.current = levelIdx; }, [levelIdx]);
   useEffect(() => { togglesRef.current = toggles; }, [toggles]);
+  useEffect(() => { csrfTokenRef.current = csrfToken; }, [csrfToken]);
+  useEffect(() => { playerIdentityRef.current = playerIdentity; }, [playerIdentity]);
+
+  const refreshLeaderboard = async () => {
+    try {
+      const board = await readJson<LeaderboardResponse>("/api/leaderboard?limit=10");
+      setLeaderboard(board.entries ?? []);
+    } catch {
+      setLeaderboard([]);
+    }
+  };
+
+  const refreshSecurityStatus = async () => {
+    try {
+      const status = await readJson<SecurityStatus>("/api/security/status");
+      setCsrfToken(status.csrfToken);
+      setPlayerIdentity(status.player ?? DEFAULT_PLAYER);
+      setCallsignInput(status.player?.callsign ?? "");
+      setCallsignMessage(status.player?.callsign ? `Pilot ${status.player.callsign} indexed.` : "Choose three letters or digits.");
+    } catch {
+      setCallsignMessage("Identity bus unavailable; local flight still works.");
+    }
+  };
+
+  useEffect(() => {
+    refreshSecurityStatus();
+    refreshLeaderboard();
+    const id = window.setInterval(refreshLeaderboard, 30000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  submitScoreRef.current = (snapshot: DebriefSnapshot) => {
+    const token = csrfTokenRef.current;
+    if (!token || !playerIdentityRef.current.callsign) {
+      setScoreSubmitStatus("needs_callsign");
+      return;
+    }
+    setScoreSubmitStatus("submitting");
+    readJson<{ ok: boolean }>("/api/scores", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+      body: JSON.stringify({
+        score: snapshot.score,
+        wave: snapshot.wave,
+        survivalTimeSec: snapshot.survivalTimeSec,
+        bestChain: snapshot.bestChain,
+        citations: snapshot.citations,
+        spheresAwakened: snapshot.spheresAwakened,
+        causeKey: snapshot.causeKey,
+      }),
+    })
+      .then(() => {
+        setScoreSubmitStatus("submitted");
+        refreshLeaderboard();
+      })
+      .catch(() => setScoreSubmitStatus("error"));
+  };
+
+  const submitCallsign = async () => {
+    const callsign = callsignInput.trim();
+    if (!/^[A-Za-z0-9]{3}$/.test(callsign)) {
+      setCallsignMessage("Callsign must be exactly 3 ASCII letters or digits.");
+      return;
+    }
+    if (!csrfToken) {
+      setCallsignMessage("Identity bus warming up; try again after the next phosphor blink.");
+      return;
+    }
+    try {
+      const result = await readJson<{ ok: boolean; player: PublicPlayer }>("/api/player/callsign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+        body: JSON.stringify({ callsign }),
+      });
+      setPlayerIdentity(result.player);
+      setCallsignInput(result.player.callsign ?? callsign);
+      setCallsignMessage(`Pilot ${result.player.callsign ?? callsign} indexed. Public board uses callsign only.`);
+      setScoreSubmitStatus("idle");
+      refreshLeaderboard();
+    } catch (err) {
+      const msg = err instanceof Error && err.message === "callsign_taken"
+        ? "That callsign is already transmitting."
+        : "Callsign registration failed.";
+      setCallsignMessage(msg);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -1936,6 +2059,7 @@ export default function MetatronVectorFOIL() {
 
     const enterDebrief = (causeKey: DeathCauseKey) => {
       debriefSnapshot = buildDebriefSnapshot(causeKey);
+      submitScoreRef.current(debriefSnapshot);
       debriefVisibleRows = 0;
       debriefPublishAccumulator = 0;
       modeRef.current = "debrief";
@@ -3012,6 +3136,14 @@ export default function MetatronVectorFOIL() {
                     </div>
                   </div>
 
+                  <CallsignConsole
+                    value={callsignInput}
+                    current={playerIdentity.callsign}
+                    message={callsignMessage}
+                    onChange={setCallsignInput}
+                    onSubmit={submitCallsign}
+                  />
+
                   <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "auto 1fr", gap: 10, alignItems: "center" }}>
                     <Keycap>Enter</Keycap><span style={{ opacity: 0.92 }}>Launch</span>
                     <Keycap>A/D</Keycap><span style={{ opacity: 0.86 }}>Rotate the foil</span>
@@ -3040,9 +3172,11 @@ export default function MetatronVectorFOIL() {
 
                   <div style={{ marginTop: 22, display: "grid", gap: 8 }}>
                     <VectorTelemetry label="NEXT MESSAGE" value={attractSequence[(attractIdx + 1) % attractSequence.length].headline} />
-                    <VectorTelemetry label="ALERT BUS" value="PILOT INPUT REQUIRED" />
+                    <VectorTelemetry label="ALERT BUS" value={playerIdentity.callsign ? `PILOT ${playerIdentity.callsign} INDEXED` : "CALLSIGN OPTIONAL"} />
                     <VectorTelemetry label="TREE STATUS" value="AWAKEN WHAT YOU TOUCH" />
                   </div>
+
+                  <LeaderboardConsole entries={leaderboard} status={scoreSubmitStatus} />
                 </VectorFrame>
               </div>
             </div>
@@ -3155,6 +3289,111 @@ function VectorTelemetry({ label, value }: { label: string; value: string }) {
     <div style={{ display: "grid", gap: 4, borderTop: "1px solid rgba(150,205,255,0.14)", paddingTop: 8 }}>
       <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.56)" }}>{label}</div>
       <div style={{ fontSize: 13, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(214,242,255,0.86)" }}>{value}</div>
+    </div>
+  );
+}
+
+function CallsignConsole({
+  value,
+  current,
+  message,
+  onChange,
+  onSubmit,
+}: {
+  value: string;
+  current: string | null;
+  message: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+}) {
+  const canSubmit = /^[A-Za-z0-9]{3}$/.test(value);
+  return (
+    <div style={{ marginTop: 18, display: "grid", gap: 8, padding: 10, border: "1px solid rgba(150,205,255,0.14)", background: "rgba(0,0,0,0.18)" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+        <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.58)" }}>Pilot Callsign</div>
+        <div style={{ fontSize: 11, letterSpacing: "0.18em", color: current ? "rgba(176,255,218,0.82)" : "rgba(243,214,152,0.72)" }}>
+          {current ? `ACTIVE // ${current}` : "UNINDEXED"}
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <input
+          value={value}
+          maxLength={3}
+          spellCheck={false}
+          autoComplete="off"
+          inputMode="text"
+          aria-label="Three character callsign"
+          onChange={(e) => onChange(e.target.value.replace(/[^A-Za-z0-9]/g, "").slice(0, 3))}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onSubmit();
+            }
+          }}
+          style={{
+            width: 76,
+            padding: "6px 8px",
+            border: "1px solid rgba(150,205,255,0.24)",
+            borderRadius: 0,
+            background: "rgba(0,0,0,0.36)",
+            color: "rgba(232,248,255,0.94)",
+            fontFamily: "ui-monospace, Menlo, monospace",
+            fontSize: 24,
+            letterSpacing: "0.14em",
+            textTransform: "none",
+            outline: "none",
+          }}
+        />
+        <button
+          type="button"
+          onClick={onSubmit}
+          disabled={!canSubmit}
+          style={{ ...btnStyle, opacity: canSubmit ? 1 : 0.44, cursor: canSubmit ? "pointer" : "not-allowed" }}
+        >
+          Set callsign
+        </button>
+      </div>
+      <div style={{ fontSize: 10, lineHeight: 1.45, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(170,214,248,0.64)" }}>
+        {message} Public board stores callsign and score, not Google name or email.
+      </div>
+    </div>
+  );
+}
+
+function LeaderboardConsole({ entries, status }: { entries: LeaderboardEntry[]; status: ScoreSubmitStatus }) {
+  const statusText = status === "submitted"
+    ? "LAST RUN PUBLISHED"
+    : status === "submitting"
+      ? "TRANSMITTING LAST RUN"
+      : status === "needs_callsign"
+        ? "SET CALLSIGN TO PUBLISH RUNS"
+        : status === "error"
+          ? "LAST RUN NOT ACCEPTED"
+          : "PUBLIC HONOR BOARD";
+  return (
+    <div style={{ marginTop: 18, display: "grid", gap: 8, paddingTop: 12, borderTop: "1px solid rgba(150,205,255,0.12)" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+        <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.56)" }}>Top Callsigns</div>
+        <div style={{ fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase", color: "rgba(243,214,152,0.68)" }}>{statusText}</div>
+      </div>
+      {entries.length === 0 ? (
+        <div style={{ fontSize: 12, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(214,242,255,0.64)", padding: "7px 0" }}>
+          No public transmissions logged.
+        </div>
+      ) : (
+        <div style={{ display: "grid", gap: 5 }}>
+          {entries.slice(0, 7).map((entry) => (
+            <div key={`${entry.rank}-${entry.callsign}-${entry.score}`} style={{ display: "grid", gridTemplateColumns: "2.5ch 4ch 1fr 5ch 6ch", gap: 8, alignItems: "baseline", fontSize: 12, letterSpacing: "0.08em", color: "rgba(222,242,255,0.82)" }}>
+              <span style={{ color: "rgba(150,205,255,0.48)" }}>{entry.rank}</span>
+              <span style={{ color: "rgba(176,255,218,0.9)", fontWeight: 700 }}>{entry.callsign}</span>
+              <span style={{ textAlign: "right" }}>{entry.score.toLocaleString()}</span>
+              <span style={{ color: "rgba(243,214,152,0.72)" }}>W{entry.wave}</span>
+              <span style={{ color: "rgba(150,205,255,0.58)" }}>{formatLeaderboardTime(entry.survivalTimeSec)}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
