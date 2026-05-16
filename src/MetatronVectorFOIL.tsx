@@ -1,11 +1,26 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { DEFAULT_HUD_CONFIG, DEFAULT_HUD_STATE, HUD_DEV_CONTROLS } from "./ui/hud/hudConfig";
+import { DEFAULT_HUD_CONFIG, DEFAULT_HUD_STATE, HUD_UPDATE_INTERVAL } from "./ui/hud/hudConfig";
 import { HUDRoot } from "./ui/hud/HUDRoot";
 import { HUDState } from "./ui/hud/hudTypes";
 import { loadJson, loadTextLines } from "./data/textLoader";
 import { scoreForCitation, scoreForEnemy, scoreForPerfectWave, scoreForWaveClear } from "./config/scoring";
 import { SCORE_THRESHOLDS } from "./config/thresholds";
 import type { CitationCategory, CommendationDefinition } from "./types/scoring";
+import {
+  AUDIO,
+  DEBRIEF_SEQUENCE,
+  DEFAULT_COMMENDATIONS,
+  DEFAULT_DEATH_CAUSE_LINES,
+  DEFAULT_FLIGHT_HINTS,
+  DEFAULT_GAME_OVER_LINES,
+  DEFAULT_INSERT_COIN_LINES,
+  DEFAULT_PLAYER,
+  DOWNGRADE,
+  MET_EDGES,
+  T,
+  TAU,
+} from "./config/gameConstants";
+import type { SolidKind } from "./config/gameConstants";
 
 /**
  * Metatron Vector FOIL
@@ -14,211 +29,7 @@ import type { CitationCategory, CommendationDefinition } from "./types/scoring";
  * - WebAudio wavetable SFX
  */
 
-// ===================== TUNABLES =====================
-const T = {
-  // World
-  META_CIRCLE_RADIUS: 272,              // visible Metatron circle/sphere radius; also defines awakening, refuel, and charging region size (world units)
-  META_NODE_SPACING: 344,              // center-to-center spacing of Metatron nodes; for tangency set to META_CIRCLE_RADIUS * 2
-  META_PLAYFIELD_RADIUS: 144,          // gameplay/camera reference radius; still decoupled from node spacing and circle size
-  HORIZON_MULT: 2.0,                   // red ring radius multiplier
-  OORT_INNER_MULT: 1.28,               // fuel-bit settlement inner band
-  OORT_OUTER_MULT: 1.55,               // fuel-bit settlement outer band
-  STAR_RADIUS: 14,                     // visible star radius (world units)
-  STAR_TRAP_RADIUS: 18,                // "stuck in well" radius threshold (world units)
-  STAR_TRAP_TIME: 3.0,                 // seconds stuck before explode/restart
-
-  // Physics
-  GRAVITY_GM: 1_150_000,               // gravity strength (GM)
-  GRAVITY_SOFTEN: 22,                  // softening distance to avoid singularity
-  MAX_SPEED: 7500,                     // hard speed clamp (world units/s)
-  FIXED_DT: 1 / 120,                   // fixed timestep for stability
-  SUBSTEPS_MAX: 8,                     // max fixed steps per frame to avoid spiral of death
-
-  // Player
-  SHIP_MASS: 26.0,                     // ship mass (higher = more inertia)
-  ROT_SPEED: 3.6,                      // ship rotation speed (rad/s)
-  THRUST_FORCE: 1900,                  // engine thrust (force units)
-  BRAKE_COEFF: 0.97,                  // braking drag coefficient applied per fixed step
-  DRAG: 0.0,                           // should remain 0 (user request)
-  ORBIT_GAIN: 1.03,                    // initial tangential velocity multiplier
-  FUEL_MAX: 100,                       // fuel capacity
-  FUEL_BURN: 16.0,                     // fuel burn per second @ full thrust
-  FUEL_REGEN_INNER: 10.0,              // fuel regen per second inside red ring
-  FUEL_REGEN_OUTER: 0.0,               // regen outside ring (keep 0)
-  FUEL_PICKUP_AMOUNT: 12.0,            // fuel gained per collected bit
-
-  // Solar sail (light pressure)
-  SOLAR_PRESSURE: 210_000,             // strength of light pressure (tune)
-  SOLAR_ANGLE_GAIN: 0.55,              // how much sail angle produces tangential push (0..1)
-
-  // Camera
-  CAMERA_LERP: 0.24,                   // camera zoom smoothing
-  CAMERA_ZOOM_FLOOR: 0.125,            // min zoom so scene never vanishes
-  CAMERA_ZOOM_CEIL: 3.0,               // max zoom to avoid jitter
-  CAMERA_PAD_PX: 56,                   // screen-space padding for keep-in-view
-  CAMERA_AESTHETIC: 0.55,              // blend weight toward aesthetic zoom (0..1)
-
-  // Visuals
-  TRAIL_SAMPLES: 2400,                 // contrail length (points)
-  TRAIL_ALPHA: 0.33,                   // contrail alpha
-  BG_FADE: 0.16,                       // background fade strength when trails on
-  DEBUG_TEXT: true,                    // show debug overlay toggle default
-
-  // Weapons
-  FIRE_RATE: 0.22,                     // seconds between shots
-  BULLET_SPEED: 500,                  // bullet speed
-  BULLET_LIFE: 8.2,                    // bullet lifetime seconds
-  BULLET_RADIUS: 4.0,                  // bullet collision radius against wireframe edges
-  BULLET_TAIL: 0.024,                  // tail length factor
-  BULLET_MASS: 2.0,                    // 0 = energy weapon (no gravity), 1 = baseline ballistic slug
-
-  SHIP_RESILIENCE: 6,                  // number of hits the ship can take before destruction; 1 = first hit kills
-  SHIP_HIT_IFRAME_SEC: 0.45,           // brief invulnerability so resilience is meaningful
-  SHIP_HIT_KNOCKBACK: 180,             // impulse away from the impact source
-
-  // Enemies
-  ENEMY_MAX: 5,                        // max enemies on screen
-  ENEMY_SPAWN_BASE: 0.9,               // base spawn interval
-  ENEMY_SPAWN_MIN: 0.35,               // minimum spawn interval at higher levels
-  ENEMY_SPEED: 60,                    // base enemy drift speed
-  ENEMY_SPAWN_RADIUS_INNER_MULT: 1.7,  // enemy spawn shell inner radius, measured from Oort outer edge
-  ENEMY_SPAWN_RADIUS_OUTER_MULT: 1.9,  // enemy spawn shell outer radius, measured from Oort outer edge
-  ENEMY_STEER: 140,                    // inward acceleration toward Sol
-  ENEMY_ORBIT_BIAS: 0.95,              // tendency to spiral rather than beeline
-  ENEMY_PLAYER_BIAS: 0.18,             // slight ship-seeking influence while still diving inward
-  ENEMY_GRAVITY_MULT: 1.1,             // extra stellar pull on enemies
-  ENEMY_HIT_RADIUS_MULT: 1.25,         // player collision radius multiplier against enemies
-  ENEMY_COLLAPSE_RATE: 1.25,           // solid downgrade morph speed
-  ENEMY_HIT_DEFLECT_IMPULSE: 135,      // direct bullet-hit impulse away from Sol
-  ENEMY_HIT_DEFLECT_TANGENTIAL: 0.22,  // preserves a little sideways motion on direct hits
-  SHARD_ENEMY_KNOCKBACK: 42,           // smaller shrapnel impulse applied to enemies
-  SHARD_ENEMY_SOL_BIAS: 0.35,          // blends shard knockback slightly outward from Sol
-  SHIP_HIT_RADIUS: 10,                 // player hit radius
-  SHARD_HIT_RADIUS_PAD: 2.5,           // extra shard collision padding
-  SHRAPNEL_COUNT_MIN: 2,               // min shrapnel on hit
-  SHRAPNEL_COUNT_MAX: 8,              // max shrapnel on hit
-  SHRAPNEL_SPEED_MIN: 40,             // shrapnel speed min
-  SHRAPNEL_SPEED_MAX: 120,             // shrapnel speed max
-  SHRAPNEL_GRAVITY_MULT: 6.0,          // shard gravity multiplier
-  SHRAPNEL_PARENT_VEL: 0.6,            // how much parent velocity shards inherit
-  SHRAPNEL_LIFE_MIN: 7.9,              // shrapnel life min
-  SHRAPNEL_LIFE_MAX: 18.9,              // shrapnel life max
-
-  // Oort cloud constellations / hazards
-  OORT_CONSTELLATIONS_ENABLED: true,    // draw and simulate the procedural Oort cloud
-  OORT_CLUSTER_COUNT: 420,              // cheap procedural three-node constellations; not full physics bodies
-  OORT_CONSTELLATION_INNER_MULT: 1.92,  // inner constellation band, measured from current Oort outer radius
-  OORT_CONSTELLATION_OUTER_MULT: 3.15,  // outer constellation band, measured from current Oort outer radius
-  OORT_GLYPH_RADIUS_MIN: 5.0,           // local three-node constellation radius
-  OORT_GLYPH_RADIUS_MAX: 18.0,          // local three-node constellation radius
-  OORT_ORBIT_SPEED_MIN: 0.00055,        // parametric orbit speed, radians/s
-  OORT_ORBIT_SPEED_MAX: 0.0030,         // parametric orbit speed, radians/s
-  OORT_LOCAL_SPIN_SPEED_MIN: -0.42,     // local glyph spin, radians/s
-  OORT_LOCAL_SPIN_SPEED_MAX: 0.42,      // local glyph spin, radians/s
-  OORT_ECCENTRICITY_MAX: 0.10,          // subtle non-circular procession without n-body integration
-  OORT_NODE_VISUAL_RADIUS: 2.3,         // node dot radius in screen-ish pixels
-  OORT_LINE_ALPHA: 0.065,               // resting constellation line opacity
-  OORT_NODE_ALPHA: 0.16,                // resting constellation node opacity
-  OORT_NEAR_PLAYER_BRIGHTEN_RADIUS: 175,// nearby Oort glyphs brighten as the jammer's field wakes them
-  OORT_HAZARD_WAKE_RADIUS: 84,          // coarse cluster distance before detailed player collision checks
-  OORT_NODE_HIT_RADIUS: 7.5,            // player collision radius around Oort nodes
-  OORT_LINE_HIT_RADIUS: 5.8,            // player collision radius around Oort tripwire segments
-  OORT_DUST_DAMAGE_PER_SECOND: 0.026,   // ambient shield abrasion inside dense Oort dust
-  OORT_DUST_SPEED_SCALE: 0.00135,       // faster Oort travel increases abrasion
-  OORT_COLLISION_BASE_DAMAGE: 0.38,     // discrete node/tripwire damage, in ship-hit units
-  OORT_COLLISION_SPEED_DAMAGE: 0.00115, // additional discrete damage per world-unit/s of speed
-  OORT_COLLISION_KNOCKBACK: 115,        // velocity kick away from struck constellation
-  OORT_SHOT_BREAK_RADIUS: 9.0,          // blaster corridor-clearing radius against nodes/lines
-  OORT_REFORM_SECONDS: 15.0,            // broken constellations drift back together after this long
-
-  // Metatron animation / node gameplay
-  META_BASE_SPIN: 0.03,                // base spin
-  META_SPIN_GAIN: 0.22,                // spin increases with distance
-  META_DWELL: 0.82,                    // dwell damping toward readable pose
-  META_ALIGN_START_COUNT: 1,           // begin flattening the lattice after this many awakened nodes
-  META_ALIGN_COMPLETE_COUNT: 3,        // fully face-on target by this many awakened nodes
-  META_ALIGN_SETTLE_SEC: 14.0,           // seconds for the lattice to drift into its new alignment target
-  META_DEPTH_WOBBLE: 8,                // early-game z offset for occult not-quite-flat projection
-  META_SPHERE_PULSE: 8.0,              // seconds per pulse
-  META_SPHERE_LIGHT_ALPHA: 0.08,       // lit-side fill opacity for awakened spheres
-  META_SPHERE_SHADOW_ALPHA: 0.065,     // dark-side opacity for awakened spheres
-  META_SPHERE_RIM_ALPHA: 0.11,         // lit rim opacity for awakened spheres
-  META_SPHERE_CENTER_FILL_ALPHA: 0.012,// faint center-circle fill; Sol itself supplies the real luminosity
-  META_LINE_ALPHA: 0.16,               // resting opacity of awakened-node connections
-  META_LINE_PULSE_ALPHA: 0.50,         // extra opacity during new-node pulse
-  META_LINE_WIDTH: 1.0,                // resting line width for awakened-node connections
-  META_LINE_PULSE_WIDTH: 2.2,          // extra line width during new-node pulse
-  META_LINE_PULSE_SEC: 0.85,           // duration of newly awakened connection pulse
-  META_NODE_FUEL_INNER: 3.5,           // small passive fuel trickle in inner-node cores
-  META_NODE_FUEL_OUTER: 5.0,           // small passive fuel trickle in outer-node cores
-  META_SPHERE_FUEL_INNER: 14.0,        // bonus fuel regen inside an awakened inner sphere core
-  META_SPHERE_FUEL_OUTER: 18.0,        // bonus fuel regen inside an awakened outer sphere core
-  META_SPHERE_SHIELD_REGEN: 0.14,      // shield repair per second while holding an awakened inner sphere
-  META_SPHERE_SHIELD_REGEN_OUTER: 0.20,// stronger shield repair per second in awakened outer spheres
-  META_NODE_CHARGE_SEC: 5.5,           // base duration added by any bullet hit on a polyhedron
-  META_NODE_OVERCHARGE_SEC: 9.0,       // bonus duration when a tetrahedron is destroyed in a node
-  META_NODE_MAX_CHARGE_SEC: 18.0,      // cap so repeated hits do not make a node permanent
-  META_ACTIVE_NODE_GRAVITY_MULT: 0.055,// awakened node gravity strength as a fraction of current Sol GM
-  META_ACTIVE_NODE_GRAVITY_SOFTEN: 72, // softening distance for awakened node gravity
-  META_ACTIVE_NODE_GRAVITY_MAX: 95,    // max acceleration from awakened node gravity per node
-  META_NODE_GRAVITY_AFFECTS_PLAYER: true,
-  META_NODE_GRAVITY_AFFECTS_BULLETS: true,
-  META_NODE_GRAVITY_AFFECTS_ENEMIES: true,
-  META_NODE_GRAVITY_AFFECTS_SHRAPNEL: true,
-
-  // Door / progression
-  ALIGN_THRESHOLD: 0.11,               // angle error threshold for "aligned"
-  ALIGN_HOLD_TIME: 0.9,                // time aligned before door arms
-  DOOR_RADIUS: 22,                     // radius of the "door" when armed
-
-  // UI / Audio
-  UI_FONT: "12px ui-monospace, Menlo, monospace",
-  MASTER_VOL: 0.95,                    // overall audio volume
-  AUDIO_DRONE_BUS_GAIN: 0.72,          // overall level of the sustained drone layer
-  AUDIO_SFX_BUS_GAIN: 0.9,             // procedural / one-shot SFX level
-  AUDIO_BACKGROUND_LEVEL: 0.51,        // base 216 Hz bed level (raised so it is clearly audible)
-  AUDIO_BACKGROUND_FILTER_HZ: 2400,    // tone color of the 216 Hz bed
-  AUDIO_ENEMY_GAIN_FAR: 0.024,         // minimum platonic-solid drone level, even out in the Oort cloud
-  AUDIO_ENEMY_GAIN_NEAR: 0.065,        // max platonic-solid drone level near Sol
-  AUDIO_ENEMY_GAIN_CURVE: 1.25,        // falloff shape: lower = louder farther out, higher = quieter until close
-  AUDIO_ENEMY_FILTER_FAR_HZ: 700,      // far-field tone color for platonic solids
-  AUDIO_ENEMY_FILTER_NEAR_HZ: 2800,    // near-field brightness for platonic solids
-  AUDIO_ENEMY_PAN_WORLD_WIDTH: 340,    // stereo pan spread relative to player position
-  AUDIO_ENEMY_DEVOLVE_GLISS_SEC: 0.34, // glide time when a solid collapses to a lower order
-  AUDIO_DOPPLER_SCALE: 0.0012,         // subtle pitch bend from radial motion relative to the player
-  AUDIO_MODE_MENU_DRONES: 0.35,        // drone bus multiplier in menu
-  AUDIO_MODE_PLAYING_DRONES: 1.0,      // drone bus multiplier while playing
-  AUDIO_MODE_PAUSED_DRONES: 0.38,      // drone bus multiplier while paused
-  AUDIO_MODE_TRANSITION_DRONES: 0.82,  // drone bus multiplier between waves
-  AUDIO_MODE_DEBRIEF_DRONES: 0.16,     // drone bus multiplier during death/debrief ritual
-
-  AUDIO_THRUST_URL: "/static/audio/thrust.wav",
-  AUDIO_BLASTER_URL: "/static/audio/blaster-fire.wav",
-  AUDIO_SHIP_DESTROYED_URL: "/static/audio/ship-destroyed.wav",
-  AUDIO_SOL_DESTROYED_URL: "/static/audio/sol-destroyed.wav",
-  AUDIO_NEXT_WAVE_URL: "/static/audio/next-wave.wav",
-  AUDIO_OORT_BREAK_URL: "/static/audio/oort-break.wav",
-  AUDIO_OORT_STRIKE_URL: "/static/audio/oort-strike.wav",
-  AUDIO_OORT_DUST_URL: "/static/audio/oort-dust.wav",
-
-  AUDIO_THRUST_SAMPLE_GAIN: 0.18,      // level of looped thrust.wav when present
-  AUDIO_THRUST_RATE_MIN: 0.92,         // idle playback rate for thrust.wav
-  AUDIO_THRUST_RATE_MAX: 1.24,         // full-thrust playback rate for thrust.wav
-  AUDIO_THRUST_FILTER_MIN_HZ: 420,     // idle filter for thrust.wav
-  AUDIO_THRUST_FILTER_MAX_HZ: 2400,    // full-thrust filter for thrust.wav
-
-  AUDIO_BLASTER_GAIN: 0.08,            // one-shot gain for blaster-fire.wav
-  AUDIO_SHIP_DESTROYED_GAIN: 0.12,     // one-shot gain for ship-destroyed.wav
-  AUDIO_SOL_DESTROYED_GAIN: 0.45,      // one-shot gain for sol-destroyed.wav
-  AUDIO_NEXT_WAVE_GAIN: 0.14,           // one-shot gain for next-wave.wav
-  AUDIO_OORT_BREAK_GAIN: 0.10,          // one-shot gain for oort-break.wav
-  AUDIO_OORT_STRIKE_GAIN: 0.16,         // one-shot gain for oort-strike.wav
-  AUDIO_OORT_DUST_GAIN: 0.12,           // max gain for looped oort-dust.wav while abrading shields
-  AUDIO_OORT_DUST_FILTER_HZ: 2600,      // high, icy dust tone when the optional loop is present
-};
-
-const TAU = Math.PI * 2;
-const HUD_UPDATE_INTERVAL = 1 / HUD_DEV_CONTROLS.refreshHz;
+// ===================== UTILITIES =====================
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const smoothstep = (edge0: number, edge1: number, x: number) => {
@@ -307,10 +118,8 @@ function isMetaNodeLit(node: MetaNode | undefined) {
   return !!node && (node.kind === "center" || node.awakened);
 }
 
-const MET_EDGES = (() => { const e: number[][] = []; for (let i = 0; i < 13; i++) for (let j = i + 1; j < 13; j++) e.push([i, j]); return e; })();
 
 // ===================== POLYHEDRA =====================
-type SolidKind = "tetra" | "cube" | "octa" | "dodeca" | "icosa";
 type PolyMesh = { verts: V3[]; edges: number[][] };
 type Impact = { point: V2; normal: V2; edgeI: number; edgeJ: number; d2: number };
 
@@ -376,13 +185,7 @@ function makePolyhedron(kind: SolidKind, r: number): PolyMesh {
   return { verts, edges };
 }
 
-const DOWNGRADE: Record<SolidKind, SolidKind | null> = {
-  icosa: "dodeca",
-  dodeca: "octa",
-  octa: "cube",
-  cube: "tetra",
-  tetra: null,
-};
+
 
 // ===================== GAME TYPES =====================
 type Bullet = { pos: V2; prevPos: V2; vel: V2; life: number; mass: number; origin: V2; firedAtMs: number; burstId: number };
@@ -506,60 +309,6 @@ type DebriefUIState = {
   snapshot: DebriefSnapshot | null;
 };
 
-const DEBRIEF_SEQUENCE = {
-  burnFadeMs: 2250,
-  gameOverHoldMs: 3750,
-  rowRevealMs: 900,
-  readyPromptDelayMs: 1200,
-  autoReturnMs: 24000,
-} as const;
-
-const DEFAULT_INSERT_COIN_LINES = [
-  "INSERT COIN",
-  "PRESS START",
-  "THE TREE REMEMBERS EVERY SPHERE YOU AWAKEN",
-  "FURTHER IN. FASTER THROUGH.",
-];
-
-const DEFAULT_FLIGHT_HINTS = [
-  "Stable orbit requires sideways velocity.",
-  "Burn prograde to raise apoapsis.",
-  "A close pass by Sol can buy speed or death.",
-  "Return to the burn.",
-  "Wide Oort excursions reset the fight on your terms.",
-  "Long shots count more when the void agrees with you.",
-];
-
-const DEFAULT_DEATH_CAUSE_LINES = [
-  "DESTROYED BY SHRAPNEL",
-  "LOST TO THE WELL",
-  "SOL BREACHED",
-  "STRUCTURAL FAILURE",
-  "OUT OF FUEL",
-  "VECTOR COLLAPSE",
-  "OORT CLOUD STRIKE",
-];
-
-const DEFAULT_GAME_OVER_LINES = [
-  "GAME OVER",
-  "PILOT DEBRIEF",
-  "TOP CALLSIGNS APPROACH",
-  "PRESS START TO FLY AGAIN",
-];
-
-const DEFAULT_COMMENDATIONS: CommendationDefinition[] = [
-  { id: "longShot", category: "gunnery", label: "GUNNERY CITATION: LONG SHOT", subtitle: "RANGING SOLUTION CONFIRMED", tier: 2 },
-  { id: "salvoConnect", category: "gunnery", label: "GUNNERY CITATION: SALVO CONNECT", subtitle: "MULTIPLE ROUNDS AGREED", tier: 2 },
-  { id: "fullSalvo", category: "gunnery", label: "GUNNERY CITATION: FULL SALVO", subtitle: "EVERY ROUND FOUND ITS DOCTRINE", tier: 2 },
-  { id: "slingshot", category: "pilotage", label: "PILOT CITATION: SLINGSHOT", subtitle: "TRAJECTORY ADVANTAGE", tier: 2 },
-  { id: "highGTurn", category: "pilotage", label: "PILOT CITATION: HIGH-G TURN", subtitle: "STRUCTURAL LIMIT APPROACHED", tier: 2 },
-  { id: "returnToTheBurn", category: "pilotage", label: "PILOT CITATION: RETURN TO THE BURN", subtitle: "ENGAGEMENT SOLUTION REACQUIRED", tier: 2 },
-  { id: "oortReach", category: "pilotage", label: "PILOT CITATION: OORT REACH", subtitle: "BLACK ICE NAVIGATED", tier: 2 },
-  { id: "periapsisKiss", category: "pilotage", label: "PILOT CITATION: PERIAPSIS KISS", subtitle: "CLOSE SOL PASS SURVIVED", tier: 2 },
-  { id: "nodeAwakened", category: "geometry", label: "NODE AWAKENED", subtitle: "SEPHIRA RESPONDS", tier: 3 },
-  { id: "allSpheresLit", category: "geometry", label: "ALL SPHERES LIT", subtitle: "METATRONIC PHASE TRANSITION", tier: 3 },
-];
-
 function buildCommendationMap(items: CommendationDefinition[]) {
   return Object.fromEntries(items.map((item) => [item.id, item])) as Record<string, CommendationDefinition>;
 }
@@ -573,61 +322,7 @@ function scoreAlertSeverity(tier: 1 | 2 | 3): HUDState["alert"]["severity"] {
 // ===================== WEB AUDIO (DRONES + SFX) =====================
 type GameMode = "menu" | "playing" | "paused" | "transition" | "debrief";
 
-const AUDIO = {
-  MASTER_GAIN: T.MASTER_VOL,
-  DRONE_BUS_GAIN: T.AUDIO_DRONE_BUS_GAIN,
-  SFX_BUS_GAIN: T.AUDIO_SFX_BUS_GAIN,
-  BUFFER_URL: "/static/audio/drone-432.wav",
-  BACKGROUND: {
-    PLAYBACK_RATE: 0.5,
-    GAIN: T.AUDIO_BACKGROUND_LEVEL,
-    PAN: 0,
-    FILTER_HZ: T.AUDIO_BACKGROUND_FILTER_HZ,
-  },
-  HARMONICS: {
-    tetra: 1.0,
-    cube: 1.5,
-    octa: 2.0,
-    dodeca: 2.5,
-    icosa: 3.0,
-  } as const,
-  ENEMY: {
-    MIN_GAIN: T.AUDIO_ENEMY_GAIN_FAR,
-    MAX_GAIN: T.AUDIO_ENEMY_GAIN_NEAR,
-    GAIN_CURVE_EXP: T.AUDIO_ENEMY_GAIN_CURVE,
-    PAN_WORLD_WIDTH: T.AUDIO_ENEMY_PAN_WORLD_WIDTH,
-    PAN_SMOOTH_SEC: 0.075,
-    GAIN_SMOOTH_SEC: 0.09,
-    FILTER_MIN_HZ: T.AUDIO_ENEMY_FILTER_FAR_HZ,
-    FILTER_MAX_HZ: T.AUDIO_ENEMY_FILTER_NEAR_HZ,
-    FILTER_SMOOTH_SEC: 0.1,
-    RATE_SMOOTH_SEC: 0.085,
-    DEVOLVE_GLISS_SEC: T.AUDIO_ENEMY_DEVOLVE_GLISS_SEC,
-    SPAWN_FADE_SEC: 0.18,
-    DEATH_FADE_SEC: 0.1,
-  },
-  DOPPLER: {
-    ENABLED: true,
-    SCALE: T.AUDIO_DOPPLER_SCALE,
-    MIN_FACTOR: 0.985,
-    MAX_FACTOR: 1.015,
-  },
-  THRUST: {
-    BASE_FREQ: 85,
-    FREQ_RANGE: 180,
-    BASE_FILTER: 380,
-    FILTER_RANGE: 1600,
-    GAIN_MAX: 0.16,
-  },
-  MODE: {
-    menu: T.AUDIO_MODE_MENU_DRONES,
-    playing: T.AUDIO_MODE_PLAYING_DRONES,
-    paused: T.AUDIO_MODE_PAUSED_DRONES,
-    transition: T.AUDIO_MODE_TRANSITION_DRONES,
-    debrief: T.AUDIO_MODE_DEBRIEF_DRONES,
-  } as const,
-  FALLBACK_BUFFER_SECONDS: 6,
-};
+
 
 class DroneVoice {
   source: AudioBufferSourceNode | null = null;
@@ -1201,6 +896,52 @@ class AudioEngine {
   }
 }
 
+
+// ===================== PLAYER IDENTITY + LEADERBOARD API =====================
+type PublicPlayer = { authenticated: boolean; authProvider: string; callsign: string | null; canChooseCallsign: boolean };
+type LeaderboardEntry = { rank: number; callsign: string; score: number; wave: number; survivalTimeSec: number; createdAt: string };
+type SecurityStatus = { ok: boolean; csrfToken: string; player: PublicPlayer; devAuthEnabled?: boolean; googleAuthEnabled?: boolean; googleLoginUrl?: string | null };
+type LeaderboardResponse = { ok: boolean; entries: LeaderboardEntry[] };
+type ScoreSubmitStatus = "idle" | "submitting" | "submitted" | "needs_login" | "needs_callsign" | "error";
+
+async function readJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, { credentials: "same-origin", ...init });
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const message = typeof payload?.error === "string" ? payload.error : `request_failed_${res.status}`;
+    throw new Error(message);
+  }
+  return payload as T;
+}
+
+async function logClientEvent(csrfToken: string, eventType: string, severity: "info" | "warning" | "error", details: Record<string, unknown> = {}) {
+  if (!csrfToken) return;
+  try {
+    await fetch("/api/client-events", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ eventType, severity, details }),
+    });
+  } catch {
+    // Logging must never make gameplay worse. The little black box is useful only if it behaves itself.
+  }
+}
+
+function formatLeaderboardTime(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "00:00";
+  const s = Math.floor(seconds % 60).toString().padStart(2, "0");
+  const m = Math.floor((seconds / 60) % 60).toString().padStart(2, "0");
+  const h = Math.floor(seconds / 3600);
+  return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
+}
+
+function callsignStatusMessage(player: PublicPlayer) {
+  if (!player.authenticated) return "Log in before choosing a callsign.";
+  if (player.callsign) return `Pilot ${player.callsign} indexed. Callsigns are account-bound.`;
+  return "Choose exactly three letters or digits. This claim is permanent from the arcade UI.";
+}
+
 // ===================== MAIN COMPONENT =====================
 export default function MetatronVectorFOIL() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -1216,6 +957,16 @@ export default function MetatronVectorFOIL() {
   const [deathCauseLines, setDeathCauseLines] = useState<string[]>(DEFAULT_DEATH_CAUSE_LINES);
   const [gameOverLines, setGameOverLines] = useState<string[]>(DEFAULT_GAME_OVER_LINES);
   const [debriefUI, setDebriefUI] = useState<DebriefUIState>({ phase: "inactive", phaseElapsedMs: 0, visibleRows: 0, snapshot: null });
+  const [playerIdentity, setPlayerIdentity] = useState<PublicPlayer>(DEFAULT_PLAYER);
+  const [csrfToken, setCsrfToken] = useState("");
+  const [callsignInput, setCallsignInput] = useState("");
+  const [callsignMessage, setCallsignMessage] = useState("Log in before choosing a callsign.");
+  const [devAuthEnabled, setDevAuthEnabled] = useState(false);
+  const [googleAuthEnabled, setGoogleAuthEnabled] = useState(false);
+  const [googleLoginUrl, setGoogleLoginUrl] = useState<string | null>(null);
+  const [devHandle, setDevHandle] = useState("dev");
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [scoreSubmitStatus, setScoreSubmitStatus] = useState<ScoreSubmitStatus>("idle");
   const [menuHintIdx, setMenuHintIdx] = useState(0);
   const [attractIdx, setAttractIdx] = useState(0);
   const [attractPhaseTick, setAttractPhaseTick] = useState(0);
@@ -1223,6 +974,10 @@ export default function MetatronVectorFOIL() {
   const modeRef = useRef(mode);
   const levelIdxRef = useRef(levelIdx);
   const togglesRef = useRef(toggles);
+  const csrfTokenRef = useRef("");
+  const playerIdentityRef = useRef<PublicPlayer>(DEFAULT_PLAYER);
+  const submitScoreRef = useRef<(snapshot: DebriefSnapshot) => void>(() => undefined);
+  const clientStartupLoggedRef = useRef(false);
   const commendationMapRef = useRef<Record<string, CommendationDefinition>>(buildCommendationMap(DEFAULT_COMMENDATIONS));
   const [sliders, setSliders] = useState({
     gravity: T.GRAVITY_GM,
@@ -1252,6 +1007,175 @@ export default function MetatronVectorFOIL() {
   }, [mode]);
   useEffect(() => { levelIdxRef.current = levelIdx; }, [levelIdx]);
   useEffect(() => { togglesRef.current = toggles; }, [toggles]);
+  useEffect(() => { csrfTokenRef.current = csrfToken; }, [csrfToken]);
+  useEffect(() => { playerIdentityRef.current = playerIdentity; }, [playerIdentity]);
+
+  const refreshLeaderboard = async () => {
+    try {
+      const board = await readJson<LeaderboardResponse>("/api/leaderboard?limit=10");
+      setLeaderboard(board.entries ?? []);
+    } catch (err) {
+      setLeaderboard([]);
+      void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
+        endpoint: "/api/leaderboard",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  };
+
+  const refreshSecurityStatus = async () => {
+    try {
+      const status = await readJson<SecurityStatus>("/api/security/status");
+      setCsrfToken(status.csrfToken);
+      setPlayerIdentity(status.player ?? DEFAULT_PLAYER);
+      setDevAuthEnabled(Boolean(status.devAuthEnabled));
+      setGoogleAuthEnabled(Boolean(status.googleAuthEnabled));
+      setGoogleLoginUrl(status.googleLoginUrl ?? null);
+      setCallsignInput(status.player?.callsign ?? "");
+      setCallsignMessage(callsignStatusMessage(status.player ?? DEFAULT_PLAYER));
+      if (!clientStartupLoggedRef.current) {
+        clientStartupLoggedRef.current = true;
+        void logClientEvent(status.csrfToken, "client.startup", "info", {
+          authProvider: status.player?.authProvider ?? "none",
+          hasCallsign: Boolean(status.player?.callsign),
+        });
+      }
+    } catch {
+      setCallsignMessage("Identity bus unavailable; local flight still works.");
+    }
+  };
+
+  useEffect(() => {
+    refreshSecurityStatus();
+    refreshLeaderboard();
+    const id = window.setInterval(refreshLeaderboard, 30000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  submitScoreRef.current = (snapshot: DebriefSnapshot) => {
+    const token = csrfTokenRef.current;
+    if (!token || !playerIdentityRef.current.authenticated) {
+      setScoreSubmitStatus("needs_login");
+      return;
+    }
+    if (!playerIdentityRef.current.callsign) {
+      setScoreSubmitStatus("needs_callsign");
+      return;
+    }
+    setScoreSubmitStatus("submitting");
+    readJson<{ ok: boolean }>("/api/scores", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+      body: JSON.stringify({
+        score: snapshot.score,
+        wave: snapshot.wave,
+        survivalTimeSec: snapshot.survivalTimeSec,
+        bestChain: snapshot.bestChain,
+        citations: snapshot.citations,
+        spheresAwakened: snapshot.spheresAwakened,
+        causeKey: snapshot.causeKey,
+      }),
+    })
+      .then(() => {
+        setScoreSubmitStatus("submitted");
+        refreshLeaderboard();
+      })
+      .catch((err) => {
+        setScoreSubmitStatus("error");
+        void logClientEvent(token, "client.score_submission_error", "warning", {
+          message: err instanceof Error ? err.message : "unknown",
+          score: snapshot.score,
+          wave: snapshot.wave,
+        });
+      });
+  };
+
+  const submitCallsign = async () => {
+    const callsign = callsignInput.trim();
+    if (!playerIdentity.authenticated) {
+      setCallsignMessage("Log in before choosing a callsign. Callsigns are not passwords.");
+      return;
+    }
+    if (!playerIdentity.canChooseCallsign) {
+      setCallsignMessage(callsignStatusMessage(playerIdentity));
+      return;
+    }
+    if (!/^[A-Za-z0-9]{3}$/.test(callsign)) {
+      setCallsignMessage("Callsign must be exactly 3 ASCII letters or digits.");
+      return;
+    }
+    if (!csrfToken) {
+      setCallsignMessage("Identity bus warming up; try again after the next phosphor blink.");
+      return;
+    }
+    try {
+      const result = await readJson<{ ok: boolean; player: PublicPlayer }>("/api/player/callsign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+        body: JSON.stringify({ callsign }),
+      });
+      setPlayerIdentity(result.player);
+      setCallsignInput(result.player.callsign ?? callsign);
+      setCallsignMessage(callsignStatusMessage(result.player));
+      setScoreSubmitStatus("idle");
+      refreshLeaderboard();
+    } catch (err) {
+      const error = err instanceof Error ? err.message : "unknown";
+      const msg = error === "callsign_taken"
+        ? "That callsign is already transmitting."
+        : error === "login_required_before_callsign"
+          ? "Log in before choosing a callsign."
+          : error === "callsign_already_assigned"
+            ? "This account already has a callsign assigned."
+            : "Callsign registration failed.";
+      setCallsignMessage(msg);
+      void logClientEvent(csrfToken, "client.api_error", "warning", {
+        endpoint: "/api/player/callsign",
+        message: error,
+      });
+    }
+  };
+
+  const googleLogin = () => {
+    if (!googleAuthEnabled) return;
+    window.location.assign(googleLoginUrl || "/auth/google/start");
+  };
+
+  const devLogin = async () => {
+    if (!csrfToken || !devAuthEnabled) return;
+    const handle = devHandle.trim() || "dev";
+    try {
+      const result = await readJson<{ ok: boolean; player: PublicPlayer }>("/api/dev-login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+        body: JSON.stringify({ handle }),
+      });
+      setPlayerIdentity(result.player);
+      setCallsignInput(result.player.callsign ?? "");
+      setCallsignMessage(callsignStatusMessage(result.player));
+      setScoreSubmitStatus("idle");
+    } catch (err) {
+      setCallsignMessage(`Dev login failed: ${err instanceof Error ? err.message : "unknown"}`);
+    }
+  };
+
+  const logoutPlayer = async () => {
+    if (!csrfToken) return;
+    try {
+      const result = await readJson<{ ok: boolean; player: PublicPlayer; csrfToken?: string }>("/api/player/logout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+        body: JSON.stringify({}),
+      });
+      if (result.csrfToken) setCsrfToken(result.csrfToken);
+      setPlayerIdentity(result.player ?? DEFAULT_PLAYER);
+      setCallsignInput("");
+      setCallsignMessage(callsignStatusMessage(result.player ?? DEFAULT_PLAYER));
+      setScoreSubmitStatus("idle");
+    } catch (err) {
+      setCallsignMessage(`Logout failed: ${err instanceof Error ? err.message : "unknown"}`);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -1936,6 +1860,7 @@ export default function MetatronVectorFOIL() {
 
     const enterDebrief = (causeKey: DeathCauseKey) => {
       debriefSnapshot = buildDebriefSnapshot(causeKey);
+      submitScoreRef.current(debriefSnapshot);
       debriefVisibleRows = 0;
       debriefPublishAccumulator = 0;
       modeRef.current = "debrief";
@@ -3012,6 +2937,24 @@ export default function MetatronVectorFOIL() {
                     </div>
                   </div>
 
+                  <CallsignConsole
+                    value={callsignInput}
+                    current={playerIdentity.callsign}
+                    authenticated={playerIdentity.authenticated}
+                    authProvider={playerIdentity.authProvider}
+                    canChoose={playerIdentity.canChooseCallsign}
+                    googleAuthEnabled={googleAuthEnabled}
+                    devAuthEnabled={devAuthEnabled}
+                    devHandle={devHandle}
+                    message={callsignMessage}
+                    onChange={setCallsignInput}
+                    onSubmit={submitCallsign}
+                    onGoogleLogin={googleLogin}
+                    onDevHandleChange={setDevHandle}
+                    onDevLogin={devLogin}
+                    onLogout={logoutPlayer}
+                  />
+
                   <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "auto 1fr", gap: 10, alignItems: "center" }}>
                     <Keycap>Enter</Keycap><span style={{ opacity: 0.92 }}>Launch</span>
                     <Keycap>A/D</Keycap><span style={{ opacity: 0.86 }}>Rotate the foil</span>
@@ -3040,9 +2983,11 @@ export default function MetatronVectorFOIL() {
 
                   <div style={{ marginTop: 22, display: "grid", gap: 8 }}>
                     <VectorTelemetry label="NEXT MESSAGE" value={attractSequence[(attractIdx + 1) % attractSequence.length].headline} />
-                    <VectorTelemetry label="ALERT BUS" value="PILOT INPUT REQUIRED" />
+                    <VectorTelemetry label="ALERT BUS" value={playerIdentity.callsign ? `PILOT ${playerIdentity.callsign} INDEXED` : playerIdentity.authenticated ? "CALLSIGN REQUIRED" : "LOGIN REQUIRED"} />
                     <VectorTelemetry label="TREE STATUS" value="AWAKEN WHAT YOU TOUCH" />
                   </div>
+
+                  <LeaderboardConsole entries={leaderboard} status={scoreSubmitStatus} />
                 </VectorFrame>
               </div>
             </div>
@@ -3155,6 +3100,206 @@ function VectorTelemetry({ label, value }: { label: string; value: string }) {
     <div style={{ display: "grid", gap: 4, borderTop: "1px solid rgba(150,205,255,0.14)", paddingTop: 8 }}>
       <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.56)" }}>{label}</div>
       <div style={{ fontSize: 13, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(214,242,255,0.86)" }}>{value}</div>
+    </div>
+  );
+}
+
+function CallsignConsole({
+  value,
+  current,
+  authenticated,
+  authProvider,
+  canChoose,
+  googleAuthEnabled,
+  devAuthEnabled,
+  devHandle,
+  message,
+  onChange,
+  onSubmit,
+  onGoogleLogin,
+  onDevHandleChange,
+  onDevLogin,
+  onLogout,
+}: {
+  value: string;
+  current: string | null;
+  authenticated: boolean;
+  authProvider: string;
+  canChoose: boolean;
+  googleAuthEnabled: boolean;
+  devAuthEnabled: boolean;
+  devHandle: string;
+  message: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  onGoogleLogin: () => void;
+  onDevHandleChange: (value: string) => void;
+  onDevLogin: () => void;
+  onLogout: () => void;
+}) {
+  const canSubmit = authenticated && canChoose && /^[A-Za-z0-9]{3}$/.test(value);
+  const status = current ? `ACTIVE // ${current}` : authenticated ? "AUTHENTICATED" : "LOGIN REQUIRED";
+  return (
+    <div style={{ marginTop: 18, display: "grid", gap: 8, padding: 10, border: "1px solid rgba(150,205,255,0.14)", background: "rgba(0,0,0,0.18)" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+        <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.58)" }}>Pilot Callsign</div>
+        <div style={{ fontSize: 11, letterSpacing: "0.18em", color: current ? "rgba(176,255,218,0.82)" : authenticated ? "rgba(243,214,152,0.72)" : "rgba(255,150,150,0.72)" }}>
+          {status}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(170,214,248,0.62)" }}>
+        <span>Auth: {authProvider}</span>
+        {authenticated && <button type="button" onClick={onLogout} style={{ ...btnStyle, padding: "4px 7px", fontSize: 10 }}>Logout</button>}
+      </div>
+
+      {devAuthEnabled && !authenticated && (
+        <div style={{ display: "flex", gap: 8, alignItems: "center", padding: 8, border: "1px dashed rgba(243,214,152,0.25)", background: "rgba(243,214,152,0.04)" }}>
+          <input
+            value={devHandle}
+            maxLength={48}
+            spellCheck={false}
+            autoComplete="off"
+            aria-label="Development login handle"
+            onChange={(e) => onDevHandleChange(e.target.value.replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 48))}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") {
+                e.preventDefault();
+                onDevLogin();
+              }
+            }}
+            style={{
+              width: 132,
+              padding: "5px 7px",
+              border: "1px solid rgba(243,214,152,0.24)",
+              borderRadius: 0,
+              background: "rgba(0,0,0,0.36)",
+              color: "rgba(232,248,255,0.94)",
+              fontFamily: "ui-monospace, Menlo, monospace",
+              fontSize: 12,
+              outline: "none",
+            }}
+          />
+          <button type="button" onClick={onDevLogin} style={{ ...btnStyle, padding: "5px 8px", fontSize: 10 }}>Dev login</button>
+        </div>
+      )}
+
+      {!authenticated ? (
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {googleAuthEnabled ? (
+            <button
+              type="button"
+              onClick={onGoogleLogin}
+              style={{
+                ...btnStyle,
+                padding: "7px 11px",
+                fontSize: 10,
+                borderColor: "rgba(176,255,218,0.30)",
+                color: "rgba(212,255,230,0.92)",
+                boxShadow: "0 0 16px rgba(145,255,212,0.08)",
+              }}
+            >
+              Login with Google
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled
+              style={{ ...btnStyle, opacity: 0.42, cursor: "not-allowed" }}
+            >
+              Login unavailable
+            </button>
+          )}
+          <span style={{ fontSize: 10, letterSpacing: "0.10em", textTransform: "uppercase", color: "rgba(170,214,248,0.58)" }}>
+            Then claim a 3-character callsign.
+          </span>
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input
+            value={value}
+            maxLength={3}
+            spellCheck={false}
+            autoComplete="off"
+            inputMode="text"
+            aria-label="Three character callsign"
+            disabled={!canChoose}
+            onChange={(e) => onChange(e.target.value.replace(/[^A-Za-z0-9]/g, "").slice(0, 3))}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") {
+                e.preventDefault();
+                onSubmit();
+              }
+            }}
+            style={{
+              width: 76,
+              padding: "6px 8px",
+              border: "1px solid rgba(150,205,255,0.24)",
+              borderRadius: 0,
+              background: "rgba(0,0,0,0.36)",
+              color: "rgba(232,248,255,0.94)",
+              fontFamily: "ui-monospace, Menlo, monospace",
+              fontSize: 24,
+              letterSpacing: "0.14em",
+              textTransform: "none",
+              outline: "none",
+              opacity: canChoose ? 1 : 0.46,
+            }}
+          />
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={!canSubmit}
+            style={{ ...btnStyle, opacity: canSubmit ? 1 : 0.44, cursor: canSubmit ? "pointer" : "not-allowed" }}
+          >
+            Set callsign
+          </button>
+        </div>
+      )}
+      <div style={{ fontSize: 10, lineHeight: 1.45, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(170,214,248,0.64)" }}>
+        {message} Public board stores callsign and score, not Google name or email.
+      </div>
+    </div>
+  );
+}
+
+function LeaderboardConsole({ entries, status }: { entries: LeaderboardEntry[]; status: ScoreSubmitStatus }) {
+  const statusText = status === "submitted"
+    ? "LAST RUN PUBLISHED"
+    : status === "submitting"
+      ? "TRANSMITTING LAST RUN"
+      : status === "needs_login"
+        ? "LOGIN TO PUBLISH RUNS"
+        : status === "needs_callsign"
+          ? "SET CALLSIGN TO PUBLISH RUNS"
+          : status === "error"
+          ? "LAST RUN NOT ACCEPTED"
+          : "PUBLIC HONOR BOARD";
+  return (
+    <div style={{ marginTop: 18, display: "grid", gap: 8, paddingTop: 12, borderTop: "1px solid rgba(150,205,255,0.12)" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+        <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.56)" }}>Top Callsigns</div>
+        <div style={{ fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase", color: "rgba(243,214,152,0.68)" }}>{statusText}</div>
+      </div>
+      {entries.length === 0 ? (
+        <div style={{ fontSize: 12, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(214,242,255,0.64)", padding: "7px 0" }}>
+          No public transmissions logged.
+        </div>
+      ) : (
+        <div style={{ display: "grid", gap: 5 }}>
+          {entries.slice(0, 7).map((entry) => (
+            <div key={`${entry.rank}-${entry.callsign}-${entry.score}`} style={{ display: "grid", gridTemplateColumns: "2.5ch 4ch 1fr 5ch 6ch", gap: 8, alignItems: "baseline", fontSize: 12, letterSpacing: "0.08em", color: "rgba(222,242,255,0.82)" }}>
+              <span style={{ color: "rgba(150,205,255,0.48)" }}>{entry.rank}</span>
+              <span style={{ color: "rgba(176,255,218,0.9)", fontWeight: 700 }}>{entry.callsign}</span>
+              <span style={{ textAlign: "right" }}>{entry.score.toLocaleString()}</span>
+              <span style={{ color: "rgba(243,214,152,0.72)" }}>W{entry.wave}</span>
+              <span style={{ color: "rgba(150,205,255,0.58)" }}>{formatLeaderboardTime(entry.survivalTimeSec)}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
