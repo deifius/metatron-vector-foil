@@ -104,6 +104,33 @@ const T = {
   SHRAPNEL_LIFE_MIN: 7.9,              // shrapnel life min
   SHRAPNEL_LIFE_MAX: 18.9,              // shrapnel life max
 
+  // Oort cloud constellations / hazards
+  OORT_CONSTELLATIONS_ENABLED: true,    // draw and simulate the procedural Oort cloud
+  OORT_CLUSTER_COUNT: 420,              // cheap procedural three-node constellations; not full physics bodies
+  OORT_CONSTELLATION_INNER_MULT: 2.92,  // inner constellation band, measured from current Oort outer radius
+  OORT_CONSTELLATION_OUTER_MULT: 4.15,  // outer constellation band, measured from current Oort outer radius
+  OORT_GLYPH_RADIUS_MIN: 5.0,           // local three-node constellation radius
+  OORT_GLYPH_RADIUS_MAX: 18.0,          // local three-node constellation radius
+  OORT_ORBIT_SPEED_MIN: 0.00055,        // parametric orbit speed, radians/s
+  OORT_ORBIT_SPEED_MAX: 0.0030,         // parametric orbit speed, radians/s
+  OORT_LOCAL_SPIN_SPEED_MIN: -0.42,     // local glyph spin, radians/s
+  OORT_LOCAL_SPIN_SPEED_MAX: 0.42,      // local glyph spin, radians/s
+  OORT_ECCENTRICITY_MAX: 0.10,          // subtle non-circular procession without n-body integration
+  OORT_NODE_VISUAL_RADIUS: 2.3,         // node dot radius in screen-ish pixels
+  OORT_LINE_ALPHA: 0.065,               // resting constellation line opacity
+  OORT_NODE_ALPHA: 0.16,                // resting constellation node opacity
+  OORT_NEAR_PLAYER_BRIGHTEN_RADIUS: 175,// nearby Oort glyphs brighten as the jammer's field wakes them
+  OORT_HAZARD_WAKE_RADIUS: 84,          // coarse cluster distance before detailed player collision checks
+  OORT_NODE_HIT_RADIUS: 7.5,            // player collision radius around Oort nodes
+  OORT_LINE_HIT_RADIUS: 5.8,            // player collision radius around Oort tripwire segments
+  OORT_DUST_DAMAGE_PER_SECOND: 0.026,   // ambient shield abrasion inside dense Oort dust
+  OORT_DUST_SPEED_SCALE: 0.00135,       // faster Oort travel increases abrasion
+  OORT_COLLISION_BASE_DAMAGE: 0.38,     // discrete node/tripwire damage, in ship-hit units
+  OORT_COLLISION_SPEED_DAMAGE: 0.00115, // additional discrete damage per world-unit/s of speed
+  OORT_COLLISION_KNOCKBACK: 115,        // velocity kick away from struck constellation
+  OORT_SHOT_BREAK_RADIUS: 9.0,          // blaster corridor-clearing radius against nodes/lines
+  OORT_REFORM_SECONDS: 15.0,            // broken constellations drift back together after this long
+
   // Metatron animation / node gameplay
   META_BASE_SPIN: 0.03,                // base spin
   META_SPIN_GAIN: 0.22,                // spin increases with distance
@@ -354,6 +381,58 @@ const DOWNGRADE: Record<SolidKind, SolidKind | null> = {
 type Bullet = { pos: V2; prevPos: V2; vel: V2; life: number; mass: number; origin: V2; firedAtMs: number; burstId: number };
 type FuelBit = { pos: V2; vel: V2; life: number; hue: number; };
 type Shard = { pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
+type OortCluster = {
+  orbitRadius: number;
+  orbitPhase: number;
+  orbitSpeed: number;
+  eccentricity: number;
+  eccentricPhase: number;
+  localSpin: number;
+  localSpinSpeed: number;
+  glyphRadius: number;
+  brightness: number;
+  hazard: number;
+  hue: number;
+  variant: number;
+  brokenUntil: number;
+  pulseUntil: number;
+};
+
+function oortClusterCenter(c: OortCluster, timeSec: number) {
+  const theta = c.orbitPhase + timeSec * c.orbitSpeed;
+  const wobble = 1 + c.eccentricity * Math.sin(theta * 2.0 + c.eccentricPhase);
+  const r = c.orbitRadius * wobble;
+  return new V2(Math.cos(theta) * r, Math.sin(theta) * r);
+}
+
+function oortClusterNodes(c: OortCluster, timeSec: number) {
+  const center = oortClusterCenter(c, timeSec);
+  const spin = c.localSpin + timeSec * c.localSpinSpeed;
+  const squash = 0.78 + 0.16 * Math.sin(c.orbitPhase * 3.0);
+  const pts: V2[] = [];
+  for (let i = 0; i < 3; i++) {
+    const a = spin + i * TAU / 3;
+    const local = new V2(Math.cos(a) * c.glyphRadius, Math.sin(a) * c.glyphRadius * squash);
+    local.rot(c.orbitPhase * 0.31);
+    pts.push(center.copy().add(local));
+  }
+  return pts;
+}
+
+function oortClusterLinks(c: OortCluster) {
+  const v = c.variant % 3;
+  if (v === 0) return [[0, 1], [1, 2]];       // twig / two-segment constellation
+  if (v === 1) return [[0, 1], [0, 2]];       // fork / treelet
+  return [[0, 1], [1, 2], [2, 0]];            // small closed triangle
+}
+
+function pointSegmentDistanceSq(p: V2, a: V2, b: V2) {
+  const ab = b.copy().sub(a);
+  const denom = ab.dot(ab) || 1;
+  const t = clamp(p.copy().sub(a).dot(ab) / denom, 0, 1);
+  const q = a.copy().add(ab.mul(t));
+  return p.copy().sub(q).dot(p.copy().sub(q));
+}
 
 type Enemy = {
   id: string;
@@ -397,7 +476,7 @@ type WaveCitationFlags = {
 };
 
 type DebriefPhase = "inactive" | "burn_fade" | "game_over_hold" | "plotting" | "ready";
-type DeathCauseKey = "shrapnel" | "enemy" | "well" | "sol" | "fuel" | "collapse";
+type DeathCauseKey = "shrapnel" | "enemy" | "well" | "sol" | "fuel" | "collapse" | "oort";
 type DebriefSnapshot = {
   causeKey: DeathCauseKey;
   causeLabel: string;
@@ -451,6 +530,7 @@ const DEFAULT_DEATH_CAUSE_LINES = [
   "STRUCTURAL FAILURE",
   "OUT OF FUEL",
   "VECTOR COLLAPSE",
+  "OORT CLOUD STRIKE",
 ];
 
 const DEFAULT_GAME_OVER_LINES = [
@@ -1313,6 +1393,37 @@ export default function MetatronVectorFOIL() {
     const shards: Shard[] = [];
     const fuelBits: FuelBit[] = [];
     const trail: V2[] = [];
+    const oortClusters: OortCluster[] = [];
+
+    const buildOortCloud = () => {
+      oortClusters.length = 0;
+      if (!T.OORT_CONSTELLATIONS_ENABLED) return;
+      const inner = oortOuter * T.OORT_CONSTELLATION_INNER_MULT;
+      const outer = oortOuter * T.OORT_CONSTELLATION_OUTER_MULT;
+      for (let i = 0; i < T.OORT_CLUSTER_COUNT; i++) {
+        const bandT = Math.sqrt(rand(0, 1)); // bias toward the outer dark
+        const orbitRadius = lerp(inner, outer, bandT);
+        const speedSign = Math.random() < 0.5 ? -1 : 1;
+        const speedScale = Math.pow(clamp(inner / Math.max(1, orbitRadius), 0.35, 1.35), 0.5);
+        oortClusters.push({
+          orbitRadius,
+          orbitPhase: rand(0, TAU),
+          orbitSpeed: speedSign * rand(T.OORT_ORBIT_SPEED_MIN, T.OORT_ORBIT_SPEED_MAX) * speedScale,
+          eccentricity: rand(0, T.OORT_ECCENTRICITY_MAX),
+          eccentricPhase: rand(0, TAU),
+          localSpin: rand(0, TAU),
+          localSpinSpeed: rand(T.OORT_LOCAL_SPIN_SPEED_MIN, T.OORT_LOCAL_SPIN_SPEED_MAX),
+          glyphRadius: rand(T.OORT_GLYPH_RADIUS_MIN, T.OORT_GLYPH_RADIUS_MAX),
+          brightness: rand(0.55, 1.25),
+          hazard: rand(0.55, 1.35),
+          hue: rand(185, 225),
+          variant: i % 3,
+          brokenUntil: 0,
+          pulseUntil: 0,
+        });
+      }
+    };
+    buildOortCloud();
 
     // metatron angles
     let metaAx = 0, metaAy = 0, metaAz = 0;
@@ -1406,6 +1517,7 @@ export default function MetatronVectorFOIL() {
         enemy: 3,
         fuel: 4,
         collapse: 5,
+        oort: 6,
       };
       return lines[indexByKey[causeKey]] ?? DEFAULT_DEATH_CAUSE_LINES[indexByKey[causeKey]];
     };
@@ -1438,6 +1550,10 @@ export default function MetatronVectorFOIL() {
 
     const resetRun = (toMenu = false) => {
       bullets.length = 0; enemies.length = 0; shards.length = 0; fuelBits.length = 0; trail.length = 0;
+      for (const c of oortClusters) {
+        c.brokenUntil = 0;
+        c.pulseUntil = 0;
+      }
       resetMetaNodes();
       player.pos = new V2(metaRadius, 0);
       // orbit init
@@ -1771,16 +1887,22 @@ export default function MetatronVectorFOIL() {
       loseRun("ship", causeKey);
     };
 
-    const applyShipHit = (sourcePos?: V2, causeKey: DeathCauseKey = "enemy") => {
+    const applyShipHit = (
+      sourcePos?: V2,
+      causeKey: DeathCauseKey = "enemy",
+      damage = 1,
+      knockback = T.SHIP_HIT_KNOCKBACK,
+    ) => {
       if (player.hitInvuln > 0) return false;
-      player.hitsTaken += 1;
+      const appliedDamage = Math.max(0, damage);
+      player.hitsTaken += appliedDamage;
       player.hitInvuln = T.SHIP_HIT_IFRAME_SEC;
-      waveDamageTaken += 1;
+      waveDamageTaken += appliedDamage;
       chainMultiplier = Math.max(1, chainMultiplier - SCORE_THRESHOLDS.chainDamagePenalty);
 
       if (sourcePos) {
         const away = player.pos.copy().sub(sourcePos);
-        if (away.len() > 0.0001) player.vel.add(away.norm().mul(T.SHIP_HIT_KNOCKBACK));
+        if (away.len() > 0.0001) player.vel.add(away.norm().mul(knockback));
       }
 
       audioRef.current.hit();
@@ -2005,6 +2127,127 @@ export default function MetatronVectorFOIL() {
       }
     };
 
+    const oortDustDensityAt = (p: V2, timeSec: number) => {
+      const r = p.len();
+      const inner = oortOuter * T.OORT_CONSTELLATION_INNER_MULT * 0.86;
+      const outer = oortOuter * T.OORT_CONSTELLATION_OUTER_MULT * 1.04;
+      const radial = smoothstep(inner, inner + oortOuter * 0.22, r) * (1 - smoothstep(outer * 0.82, outer, r));
+      if (radial <= 0) return 0;
+      const a = Math.atan2(p.y, p.x);
+      const filament = 0.5 + 0.5 * Math.sin(a * 7 + timeSec * 0.17 + Math.sin(r * 0.018));
+      const glitter = 0.5 + 0.5 * Math.sin(a * 17 - timeSec * 0.11 + r * 0.041);
+      return clamp(radial * (0.34 + 0.46 * filament + 0.20 * glitter), 0, 1);
+    };
+
+    const applyOortAmbientAbrasion = (dt: number, timeSec: number) => {
+      if (!T.OORT_CONSTELLATIONS_ENABLED || T.OORT_DUST_DAMAGE_PER_SECOND <= 0) return false;
+      const density = oortDustDensityAt(player.pos, timeSec);
+      if (density <= 0.015) return false;
+      const speedFactor = 0.38 + player.vel.len() * T.OORT_DUST_SPEED_SCALE;
+      const damage = density * T.OORT_DUST_DAMAGE_PER_SECOND * speedFactor * dt;
+      if (damage <= 0) return false;
+      player.hitsTaken += damage;
+      waveDamageTaken += damage;
+      if (player.hitsTaken >= T.SHIP_RESILIENCE) {
+        killPlayer("oort");
+        return true;
+      }
+      return false;
+    };
+
+    const applyOortPlayerHazards = (dt: number, playerPrevPos: V2) => {
+      if (!T.OORT_CONSTELLATIONS_ENABLED) return false;
+      const timeSec = metaPulseClock;
+      if (applyOortAmbientAbrasion(dt, timeSec)) return true;
+      if (player.hitInvuln > 0) return false;
+
+      const speed = player.vel.len();
+      const lineHitR = T.SHIP_HIT_RADIUS + T.OORT_LINE_HIT_RADIUS;
+      const nodeHitR = T.SHIP_HIT_RADIUS + T.OORT_NODE_HIT_RADIUS;
+      for (const c of oortClusters) {
+        if (c.brokenUntil > timeSec) continue;
+        const center = oortClusterCenter(c, timeSec);
+        const coarse = center.copy().sub(player.pos).len();
+        if (coarse > T.OORT_HAZARD_WAKE_RADIUS + c.glyphRadius + T.SHIP_HIT_RADIUS) continue;
+
+        const pts = oortClusterNodes(c, timeSec);
+        let struck = false;
+        for (const p of pts) {
+          if (pointSegmentDistanceSq(p, playerPrevPos, player.pos) <= nodeHitR * nodeHitR) {
+            struck = true;
+            break;
+          }
+        }
+        if (!struck) {
+          for (const [ai, bi] of oortClusterLinks(c)) {
+            const a = pts[ai];
+            const b = pts[bi];
+            if (!a || !b) continue;
+            const res = closestPointsOnSegments(playerPrevPos, player.pos, a, b);
+            if (res.d2 <= lineHitR * lineHitR) {
+              struck = true;
+              break;
+            }
+          }
+        }
+
+        if (struck) {
+          c.pulseUntil = timeSec + 0.72;
+          const damage = (T.OORT_COLLISION_BASE_DAMAGE + speed * T.OORT_COLLISION_SPEED_DAMAGE) * c.hazard;
+          return applyShipHit(center, "oort", damage, T.OORT_COLLISION_KNOCKBACK);
+        }
+      }
+      return false;
+    };
+
+    const breakOortCluster = (c: OortCluster, timeSec: number) => {
+      c.brokenUntil = timeSec + T.OORT_REFORM_SECONDS;
+      c.pulseUntil = timeSec + 0.62;
+      audioRef.current.blip(840 + rand(-110, 170), 0.035, 0.10);
+    };
+
+    const handleOortProjectileHits = () => {
+      if (!T.OORT_CONSTELLATIONS_ENABLED || bullets.length === 0 || oortClusters.length === 0) return;
+      const timeSec = metaPulseClock;
+      const hitR = T.OORT_SHOT_BREAK_RADIUS + T.BULLET_RADIUS;
+      for (let bi = bullets.length - 1; bi >= 0; bi--) {
+        const b = bullets[bi];
+        let cleared = false;
+        for (const c of oortClusters) {
+          if (c.brokenUntil > timeSec) continue;
+          const center = oortClusterCenter(c, timeSec);
+          if (pointSegmentDistanceSq(center, b.prevPos, b.pos) > Math.pow(T.OORT_HAZARD_WAKE_RADIUS + c.glyphRadius, 2)) continue;
+          const pts = oortClusterNodes(c, timeSec);
+
+          for (const p of pts) {
+            if (pointSegmentDistanceSq(p, b.prevPos, b.pos) <= hitR * hitR) {
+              cleared = true;
+              break;
+            }
+          }
+          if (!cleared) {
+            for (const [ai, ci] of oortClusterLinks(c)) {
+              const a = pts[ai];
+              const d = pts[ci];
+              if (!a || !d) continue;
+              const res = closestPointsOnSegments(b.prevPos, b.pos, a, d);
+              if (res.d2 <= hitR * hitR) {
+                cleared = true;
+                break;
+              }
+            }
+          }
+
+          if (cleared) {
+            breakOortCluster(c, timeSec);
+            resolveBurst(b.burstId, false);
+            bullets.splice(bi, 1);
+            break;
+          }
+        }
+      }
+    };
+
     // =============== fixed timestep loop ===============
     let raf = 0;
     let last = performance.now();
@@ -2130,7 +2373,9 @@ export default function MetatronVectorFOIL() {
       const sp = player.vel.len();
       if (sp > T.MAX_SPEED) player.vel.mul(T.MAX_SPEED / sp);
 
+      const playerPrevPos = player.pos.copy();
       player.pos.add(player.vel.copy().mul(dt));
+      if (applyOortPlayerHazards(dt, playerPrevPos)) return;
 
       const accel = player.vel.copy().sub(velBefore).mul(1 / Math.max(dt, 1e-6));
       const speedNow = player.vel.len();
@@ -2216,6 +2461,8 @@ export default function MetatronVectorFOIL() {
           bullets.splice(i, 1);
         }
       }
+
+      handleOortProjectileHits();
 
       if (waveBannerTimer > 0) {
         waveBannerTimer = Math.max(0, waveBannerTimer - dt);
@@ -2537,6 +2784,7 @@ export default function MetatronVectorFOIL() {
         level: getLevel(levelIdxRef.current),
         player, camera,
         meta: { ax: metaAx, ay: metaAy, az: metaAz, alignT: metaAlignT, centers3, nodes: metaNodes, pulseClock: metaPulseClock },
+        oort: { clusters: oortClusters, timeSec: metaPulseClock },
         entities: { bullets, enemies, shards, fuelBits, trail },
         toggles: togglesRef.current,
         horizonR, oortInner, oortOuter,
@@ -2984,6 +3232,7 @@ function render(
     player: { pos: V2; vel: V2; angle: number; thrust: number; fuel: number; stuckTime: number; hitsTaken: number; hitInvuln: number };
     camera: { pos: V2; zoom: number };
     meta: { ax: number; ay: number; az: number; alignT: number; centers3: V3[]; nodes: MetaNode[]; pulseClock: number };
+    oort: { clusters: OortCluster[]; timeSec: number };
     entities: { bullets: Bullet[]; enemies: Enemy[]; shards: Shard[]; fuelBits: FuelBit[]; trail: V2[] };
     toggles: { metatron: boolean; trails: boolean; debug: boolean };
     horizonR: number;
@@ -3027,6 +3276,53 @@ function render(
   ctx.strokeStyle = "rgba(190,225,255,0.06)";
   ctx.beginPath(); arcSafe(ctx, 0, 0, S.oortOuter); ctx.stroke();
   ctx.restore();
+
+  // procedural Oort cloud: hundreds of cheap three-node orbiting constellations.
+  // They look abundant, but only nearby/bullet-touched clusters are checked in the physics step.
+  if (T.OORT_CONSTELLATIONS_ENABLED && S.oort.clusters.length > 0) {
+    ctx.save();
+    ctx.globalAlpha = lineAlpha;
+    ctx.lineCap = "round";
+    const timeSec = S.oort.timeSec;
+    for (const c of S.oort.clusters) {
+      const center = oortClusterCenter(c, timeSec);
+      const dPlayer = center.copy().sub(S.player.pos).len();
+      const near = 1 - smoothstep(0, T.OORT_NEAR_PLAYER_BRIGHTEN_RADIUS, dPlayer);
+      const pulse = c.pulseUntil > timeSec ? clamp((c.pulseUntil - timeSec) / 0.72, 0, 1) : 0;
+      const broken = c.brokenUntil > timeSec;
+      const reformWindow = Math.max(0.001, T.OORT_REFORM_SECONDS * 0.30);
+      const reformT = broken ? clamp(1 - (c.brokenUntil - timeSec) / reformWindow, 0, 1) : 1;
+      const visibility = broken ? (0.10 + 0.32 * reformT + 0.55 * pulse) : 1;
+      if (visibility <= 0.035) continue;
+
+      const pts = oortClusterNodes(c, timeSec);
+      const lineA = (T.OORT_LINE_ALPHA * c.brightness + near * 0.11 + pulse * 0.28) * visibility;
+      const nodeA = (T.OORT_NODE_ALPHA * c.brightness + near * 0.24 + pulse * 0.45) * visibility;
+      ctx.lineWidth = (0.62 + near * 0.45 + pulse * 1.15) / S.camera.zoom;
+      ctx.strokeStyle = `hsla(${Math.round(c.hue)},95%,76%,${lineA})`;
+      ctx.beginPath();
+      for (const [ai, bi] of oortClusterLinks(c)) {
+        const a = pts[ai];
+        const b = pts[bi];
+        if (!a || !b) continue;
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+      }
+      ctx.stroke();
+
+      for (const p of pts) {
+        const r = (T.OORT_NODE_VISUAL_RADIUS + near * 1.6 + pulse * 2.6) / S.camera.zoom;
+        ctx.fillStyle = `hsla(${Math.round(c.hue)},95%,80%,${nodeA})`;
+        ctx.beginPath(); arcSafe(ctx, p.x, p.y, r); ctx.fill();
+        if (near > 0.02 || pulse > 0.02) {
+          ctx.strokeStyle = `hsla(${Math.round(c.hue)},95%,86%,${Math.min(0.52, nodeA * 0.9)})`;
+          ctx.lineWidth = (0.72 + pulse * 0.85) / S.camera.zoom;
+          ctx.beginPath(); arcSafe(ctx, p.x, p.y, r * (2.2 + pulse * 2.0)); ctx.stroke();
+        }
+      }
+    }
+    ctx.restore();
+  }
 
   // star
   ctx.save();
