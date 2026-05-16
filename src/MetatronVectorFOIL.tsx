@@ -17,8 +17,8 @@ import type { CitationCategory, CommendationDefinition } from "./types/scoring";
 // ===================== TUNABLES =====================
 const T = {
   // World
-  META_CIRCLE_RADIUS: 212,              // visible Metatron circle/sphere radius; also defines awakening, refuel, and charging region size (world units)
-  META_NODE_SPACING: 164,              // center-to-center spacing of Metatron nodes; for tangency set to META_CIRCLE_RADIUS * 2
+  META_CIRCLE_RADIUS: 172,              // visible Metatron circle/sphere radius; also defines awakening, refuel, and charging region size (world units)
+  META_NODE_SPACING: 244,              // center-to-center spacing of Metatron nodes; for tangency set to META_CIRCLE_RADIUS * 2
   META_PLAYFIELD_RADIUS: 144,          // gameplay/camera reference radius; still decoupled from node spacing and circle size
   HORIZON_MULT: 2.0,                   // red ring radius multiplier
   OORT_INNER_MULT: 1.28,               // fuel-bit settlement inner band
@@ -109,13 +109,14 @@ const T = {
   META_SPIN_GAIN: 0.22,                // spin increases with distance
   META_DWELL: 0.82,                    // dwell damping toward readable pose
   META_ALIGN_START_COUNT: 1,           // begin flattening the lattice after this many awakened nodes
-  META_ALIGN_COMPLETE_COUNT: 3,        // fully face-on by this many awakened nodes
+  META_ALIGN_COMPLETE_COUNT: 3,        // fully face-on target by this many awakened nodes
+  META_ALIGN_SETTLE_SEC: 4.0,           // seconds for the lattice to drift into its new alignment target
   META_DEPTH_WOBBLE: 8,                // early-game z offset for occult not-quite-flat projection
   META_SPHERE_PULSE: 8.0,              // seconds per pulse
-  META_SPHERE_LIGHT_ALPHA: 0.16,       // lit-side fill opacity for awakened spheres
-  META_SPHERE_SHADOW_ALPHA: 0.13,      // dark-side opacity for awakened spheres
-  META_SPHERE_RIM_ALPHA: 0.22,         // lit rim opacity for awakened spheres
-  META_SPHERE_CENTER_FILL_ALPHA: 0.025,// faint center-circle fill; Sol itself supplies the real luminosity
+  META_SPHERE_LIGHT_ALPHA: 0.08,       // lit-side fill opacity for awakened spheres
+  META_SPHERE_SHADOW_ALPHA: 0.065,     // dark-side opacity for awakened spheres
+  META_SPHERE_RIM_ALPHA: 0.11,         // lit rim opacity for awakened spheres
+  META_SPHERE_CENTER_FILL_ALPHA: 0.012,// faint center-circle fill; Sol itself supplies the real luminosity
   META_LINE_ALPHA: 0.16,               // resting opacity of awakened-node connections
   META_LINE_PULSE_ALPHA: 0.50,         // extra opacity during new-node pulse
   META_LINE_WIDTH: 1.0,                // resting line width for awakened-node connections
@@ -260,6 +261,12 @@ function metatronCenters(nodeSpacing: number) {
 
 function metatronAlignmentFor(activeCount: number) {
   return smoothstep(T.META_ALIGN_START_COUNT, T.META_ALIGN_COMPLETE_COUNT, activeCount);
+}
+
+function approachScalar(current: number, target: number, maxStep: number) {
+  if (current < target) return Math.min(target, current + maxStep);
+  if (current > target) return Math.max(target, current - maxStep);
+  return current;
 }
 
 function isMetaNodeLit(node: MetaNode | undefined) {
@@ -1310,6 +1317,7 @@ export default function MetatronVectorFOIL() {
     // metatron angles
     let metaAx = 0, metaAy = 0, metaAz = 0;
     let metaPulseClock = 0;
+    let metaAlignT = metatronAlignmentFor(0);
 
     // timers / wave state
     let gunCD = 0;
@@ -1322,8 +1330,14 @@ export default function MetatronVectorFOIL() {
     // reset helper
     const getAwakenedMetaNodeCount = () => metaNodes.filter((node) => node.kind !== "center" && node.awakened).length;
 
+    const updateMetaAlignment = (dt: number) => {
+      const target = metatronAlignmentFor(getAwakenedMetaNodeCount());
+      const maxStep = T.META_ALIGN_SETTLE_SEC > 0 ? dt / T.META_ALIGN_SETTLE_SEC : 1;
+      metaAlignT = approachScalar(metaAlignT, target, maxStep);
+    };
+
     const syncMetaNodeWorldPositions = () => {
-      const alignT = metatronAlignmentFor(getAwakenedMetaNodeCount());
+      const alignT = smoothstep(0, 1, metaAlignT);
       const tiltT = 1 - alignT;
       metaNodeWorld = centers3.map((v0) => {
         let v = new V3(v0.x, v0.y, v0.z * tiltT);
@@ -1343,6 +1357,7 @@ export default function MetatronVectorFOIL() {
         node.overcharged = isCenter;
         node.activatedAt = isCenter ? 0 : -Infinity;
       }
+      metaAlignT = metatronAlignmentFor(0);
       syncMetaNodeWorldPositions();
     };
 
@@ -2050,6 +2065,7 @@ export default function MetatronVectorFOIL() {
         metaAz += spin * dt;
         metaAx += spin * 0.6 * dt;
         metaAy += spin * 0.4 * dt;
+        updateMetaAlignment(dt);
         syncMetaNodeWorldPositions();
         audioRef.current.updateDrones(modeRef.current as GameMode, enemies, player, T.STAR_RADIUS, oortOuter);
         audioRef.current.setThrust(0);
@@ -2378,6 +2394,7 @@ export default function MetatronVectorFOIL() {
       metaAx -= metaAx * dwell * dt;
       metaAy -= metaAy * dwell * dt;
       metaAz -= metaAz * dwell * 0.35 * dt; // let az keep motion
+      updateMetaAlignment(dt);
       syncMetaNodeWorldPositions();
 
       if (waveActive && enemies.length === 0 && shards.length === 0) {
@@ -2519,7 +2536,7 @@ export default function MetatronVectorFOIL() {
         mode: modeRef.current,
         level: getLevel(levelIdxRef.current),
         player, camera,
-        meta: { ax: metaAx, ay: metaAy, az: metaAz, centers3, nodes: metaNodes, pulseClock: metaPulseClock },
+        meta: { ax: metaAx, ay: metaAy, az: metaAz, alignT: metaAlignT, centers3, nodes: metaNodes, pulseClock: metaPulseClock },
         entities: { bullets, enemies, shards, fuelBits, trail },
         toggles: togglesRef.current,
         horizonR, oortInner, oortOuter,
@@ -2966,7 +2983,7 @@ function render(
     level: Level;
     player: { pos: V2; vel: V2; angle: number; thrust: number; fuel: number; stuckTime: number; hitsTaken: number; hitInvuln: number };
     camera: { pos: V2; zoom: number };
-    meta: { ax: number; ay: number; az: number; centers3: V3[]; nodes: MetaNode[]; pulseClock: number };
+    meta: { ax: number; ay: number; az: number; alignT: number; centers3: V3[]; nodes: MetaNode[]; pulseClock: number };
     entities: { bullets: Bullet[]; enemies: Enemy[]; shards: Shard[]; fuelBits: FuelBit[]; trail: V2[] };
     toggles: { metatron: boolean; trails: boolean; debug: boolean };
     horizonR: number;
@@ -3024,8 +3041,7 @@ function render(
 
   // metatron (animated)
   if (S.toggles.metatron) {
-    const awakenedCount = S.meta.nodes.filter((node) => node.kind !== "center" && node.awakened).length;
-    const alignT = metatronAlignmentFor(awakenedCount);
+    const alignT = smoothstep(0, 1, S.meta.alignT);
     const tiltT = 1 - alignT;
     const C2: { x: number; y: number }[] = [];
     for (const v0 of S.meta.centers3) {
@@ -3080,7 +3096,7 @@ function render(
           ctx.fillStyle = `rgba(150,190,240,${T.META_SPHERE_CENTER_FILL_ALPHA})`;
           ctx.beginPath(); arcSafe(ctx, c.x, c.y, r); ctx.fill();
           ctx.lineWidth = 1.0 / S.camera.zoom;
-          ctx.strokeStyle = `rgba(205,232,255,${0.16 + sphereStrength * 0.08})`;
+          ctx.strokeStyle = `rgba(205,232,255,${0.08 + sphereStrength * 0.04})`;
           ctx.beginPath(); arcSafe(ctx, c.x, c.y, r); ctx.stroke();
         } else {
           const sol = C2[0] ?? { x: 0, y: 0 };
@@ -3091,8 +3107,8 @@ function render(
           // Directional illumination: bright toward Sol, dim and shadowed away from Sol.
           // These are not little suns; they are spheres catching the central light.
           const overchargeBoost = overcharged ? 1.18 : 1.0;
-          const litAlpha = T.META_SPHERE_LIGHT_ALPHA * overchargeBoost + sphereStrength * 0.035;
-          const shadowAlpha = T.META_SPHERE_SHADOW_ALPHA + sphereStrength * 0.025;
+          const litAlpha = T.META_SPHERE_LIGHT_ALPHA * overchargeBoost + sphereStrength * 0.0175;
+          const shadowAlpha = T.META_SPHERE_SHADOW_ALPHA + sphereStrength * 0.0125;
           const litX = c.x + lightDir.x * r;
           const litY = c.y + lightDir.y * r;
           const darkX = c.x - lightDir.x * r;
@@ -3123,15 +3139,15 @@ function render(
 
           const lightAngle = Math.atan2(lightDir.y, lightDir.x);
           ctx.lineWidth = 0.95 / S.camera.zoom;
-          ctx.strokeStyle = `rgba(185,225,255,${0.10 + sphereStrength * 0.08})`;
+          ctx.strokeStyle = `rgba(185,225,255,${0.05 + sphereStrength * 0.04})`;
           ctx.beginPath(); arcSafe(ctx, c.x, c.y, r); ctx.stroke();
 
           ctx.lineWidth = 1.25 / S.camera.zoom;
-          ctx.strokeStyle = `rgba(230,248,255,${T.META_SPHERE_RIM_ALPHA * overchargeBoost + sphereStrength * 0.07})`;
+          ctx.strokeStyle = `rgba(230,248,255,${T.META_SPHERE_RIM_ALPHA * overchargeBoost + sphereStrength * 0.035})`;
           ctx.beginPath(); ctx.arc(c.x, c.y, r, lightAngle - Math.PI * 0.58, lightAngle + Math.PI * 0.58); ctx.stroke();
 
           ctx.lineWidth = 0.85 / S.camera.zoom;
-          ctx.strokeStyle = `rgba(20,35,58,${0.18 + shadowAlpha * 0.45})`;
+          ctx.strokeStyle = `rgba(20,35,58,${0.09 + shadowAlpha * 0.225})`;
           ctx.beginPath(); ctx.arc(c.x, c.y, r, lightAngle + Math.PI * 0.58, lightAngle + Math.PI * 1.42); ctx.stroke();
         }
       } else {
