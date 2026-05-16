@@ -107,8 +107,8 @@ const T = {
   // Oort cloud constellations / hazards
   OORT_CONSTELLATIONS_ENABLED: true,    // draw and simulate the procedural Oort cloud
   OORT_CLUSTER_COUNT: 420,              // cheap procedural three-node constellations; not full physics bodies
-  OORT_CONSTELLATION_INNER_MULT: 0.92,  // inner constellation band, measured from current Oort outer radius
-  OORT_CONSTELLATION_OUTER_MULT: 2.15,  // outer constellation band, measured from current Oort outer radius
+  OORT_CONSTELLATION_INNER_MULT: 1.92,  // inner constellation band, measured from current Oort outer radius
+  OORT_CONSTELLATION_OUTER_MULT: 3.15,  // outer constellation band, measured from current Oort outer radius
   OORT_GLYPH_RADIUS_MIN: 5.0,           // local three-node constellation radius
   OORT_GLYPH_RADIUS_MAX: 18.0,          // local three-node constellation radius
   OORT_ORBIT_SPEED_MIN: 0.00055,        // parametric orbit speed, radians/s
