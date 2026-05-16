@@ -17,8 +17,8 @@ import type { CitationCategory, CommendationDefinition } from "./types/scoring";
 // ===================== TUNABLES =====================
 const T = {
   // World
-  META_CIRCLE_RADIUS: 172,              // visible Metatron circle/sphere radius; also defines awakening, refuel, and charging region size (world units)
-  META_NODE_SPACING: 244,              // center-to-center spacing of Metatron nodes; for tangency set to META_CIRCLE_RADIUS * 2
+  META_CIRCLE_RADIUS: 272,              // visible Metatron circle/sphere radius; also defines awakening, refuel, and charging region size (world units)
+  META_NODE_SPACING: 344,              // center-to-center spacing of Metatron nodes; for tangency set to META_CIRCLE_RADIUS * 2
   META_PLAYFIELD_RADIUS: 144,          // gameplay/camera reference radius; still decoupled from node spacing and circle size
   HORIZON_MULT: 2.0,                   // red ring radius multiplier
   OORT_INNER_MULT: 1.28,               // fuel-bit settlement inner band
@@ -52,7 +52,7 @@ const T = {
   SOLAR_ANGLE_GAIN: 0.55,              // how much sail angle produces tangential push (0..1)
 
   // Camera
-  CAMERA_LERP: 0.14,                   // camera zoom smoothing
+  CAMERA_LERP: 0.24,                   // camera zoom smoothing
   CAMERA_ZOOM_FLOOR: 0.125,            // min zoom so scene never vanishes
   CAMERA_ZOOM_CEIL: 3.0,               // max zoom to avoid jitter
   CAMERA_PAD_PX: 56,                   // screen-space padding for keep-in-view
@@ -110,7 +110,7 @@ const T = {
   META_DWELL: 0.82,                    // dwell damping toward readable pose
   META_ALIGN_START_COUNT: 1,           // begin flattening the lattice after this many awakened nodes
   META_ALIGN_COMPLETE_COUNT: 3,        // fully face-on target by this many awakened nodes
-  META_ALIGN_SETTLE_SEC: 4.0,           // seconds for the lattice to drift into its new alignment target
+  META_ALIGN_SETTLE_SEC: 14.0,           // seconds for the lattice to drift into its new alignment target
   META_DEPTH_WOBBLE: 8,                // early-game z offset for occult not-quite-flat projection
   META_SPHERE_PULSE: 8.0,              // seconds per pulse
   META_SPHERE_LIGHT_ALPHA: 0.08,       // lit-side fill opacity for awakened spheres
