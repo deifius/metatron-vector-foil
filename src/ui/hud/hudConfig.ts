@@ -48,6 +48,8 @@ export const HUD_DEV_CONTROLS = {
   },
 };
 
+export const HUD_UPDATE_INTERVAL = 1 / HUD_DEV_CONTROLS.refreshHz;
+
 export const DEFAULT_HUD_CONFIG: HUDConfig = {
   enabled: true,
   scale: HUD_DEV_CONTROLS.globalScale,

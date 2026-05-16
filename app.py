@@ -5,14 +5,11 @@ import hmac
 import json
 import logging
 from logging.handlers import RotatingFileHandler
-import os
-import re
 import secrets
 import sqlite3
 import time
 import uuid
 from functools import wraps
-from pathlib import Path
 from typing import Any, Callable, TypeVar
 from urllib.parse import urlsplit
 
@@ -20,50 +17,55 @@ from flask import Flask, Response, abort, g, jsonify, render_template, request, 
 from werkzeug.exceptions import HTTPException, InternalServerError
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("MVF_DB_PATH", BASE_DIR / "instance" / "metatron-vector-foil.sqlite3"))
-CALLSIGN_RE = re.compile(r"^[A-Za-z0-9]{3}$")
-REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,80}$")
-VALID_CAUSES = {"shrapnel", "enemy", "well", "sol", "fuel", "collapse", "oort", "unknown"}
-CLIENT_EVENT_TYPES = {
-    "client.startup",
-    "client.api_error",
-    "client.score_submission_error",
-    "client.audio_error",
-    "client.render_error",
-}
-VALID_LOG_SEVERITIES = {"debug", "info", "warning", "error", "critical"}
-SENSITIVE_LOG_KEYS = {
-    "authorization",
-    "cookie",
-    "csrf",
-    "csrftoken",
-    "csrf_token",
-    "password",
-    "secret",
-    "session",
-    "token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "google_sub",
-    "email",
-    "name",
-    "avatar",
-}
+from app_config import (
+    ACCEPT_CLIENT_DEBUG_LOGS,
+    CALLSIGN_RATE_LIMIT_SECONDS,
+    CALLSIGN_RE,
+    CLIENT_EVENT_RATE_LIMIT_SECONDS,
+    CLIENT_EVENT_TYPES,
+    CONTENT_SECURITY_POLICY,
+    DEV_AUTH_ENABLED,
+    DEV_AUTH_RATE_LIMIT_SECONDS,
+    DEV_AUTH_RE,
+    DB_PATH,
+    ENABLE_HSTS,
+    FLASK_SECRET_KEY,
+    LEADERBOARD_DEFAULT_LIMIT,
+    LEADERBOARD_MAX_LIMIT,
+    LOG_BACKUPS,
+    LOG_DICT_MAX_ITEMS,
+    LOG_JSON,
+    LOG_LEVEL,
+    LOG_LIST_MAX_ITEMS,
+    LOG_MAX_BYTES,
+    LOG_MAX_DEPTH,
+    LOG_PATH,
+    LOG_PEPPER,
+    LOG_STATIC_REQUESTS,
+    LOG_STRING_MAX_CHARS,
+    MAX_CONTENT_LENGTH_BYTES,
+    PERMISSIONS_POLICY,
+    REQUEST_ID_RE,
+    SCORE_SUBMIT_RATE_LIMIT_SECONDS,
+    SENSITIVE_LOG_KEYS,
+    SESSION_COOKIE_SAMESITE,
+    SESSION_COOKIE_SECURE,
+    VALID_CAUSES,
+    VALID_LOG_SEVERITIES,
+)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
 
 # A production deployment MUST set FLASK_SECRET_KEY in the service environment.
 # The generated development key keeps local sessions working without committing a secret.
-app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_urlsafe(48)
+app.secret_key = FLASK_SECRET_KEY or secrets.token_urlsafe(48)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE=os.environ.get("MVF_COOKIE_SAMESITE", "Lax"),
-    SESSION_COOKIE_SECURE=os.environ.get("MVF_COOKIE_SECURE", "0") == "1",
+    SESSION_COOKIE_SAMESITE=SESSION_COOKIE_SAMESITE,
+    SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
     JSON_SORT_KEYS=False,
-    MAX_CONTENT_LENGTH=32 * 1024,
+    MAX_CONTENT_LENGTH=MAX_CONTENT_LENGTH_BYTES,
 )
 
 
@@ -100,25 +102,26 @@ class JsonFormatter(logging.Formatter):
 
 
 def setup_logging() -> None:
-    level_name = os.environ.get("MVF_LOG_LEVEL", "INFO").upper()
+    level_name = LOG_LEVEL.upper()
     level = getattr(logging, level_name, logging.INFO)
     app.logger.setLevel(level)
     app.logger.handlers.clear()
 
     formatter: logging.Formatter
-    if os.environ.get("MVF_LOG_JSON", "1") == "1":
+    if LOG_JSON:
         formatter = JsonFormatter()
     else:
         formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
-    log_path = os.environ.get("MVF_LOG_PATH")
+    log_path = LOG_PATH
     if log_path:
+        from pathlib import Path
         path = Path(log_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         handler: logging.Handler = RotatingFileHandler(
             path,
-            maxBytes=int(os.environ.get("MVF_LOG_MAX_BYTES", str(2 * 1024 * 1024))),
-            backupCount=int(os.environ.get("MVF_LOG_BACKUPS", "5")),
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUPS,
             encoding="utf-8",
         )
     else:
@@ -133,7 +136,7 @@ setup_logging()
 
 
 def log_secret() -> bytes:
-    configured = os.environ.get("MVF_LOG_PEPPER") or os.environ.get("FLASK_SECRET_KEY") or app.secret_key
+    configured = LOG_PEPPER or app.secret_key
     return str(configured).encode("utf-8")
 
 
@@ -152,19 +155,19 @@ def request_id() -> str:
 
 
 def sanitize_for_log(value: Any, depth: int = 0) -> Any:
-    if depth > 4:
+    if depth > LOG_MAX_DEPTH:
         return "[max_depth]"
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
         cleaned = value.replace("\r", "\\r").replace("\n", "\\n")
-        if len(cleaned) > 512:
-            return cleaned[:512] + "…"
+        if len(cleaned) > LOG_STRING_MAX_CHARS:
+            return cleaned[:LOG_STRING_MAX_CHARS] + "…"
         return cleaned
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for i, (key, item) in enumerate(value.items()):
-            if i >= 40:
+            if i >= LOG_DICT_MAX_ITEMS:
                 out["_truncated"] = True
                 break
             key_s = str(key)[:80]
@@ -175,7 +178,7 @@ def sanitize_for_log(value: Any, depth: int = 0) -> Any:
                 out[key_s] = sanitize_for_log(item, depth + 1)
         return out
     if isinstance(value, (list, tuple, set)):
-        return [sanitize_for_log(item, depth + 1) for item in list(value)[:12]]
+        return [sanitize_for_log(item, depth + 1) for item in list(value)[:LOG_LIST_MAX_ITEMS]]
     return sanitize_for_log(str(value), depth + 1)
 
 
@@ -356,28 +359,13 @@ def before_request() -> None:
 @app.after_request
 def add_security_headers(resp: Response) -> Response:
     # React uses inline style attributes heavily, so style-src needs unsafe-inline until the UI is refactored.
-    csp = "; ".join(
-        [
-            "default-src 'self'",
-            "script-src 'self'",
-            "style-src 'self' 'unsafe-inline'",
-            "connect-src 'self'",
-            "img-src 'self' data: https:",
-            "media-src 'self'",
-            "font-src 'self' data:",
-            "object-src 'none'",
-            "base-uri 'self'",
-            "form-action 'self'",
-            "frame-ancestors 'none'",
-        ]
-    )
-    resp.headers.setdefault("Content-Security-Policy", csp)
+    resp.headers.setdefault("Content-Security-Policy", CONTENT_SECURITY_POLICY)
     resp.headers.setdefault("Referrer-Policy", "same-origin")
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
-    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), xr-spatial-tracking=()")
+    resp.headers.setdefault("Permissions-Policy", PERMISSIONS_POLICY)
     resp.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
-    if os.environ.get("MVF_ENABLE_HSTS", "0") == "1":
+    if ENABLE_HSTS:
         resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     if request.path.startswith("/api/"):
         resp.headers.setdefault("Cache-Control", "no-store")
@@ -389,7 +377,7 @@ def add_security_headers(resp: Response) -> Response:
 def emit_access_log(resp: Response) -> None:
     duration_ms = round((time.perf_counter() - float(getattr(g, "request_started_at", time.perf_counter()))) * 1000, 2)
     is_static = request.path.startswith("/static/")
-    if is_static and resp.status_code < 400 and os.environ.get("MVF_LOG_STATIC", "0") != "1":
+    if is_static and resp.status_code < 400 and not LOG_STATIC_REQUESTS:
         return
     severity = "warning" if resp.status_code >= 400 else "info"
     if resp.status_code >= 500:
@@ -516,24 +504,64 @@ def session_rate_limit(bucket: str, seconds: float) -> None:
     session.modified = True
 
 
-def current_player() -> sqlite3.Row | None:
-    db = get_db()
-    google_sub = session.get("google_sub")
+def auth_provider() -> str:
+    google_sub = str(session.get("google_sub") or "")
+    if google_sub.startswith("dev:"):
+        return "developer"
     if google_sub:
-        row = db.execute("SELECT * FROM players WHERE google_sub = ?", (google_sub,)).fetchone()
-        if row:
-            return row
+        return "google"
+    return "none"
+
+
+def current_player() -> sqlite3.Row | None:
+    """Return the authenticated player for this session, never an anonymous callsign claimant."""
+    google_sub = session.get("google_sub")
+    if not google_sub:
+        return None
+    return get_db().execute("SELECT * FROM players WHERE google_sub = ?", (google_sub,)).fetchone()
+
+
+def authenticated_player(create: bool = False) -> sqlite3.Row | None:
+    google_sub = session.get("google_sub")
+    if not google_sub:
+        return None
+    row = current_player()
+    if row or not create:
+        return row
+
+    # Smoothly migrate old development/browser-session claims into the authenticated model.
+    # This avoids orphaning callsigns that were claimed before callsigns became login-bound.
     anon = session.get("anonymous_id")
     if anon:
-        return db.execute("SELECT * FROM players WHERE anonymous_id = ?", (anon,)).fetchone()
-    return None
+        legacy = get_db().execute(
+            "SELECT * FROM players WHERE anonymous_id = ? AND google_sub IS NULL",
+            (anon,),
+        ).fetchone()
+        if legacy:
+            get_db().execute(
+                "UPDATE players SET google_sub = ?, updated_at = datetime('now') WHERE id = ?",
+                (google_sub, legacy["id"]),
+            )
+            get_db().commit()
+            return current_player()
+
+    anon_for_insert = anon
+    if anon and get_db().execute("SELECT id FROM players WHERE anonymous_id = ?", (anon,)).fetchone():
+        anon_for_insert = None
+    get_db().execute(
+        "INSERT INTO players (google_sub, anonymous_id) VALUES (?, ?)",
+        (google_sub, anon_for_insert),
+    )
+    get_db().commit()
+    return current_player()
 
 
 def public_player_payload(row: sqlite3.Row | None) -> dict[str, Any]:
     return {
         "authenticated": bool(session.get("google_sub")),
-        "authProvider": "google" if session.get("google_sub") else "session",
+        "authProvider": auth_provider(),
         "callsign": row["callsign"] if row and row["callsign"] else None,
+        "canChooseCallsign": bool(session.get("google_sub")) and bool(row is None or not row["callsign"]),
     }
 
 
@@ -561,7 +589,7 @@ def parse_float(data: dict[str, Any], name: str, default: float, low: float, hig
 @app.post("/api/client-events")
 @require_csrf
 def client_events():
-    session_rate_limit("client_events", 0.35)
+    session_rate_limit("client_events", CLIENT_EVENT_RATE_LIMIT_SECONDS)
     data = json_body()
     event_type = str(data.get("eventType", "client.unknown"))
     if event_type not in CLIENT_EVENT_TYPES:
@@ -569,7 +597,7 @@ def client_events():
     severity = str(data.get("severity", "info")).lower()
     if severity not in VALID_LOG_SEVERITIES:
         severity = "info"
-    if severity == "debug" and os.environ.get("MVF_ACCEPT_CLIENT_DEBUG_LOGS", "0") != "1":
+    if severity == "debug" and not ACCEPT_CLIENT_DEBUG_LOGS:
         severity = "info"
     details = data.get("details") if isinstance(data.get("details"), dict) else {}
     log_event(
@@ -594,8 +622,10 @@ def security_status():
             "ok": True,
             "csrfToken": session["csrf_token"],
             "player": public_player_payload(row),
+            "devAuthEnabled": DEV_AUTH_ENABLED,
             "identityPolicy": {
                 "publicIdentifier": "3-character case-sensitive callsign",
+                "callsignClaiming": "requires authenticated account and no existing callsign",
                 "publicFields": ["callsign", "score", "wave", "survivalTimeSec", "createdAt"],
                 "googleDataStored": ["sub only, when Google OAuth is enabled"],
                 "googleDataNotStored": ["email", "name", "avatar", "access_token", "refresh_token"],
@@ -604,31 +634,73 @@ def security_status():
     )
 
 
+@app.post("/api/dev-login")
+@require_csrf
+def dev_login():
+    if not DEV_AUTH_ENABLED:
+        abort(404, "not_found")
+    session_rate_limit("dev_auth", DEV_AUTH_RATE_LIMIT_SECONDS)
+    data = json_body()
+    handle = str(data.get("handle", "dev"))
+    if not DEV_AUTH_RE.fullmatch(handle):
+        abort(400, "invalid_dev_handle")
+    session["google_sub"] = f"dev:{handle}"
+    session.modified = True
+    player = authenticated_player(create=True)
+    log_event("auth.dev_login", "warning", player=player, details={"dev_handle": handle}, persist=True)
+    return jsonify({"ok": True, "player": public_player_payload(player)})
+
+
+@app.post("/api/player/logout")
+@require_csrf
+def logout_player():
+    player = current_player()
+    log_event("auth.logout", "info", player=player, persist=True)
+    csrf_token = session.get("csrf_token")
+    anonymous_id = secrets.token_urlsafe(24)
+    session.clear()
+    session["csrf_token"] = csrf_token or secrets.token_urlsafe(32)
+    session["anonymous_id"] = anonymous_id
+    session.modified = True
+    return jsonify({"ok": True, "player": public_player_payload(None), "csrfToken": session["csrf_token"]})
+
+
 @app.post("/api/player/callsign")
 @require_csrf
 def set_callsign():
-    session_rate_limit("callsign", 0.75)
+    session_rate_limit("callsign", CALLSIGN_RATE_LIMIT_SECONDS)
+    if not session.get("google_sub"):
+        log_event("player.callsign_without_login", "warning", persist=True)
+        abort(403, "login_required_before_callsign")
+
     data = json_body()
     callsign = str(data.get("callsign", ""))
     if not CALLSIGN_RE.fullmatch(callsign):
         abort(400, "callsign_must_be_exactly_3_case_sensitive_ascii_letters_or_digits")
 
     db = get_db()
+    me = authenticated_player(create=True)
+    if not me:
+        abort(403, "login_required_before_callsign")
+
+    if me["callsign"]:
+        if me["callsign"] == callsign:
+            return jsonify({"ok": True, "unchanged": True, "player": public_player_payload(me)})
+        log_event(
+            "player.callsign_change_blocked",
+            "warning",
+            player=me,
+            details={"requested_callsign": callsign},
+            persist=True,
+        )
+        abort(409, "callsign_already_assigned")
+
     existing = db.execute("SELECT id FROM players WHERE callsign = ? COLLATE BINARY", (callsign,)).fetchone()
-    me = current_player()
-    if existing and (me is None or existing["id"] != me["id"]):
+    if existing:
         log_event("player.callsign_taken", "warning", player=me, details={"requested_callsign": callsign}, persist=True)
         abort(409, "callsign_taken")
 
-    anon = session["anonymous_id"]
-    google_sub = session.get("google_sub")
-    if me:
-        db.execute("UPDATE players SET callsign = ?, updated_at = datetime('now') WHERE id = ?", (callsign, me["id"]))
-    else:
-        db.execute(
-            "INSERT INTO players (google_sub, anonymous_id, callsign) VALUES (?, ?, ?)",
-            (google_sub, anon, callsign),
-        )
+    db.execute("UPDATE players SET callsign = ?, updated_at = datetime('now') WHERE id = ?", (callsign, me["id"]))
     db.commit()
     updated_player = current_player()
     log_event("player.callsign_set", "info", player=updated_player, details={"callsign": callsign}, persist=True)
@@ -637,7 +709,7 @@ def set_callsign():
 
 @app.get("/api/leaderboard")
 def leaderboard():
-    limit = parse_int(request.args, "limit", 10, 1, 50)  # type: ignore[arg-type]
+    limit = parse_int(request.args, "limit", LEADERBOARD_DEFAULT_LIMIT, 1, LEADERBOARD_MAX_LIMIT)  # type: ignore[arg-type]
     rows = get_db().execute(
         """
         SELECT callsign, score, wave, survival_time_sec, created_at
@@ -683,8 +755,11 @@ def leaderboard():
 @app.post("/api/scores")
 @require_csrf
 def submit_score():
-    session_rate_limit("score", 1.25)
+    session_rate_limit("score", SCORE_SUBMIT_RATE_LIMIT_SECONDS)
     player = current_player()
+    if not session.get("google_sub"):
+        log_event("score.submit_without_login", "warning", persist=True)
+        abort(403, "login_required_before_score")
     if not player or not player["callsign"]:
         log_event("score.submit_without_callsign", "warning", player=player, persist=True)
         abort(403, "set_callsign_before_submitting_score")

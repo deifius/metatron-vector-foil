@@ -32,6 +32,9 @@ Even when `email` and `profile` are present in the ID token, the app should stor
 - Players choose an exact 3-character callsign.
 - Callsigns are case-sensitive: `ABC`, `Abc`, and `abc` are different callsigns.
 - For security and legibility, callsigns are restricted to ASCII letters and digits: `A-Z`, `a-z`, `0-9`.
+- Callsigns are display identifiers, not login secrets. Never authenticate a player by callsign alone.
+- Callsign claiming requires an authenticated account. Anonymous/browser-session visitors may play locally but may not reserve public callsigns or publish persistent scores.
+- Callsigns are account-bound and immutable from the arcade UI once assigned; admin/manual database repair is the only expected change path.
 - Public leaderboards may show only callsign, score, wave, survival time, and submission time.
 - Do not expose email, Google display name, Google avatar URL, IP address, user-agent, session ID, OAuth token, or raw telemetry in public leaderboard responses.
 
@@ -40,8 +43,8 @@ Even when `email` and `profile` are present in the ID token, the app should stor
 Store the minimum viable data:
 
 - `google_sub` when OAuth is enabled.
-- Anonymous session identifier for local/dev/non-OAuth play.
-- Player callsign.
+- Anonymous session identifier only for CSRF/session continuity, not for public callsign ownership.
+- Player callsign, only after authentication.
 - Score, wave, survival duration, and small run-summary values needed for leaderboard ranking.
 
 Avoid storing full run telemetry unless a later anti-cheat or replay system explicitly requires it. If such telemetry is added, it must be clearly separated from public leaderboard data and protected as private player data.
@@ -88,6 +91,7 @@ MVF_LOG_BACKUPS=5               # rotating backup count
 MVF_LOG_PEPPER='long-random-log-hash-pepper'
 MVF_LOG_STATIC=0                # set 1 only when debugging static asset delivery
 MVF_ACCEPT_CLIENT_DEBUG_LOGS=0  # keep debug noise off in production
+MVF_DEV_AUTH_ENABLED=0        # production must remain 0; dev-only fake account login
 ```
 
 Recommended production ownership:
@@ -115,10 +119,12 @@ The audit trail intentionally stores hashed IP/user-agent fingerprints, not raw 
 
 When Google OAuth is implemented, use server-side Authorization Code flow rather than handling tokens entirely in browser code. Validate ID tokens server-side using a well-maintained Google/Python client library or JOSE/JWT library. Validate issuer, audience, signature, expiration, and nonce/state. Store the `sub` claim as the stable account key; do not use email as the primary account key. Do not store refresh tokens unless a future feature truly requires offline Google API access, which the arcade game should not need.
 
+Development builds may set `MVF_DEV_AUTH_ENABLED=1` to expose `/api/dev-login` for fake account sessions. This endpoint must remain disabled in production and must never be treated as a replacement for Google OAuth.
+
 ### Leaderboard Security Rules
 
-- Require a callsign before accepting persistent score submissions.
-- Rate-limit callsign changes and score submissions.
+- Require authenticated login and a callsign before accepting persistent score submissions.
+- Rate-limit callsign claims and score submissions. Callsigns are not changeable through the public UI after assignment.
 - Validate submitted score payloads server-side for type, range, and shape.
 - Treat browser-submitted scores as untrusted. The current leaderboard is an arcade honor board, not a cryptographically authoritative tournament system.
 - Prefer one best score per player on the public board so a single pilot cannot flood the list.
@@ -129,7 +135,16 @@ When Google OAuth is implemented, use server-side Authorization Code flow rather
 - `src/MetatronVectorFOIL.tsx`
   - Main game loop, physics, rendering, entities, audio integration, Metatron node logic.
   - This file is large but canonical.
+  - Do not put tunable constants back into this file. Import them from config modules.
   - Do not perform broad refactors unless explicitly asked.
+
+- `src/config/gameConstants.ts`
+  - Central gameplay, geometry, debrief, audio, and default public-player constants.
+  - Add new gameplay tuning values here rather than inside `MetatronVectorFOIL.tsx`.
+
+- `app_config.py`
+  - Central Flask/server runtime constants: identity policy, rate limits, log knobs, request limits, security headers, and leaderboard limits.
+  - Prefer environment-backed settings here rather than scattering `os.environ.get(...)` calls through `app.py`.
 
 - `src/ui/hud/`
   - Modular HUD components.
@@ -143,6 +158,9 @@ When Google OAuth is implemented, use server-side Authorization Code flow rather
 
 - `src/config/unlocks.ts`
   - Unlock-related feature flags.
+
+- `src/ui/hud/hudConfig.ts`
+  - HUD layout, refresh interval, widget defaults, and HUD tuning constants.
 
 - `static/text/`
   - Cabinet prose, game-over lines, alerts, commendations, hints.
@@ -195,8 +213,28 @@ The following are ignored and should not be committed:
 - `static/main.js.map`
 - `static/audio/*`
 - `__pycache__/`
+- `instance/`
+- `*.sqlite3`
+- `*.db`
+- `*.log`
+- `logs/`
 
 The JS bundle is generated from TypeScript using esbuild.
+
+## Constants and Configuration Separation
+
+Keep constants out of active scripts and components. The active code should import configuration from purpose-built modules rather than defining large constant blocks inline. This makes user tuning safer and prevents gameplay, security, and logging knobs from being scattered through the machinery.
+
+Current homes:
+
+- Gameplay/world/audio/debrief constants: `src/config/gameConstants.ts`
+- Scoring constants: `src/config/scoring.ts`
+- Scoring thresholds: `src/config/thresholds.ts`
+- Unlock flags: `src/config/unlocks.ts`
+- HUD layout/defaults: `src/ui/hud/hudConfig.ts`
+- Flask/server/security/logging constants: `app_config.py`
+
+Small local constants that are truly derived values inside a helper are acceptable, but user-tunable knobs and policy values should live in one of the config files above.
 
 ## Coding Rules
 
@@ -204,7 +242,7 @@ The JS bundle is generated from TypeScript using esbuild.
 - Prefer small, focused patches.
 - Do not rewrite unrelated systems.
 - Do not replace existing tunable constants with hard-coded values.
-- Add new tuning values to the `T` constants block unless there is a strong reason to put them elsewhere.
+- Add new gameplay tuning values to `src/config/gameConstants.ts`; add HUD tuning values to `src/ui/hud/hudConfig.ts`; add server/runtime settings to `app_config.py`.
 - Preserve existing user-tuned values unless the requested change specifically requires adjustment.
 - Keep gameplay math deterministic and readable.
 - Use helper functions for repeated vector/geometry logic.
