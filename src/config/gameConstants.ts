@@ -12,6 +12,7 @@ export const T = {
   OORT_INNER_MULT: 1.28,               // fuel-bit settlement inner band
   OORT_OUTER_MULT: 1.55,               // fuel-bit settlement outer band
   STAR_RADIUS: 14,                     // visible star radius (world units)
+  STAR_COLLISION_RADIUS: 9.5,           // hard Sol body; touch this with the Corsair and it is crash-and-burn
   STAR_TRAP_RADIUS: 18,                // "stuck in well" radius threshold (world units)
   STAR_TRAP_TIME: 3.0,                 // seconds stuck before explode/restart
 
@@ -24,9 +25,15 @@ export const T = {
 
   // Player
   SHIP_MASS: 26.0,                     // ship mass (higher = more inertia)
-  ROT_SPEED: 3.6,                      // ship rotation speed (rad/s)
+  ROT_SPEED: 3.6,                      // legacy/direct ship rotation speed (rad/s) when rotational inertia is disabled
+  SHIP_ROTATIONAL_INERTIA_ENABLED: true, // true = A/D apply torque and angular velocity is conserved between inputs
+  SHIP_ANGULAR_ACCEL: 11.5,            // angular acceleration from steering input (rad/s^2)
+  SHIP_ANGULAR_DAMPING: 0.42,          // angular velocity bleed per second; 0 = pure conservation, higher = easier handling
+  SHIP_MAX_ANGULAR_SPEED: 4.2,         // angular velocity clamp when rotational inertia is enabled (rad/s)
   THRUST_FORCE: 1900,                  // engine thrust (force units)
   BRAKE_COEFF: 0.97,                  // braking drag coefficient applied per fixed step
+  BRAKING_REQUIRES_ACTIVATED_SPHERE: true, // brakes need Metatronic medium; open space has nothing to parachute against
+  OPEN_SPACE_BRAKE_MULTIPLIER: 0.0,    // 0 = no braking outside awakened spheres; raise for emergency inertial damping
   DRAG: 0.0,                           // should remain 0 (user request)
   ORBIT_GAIN: 1.03,                    // initial tangential velocity multiplier
   FUEL_MAX: 100,                       // fuel capacity
@@ -118,6 +125,15 @@ export const T = {
   OORT_COLLISION_KNOCKBACK: 115,        // velocity kick away from struck constellation
   OORT_SHOT_BREAK_RADIUS: 9.0,          // blaster corridor-clearing radius against nodes/lines
   OORT_REFORM_SECONDS: 15.0,            // broken constellations drift back together after this long
+  OORT_ALLOWS_BRAKING: true,            // dusty ice medium lets the brake foil bite weakly in the Oort cloud
+  OORT_BRAKE_MULTIPLIER: 0.28,          // fraction of normal sphere braking available in dense Oort dust
+  OORT_PASSIVE_DRAG: 0.045,             // passive speed bleed per second in dense Oort dust
+  OORT_INWARD_PRESSURE_ENABLED: true,   // heliopause/Riemann pressure nudges far-out ships back toward Sol
+  OORT_INWARD_PRESSURE_START_MULT: 2.85,// start pressure at this multiple of the normal Oort outer radius
+  OORT_INWARD_PRESSURE_FULL_MULT: 4.00, // pressure reaches full strength at this multiple of Oort outer radius
+  OORT_INWARD_PRESSURE_ACCEL: 36,       // maximum inward acceleration from outer-shell pressure
+  OORT_COLLISION_INWARD_BIAS: 0.34,     // after Oort strikes, blend the rebound vector back toward Sol
+  OORT_COLLISION_SPEED_DAMPING: 0.82,   // Oort collisions knock speed down so they rescue as well as punish
 
   // Metatron animation / node gameplay
   META_BASE_SPIN: 0.03,                // base spin
@@ -153,6 +169,18 @@ export const T = {
   META_NODE_GRAVITY_AFFECTS_BULLETS: true,
   META_NODE_GRAVITY_AFFECTS_ENEMIES: true,
   META_NODE_GRAVITY_AFFECTS_SHRAPNEL: true,
+  META_SPHERE_PLAYER_MEDIUM_DRAG: 0.006,// very light passive atmospheric damping inside awakened spheres; braking supplies the real drag
+  META_SPHERE_ENEMY_MEDIUM_DRAG: 0.18,  // awakened-sphere medium slows hostile polyhedra slightly, per second
+  META_SPHERE_SHRAPNEL_MEDIUM_DRAG: 0.55,// awakened-sphere medium damps shrapnel noticeably, per second
+
+  // Ship animation feel
+  THRUST_TRAIL_GLOW_ENABLED: true,
+  THRUST_TRAIL_GLOW_POINTS: 42,         // recent trail samples energized by thrust plume
+  THRUST_TRAIL_GLOW_INTENSITY: 0.72,    // maximum added plume alpha along the near trail
+  BRAKE_UNFOLD_ENABLED: true,
+  BRAKE_UNFOLD_AMOUNT: 0.72,            // how far the sphenic wedge splays open while braking in medium
+  BRAKE_WAKE_LINES_ENABLED: false,       // keep false for clean brake animation: widened foil only, no aft wake scribbles
+  BRAKE_WAKE_INTENSITY: 0.68,
 
   // Door / progression
   ALIGN_THRESHOLD: 0.11,               // angle error threshold for "aligned"
@@ -188,6 +216,7 @@ export const T = {
   AUDIO_OORT_BREAK_URL: "/static/audio/oort-break.wav",
   AUDIO_OORT_STRIKE_URL: "/static/audio/oort-strike.wav",
   AUDIO_OORT_DUST_URL: "/static/audio/oort-dust.wav",
+  AUDIO_SPHERE_ACTIVATE_URL: "/static/audio/sphere-activate.wav",
 
   AUDIO_THRUST_SAMPLE_GAIN: 0.18,      // level of looped thrust.wav when present
   AUDIO_THRUST_RATE_MIN: 0.92,         // idle playback rate for thrust.wav
@@ -203,6 +232,7 @@ export const T = {
   AUDIO_OORT_STRIKE_GAIN: 0.16,         // one-shot gain for oort-strike.wav
   AUDIO_OORT_DUST_GAIN: 0.12,           // max gain for looped oort-dust.wav while abrading shields
   AUDIO_OORT_DUST_FILTER_HZ: 2600,      // high, icy dust tone when the optional loop is present
+  AUDIO_SPHERE_ACTIVATE_GAIN: 0.18,      // one-shot gain for sphere-activate.wav
 };
 
 export const TAU = Math.PI * 2;
