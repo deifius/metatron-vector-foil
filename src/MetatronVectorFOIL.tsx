@@ -3126,6 +3126,24 @@ export default function MetatronVectorFOIL() {
               64%, 70% { opacity: 0.98; }
               82% { opacity: 0.36; }
             }
+            @keyframes mvfMysticSolPulse {
+              0%, 100% { opacity: 0.78; filter: brightness(1); transform: scale(1); }
+              34% { opacity: 0.94; filter: brightness(1.18); transform: scale(1.035); }
+              59% { opacity: 1; filter: brightness(1.55); transform: scale(1.07); }
+              61% { opacity: 0.58; filter: brightness(0.82); transform: scale(0.99); }
+              64% { opacity: 0.96; filter: brightness(1.22); transform: scale(1.025); }
+            }
+            @keyframes mvfMysticSolRings {
+              0% { opacity: 0.16; stroke-dashoffset: 42; transform: scale(0.92); }
+              42% { opacity: 0.62; }
+              100% { opacity: 0.10; stroke-dashoffset: -42; transform: scale(1.22); }
+            }
+            @keyframes mvfMysticSolSweep {
+              0% { opacity: 0; transform: rotate(0deg); }
+              16% { opacity: 0.68; }
+              62% { opacity: 0.20; }
+              100% { opacity: 0; transform: rotate(360deg); }
+            }
           `}</style>
           <div
             aria-hidden
@@ -3434,6 +3452,7 @@ function GhostMetatronCube({ glow, opacity, headline, subline }: { glow: number;
         minWidth: 110,
         aspectRatio: "1 / 1",
         opacity: 0.54 + opacity * 0.34,
+        transform: "translateY(clamp(-82px, -8.8vh, -54px))",
         filter: `drop-shadow(0 0 ${18 + glow * 18}px rgba(140,210,255,0.14)) drop-shadow(0 0 ${42 + glow * 28}px rgba(176,255,218,0.08))`,
       }}
     >
@@ -3446,10 +3465,18 @@ function GhostMetatronCube({ glow, opacity, headline, subline }: { glow: number;
               <feMergeNode in="SourceGraphic" />
             </feMerge>
           </filter>
-          <radialGradient id="mvfMetaCore" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stopColor="rgba(214,245,255,0.92)" />
-            <stop offset="28%" stopColor="rgba(176,255,218,0.32)" />
+          <radialGradient id="mvfMysticSolCore" cx="45%" cy="38%" r="62%">
+            <stop offset="0%" stopColor="rgba(255,255,244,1)" />
+            <stop offset="24%" stopColor="rgba(255,231,164,0.96)" />
+            <stop offset="48%" stopColor="rgba(255,184,92,0.54)" />
+            <stop offset="76%" stopColor="rgba(176,255,218,0.18)" />
             <stop offset="100%" stopColor="rgba(176,255,218,0)" />
+          </radialGradient>
+          <radialGradient id="mvfMysticSolAura" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stopColor="rgba(255,244,206,0.58)" />
+            <stop offset="35%" stopColor="rgba(255,203,112,0.20)" />
+            <stop offset="70%" stopColor="rgba(176,255,218,0.10)" />
+            <stop offset="100%" stopColor="rgba(144,206,255,0)" />
           </radialGradient>
         </defs>
         <g fill="none" strokeLinecap="round" filter="url(#mvfMetaGlow)" style={{ mixBlendMode: "screen" }}>
@@ -3484,11 +3511,27 @@ function GhostMetatronCube({ glow, opacity, headline, subline }: { glow: number;
             {line([0, 0], octa[3], "oct-h", "rgba(176,255,218,0.72)", 1.35)}
           </g>
         </g>
-        <circle cx="0" cy="0" r="16" fill="url(#mvfMetaCore)" opacity={0.44 + glow * 0.16} />
+        <g style={{ transformOrigin: "0px 0px", animation: "mvfMysticSolPulse 6.4s ease-in-out infinite" }}>
+          <circle cx="0" cy="0" r="34" fill="url(#mvfMysticSolAura)" opacity={0.72 + glow * 0.16} />
+          <circle cx="0" cy="0" r="15" fill="url(#mvfMysticSolCore)" opacity={0.96} />
+          <circle cx="0" cy="0" r="8" fill="rgba(255,255,236,0.94)" />
+          <g fill="none" strokeLinecap="round" style={{ mixBlendMode: "screen" }}>
+            <circle cx="0" cy="0" r="24" stroke="rgba(255,230,166,0.34)" strokeWidth="1.05" strokeDasharray="2 6" style={{ transformOrigin: "0px 0px", animation: "mvfMysticSolRings 5.2s linear infinite" }} />
+            <circle cx="0" cy="0" r="32" stroke="rgba(176,255,218,0.20)" strokeWidth="0.85" strokeDasharray="8 10" style={{ transformOrigin: "0px 0px", animation: "mvfMysticSolRings 6.8s linear infinite reverse" }} />
+            <line x1="-39" y1="0" x2="-20" y2="0" stroke="rgba(255,234,178,0.32)" strokeWidth="0.9" />
+            <line x1="20" y1="0" x2="39" y2="0" stroke="rgba(255,234,178,0.32)" strokeWidth="0.9" />
+            <line x1="0" y1="-39" x2="0" y2="-20" stroke="rgba(176,255,218,0.28)" strokeWidth="0.9" />
+            <line x1="0" y1="20" x2="0" y2="39" stroke="rgba(176,255,218,0.28)" strokeWidth="0.9" />
+          </g>
+          <g fill="none" strokeLinecap="round" stroke="rgba(244,252,255,0.42)" strokeWidth="1.1" style={{ transformOrigin: "0px 0px", animation: "mvfMysticSolSweep 3.7s linear infinite" }}>
+            <path d="M 0 -45 C 10 -30 10 -15 0 0 C -10 15 -10 30 0 45" />
+            <path d="M -45 0 C -30 -10 -15 -10 0 0 C 15 10 30 10 45 0" />
+          </g>
+        </g>
       </svg>
       <div style={{ position: "absolute", inset: 0, background: "radial-gradient(circle at center, rgba(144,206,255,0.06), transparent 52%)", animation: "mvfMetatronGhost 8.6s ease-in-out infinite" }} />
       <div style={{ position: "absolute", left: "50%", bottom: -20, transform: "translateX(-50%)", width: 230, maxWidth: "72vw", textAlign: "center", fontSize: 9, letterSpacing: "0.28em", textTransform: "uppercase", color: `rgba(174,233,255,${0.46 + glow * 0.22})`, textShadow: "0 0 12px rgba(160,220,255,0.16)" }}>
-        Ghost Metatron Trace
+        Sol-Centered Metatron Trace
       </div>
       <div style={{ position: "absolute", left: "50%", bottom: -36, transform: "translateX(-50%)", width: 230, maxWidth: "72vw", textAlign: "center", fontSize: 8, letterSpacing: "0.20em", textTransform: "uppercase", color: `rgba(202,230,248,${0.38 + glow * 0.16})` }}>
         {headline} // {subline}
