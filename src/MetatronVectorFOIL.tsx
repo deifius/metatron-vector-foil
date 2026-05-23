@@ -952,6 +952,29 @@ function callsignStatusMessage(player: PublicPlayer) {
   return "Choose exactly three letters or digits. This claim is permanent from the arcade UI.";
 }
 
+const MENU_HINT_TICK_MS = 50;
+const MENU_HINT_TYPE_MS = 42;
+const MENU_HINT_DETAIL_TYPE_MS = 18;
+const MENU_HINT_DETAIL_DELAY_MS = 260;
+const MENU_HINT_STABLE_MS = 8400;
+const MENU_HINT_BLINK_MS = 1400;
+const MENU_HINT_CYCLE_MS = MENU_HINT_STABLE_MS + MENU_HINT_BLINK_MS;
+
+function flightHintDetail(hint: string) {
+  const h = hint.toLowerCase();
+  if (h.includes("stable orbit") || h.includes("sideways")) return "Your ship wants to fall. Sideways speed lets the fall miss Sol.";
+  if (h.includes("prograde")) return "Burn with your motion to lift the far side of the orbit. Retrograde tightens the dive.";
+  if (h.includes("retrograde")) return "Burn against your motion to drop inward. Use it deliberately; Sol collects mistakes.";
+  if (h.includes("slingshot") || h.includes("close pass")) return "A near-periapsis pass converts courage into velocity. Always leave an exit vector.";
+  if (h.includes("oort")) return "The outer cloud buys breathing room, but dust and ice still remember your hull.";
+  if (h.includes("braking") || h.includes("drag")) return "Brake only when you must; drag is a local miracle, not a universal law.";
+  if (h.includes("fuel") || h.includes("rocket equation")) return "Every ignition writes a bill. Spend thrust only when the orbit pays you back.";
+  if (h.includes("impossible")) return "Goddard was mocked before the equations caught up. Use impossible sparingly.";
+  if (h.includes("vacuum") || h.includes("thrust works")) return "The engine pushes against its own exhaust. The void is not a wall.";
+  if (h.includes("gravity")) return "Do not overpower the well. Enter a bargain with it, then leave before it collects.";
+  return "Read the trace, wait for the burn window, and let geometry do half the fighting.";
+}
+
 // ===================== MAIN COMPONENT =====================
 export default function MetatronVectorFOIL() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -978,6 +1001,7 @@ export default function MetatronVectorFOIL() {
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [scoreSubmitStatus, setScoreSubmitStatus] = useState<ScoreSubmitStatus>("idle");
   const [menuHintIdx, setMenuHintIdx] = useState(0);
+  const [menuHintTick, setMenuHintTick] = useState(0);
   const [attractIdx, setAttractIdx] = useState(0);
   const [attractPhaseTick, setAttractPhaseTick] = useState(0);
 
@@ -1211,28 +1235,33 @@ export default function MetatronVectorFOIL() {
   }, []);
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setMenuHintIdx((idx) => (flightHints.length > 0 ? (idx + 1) % flightHints.length : 0));
-    }, 4600);
+    if (mode !== "menu") {
+      setMenuHintTick(0);
+      return;
+    }
+    setMenuHintTick(0);
+    const id = window.setInterval(() => setMenuHintTick((tick) => tick + 1), MENU_HINT_TICK_MS);
     return () => window.clearInterval(id);
-  }, [flightHints]);
+  }, [mode, menuHintIdx]);
+
+  useEffect(() => {
+    if (mode !== "menu") return;
+    const id = window.setTimeout(() => {
+      setMenuHintIdx((idx) => (flightHints.length > 0 ? (idx + 1) % flightHints.length : 0));
+    }, MENU_HINT_CYCLE_MS);
+    return () => window.clearTimeout(id);
+  }, [mode, flightHints.length, menuHintIdx]);
 
 
-  const attractSequence = useMemo(() => {
-    const insertCoin = insertCoinLines[0] ?? DEFAULT_INSERT_COIN_LINES[0];
-    const pressStart = insertCoinLines[1] ?? DEFAULT_INSERT_COIN_LINES[1];
-    const remembrance = insertCoinLines[2] ?? DEFAULT_INSERT_COIN_LINES[2];
+  const attractSequence = useMemo((): Array<{ id: string; label: string; headline: string; subline: string; anim: "typeon" | "blink" | "flicker" | "pulse"; durationMs: number }> => {
     const motto = insertCoinLines[3] ?? DEFAULT_INSERT_COIN_LINES[3];
-    const hint = flightHints[menuHintIdx] ?? DEFAULT_FLIGHT_HINTS[0];
     return [
-      { id: "online", label: "SYSTEM", headline: "SPHENIC CORSAIR ONLINE", subline: "VECTOR FIELD LOCKED", anim: "flicker" as const, durationMs: 1200 },
-      { id: "title", label: "CABINET", headline: "METATRON VECTOR FOIL", subline: "PILOT SCHOOL READY", anim: "typeon" as const, durationMs: 1800 },
-      { id: "insert", label: "ARCADE", headline: insertCoin, subline: motto, anim: "blink" as const, durationMs: 1300 },
-      { id: "start", label: "LAUNCH", headline: pressStart, subline: "ENTER // LAUNCH", anim: "pulse" as const, durationMs: 1900 },
-      { id: "dual", label: "ARCADE", headline: `${insertCoin} // ${pressStart}`, subline: remembrance, anim: "pulse" as const, durationMs: 2200 },
-      { id: "hint", label: "FLIGHT HINT", headline: hint.toUpperCase(), subline: "RETURN TO THE BURN", anim: "typeon" as const, durationMs: 2600 },
+      { id: "online", label: "SYSTEM", headline: "SPHENIC CORSAIR ONLINE", subline: "VECTOR FIELD LOCKED", anim: "flicker" as const, durationMs: 1300 },
+      { id: "scope", label: "SCOPE", headline: "LIVE ORBITAL TRACE", subline: "PHOSPHOR PERSISTENCE", anim: "pulse" as const, durationMs: 1900 },
+      { id: "tree", label: "TREE", headline: "AWAKEN WHAT YOU TOUCH", subline: motto, anim: "typeon" as const, durationMs: 2200 },
+      { id: "guidance", label: "GUIDANCE", headline: "ORBITAL LESSON ARMED", subline: "READ THE BURN", anim: "typeon" as const, durationMs: 2100 },
     ];
-  }, [flightHints, insertCoinLines, menuHintIdx]);
+  }, [insertCoinLines]);
 
   const currentAttract = attractSequence[attractIdx % attractSequence.length];
   const attractPhase = attractPhaseTick / 10;
@@ -2887,7 +2916,7 @@ export default function MetatronVectorFOIL() {
         const trimDeg = Math.atan2(trimVec.x * radialDir.y - trimVec.y * radialDir.x, trimVec.dot(radialDir)) * 180 / Math.PI;
         setHUDState({
           title: `Metatron Vector FOIL · SCORE ${Math.round(score).toLocaleString()}`,
-          controlsText: "A/D rotate · W/S trim · Space shoot · Enter start · P pause · M/T/B toggles",
+          controlsText: "A/D rotate · W/S trim · Space shoot · Enter launch · P pause · M/T/B toggles",
           alert: { text: alertText, severity: alertSeverity, flashing, subtitle: alertSubtitle },
           player: {
             shieldsPct,
@@ -2973,6 +3002,27 @@ export default function MetatronVectorFOIL() {
   const debriefHudFade = mode === "debrief"
     ? Math.max(0, 1 - (debriefUI.phase === "burn_fade" ? debriefUI.phaseElapsedMs / DEBRIEF_SEQUENCE.burnFadeMs : 1))
     : 1;
+  const menuFlightHint = flightHints[menuHintIdx] ?? DEFAULT_FLIGHT_HINTS[0];
+  const menuFlightDetail = flightHintDetail(menuFlightHint);
+  const menuHintElapsedMs = menuHintTick * MENU_HINT_TICK_MS;
+  const menuHintBlinking = menuHintElapsedMs >= MENU_HINT_STABLE_MS;
+  const menuHintBlinkVisible = !menuHintBlinking || Math.floor((menuHintElapsedMs - MENU_HINT_STABLE_MS) / 120) % 2 === 0;
+  const menuHintHeadlineChars = Math.min(menuFlightHint.length, Math.max(0, Math.floor(menuHintElapsedMs / MENU_HINT_TYPE_MS)));
+  const menuHintDetailStartMs = menuFlightHint.length * MENU_HINT_TYPE_MS + MENU_HINT_DETAIL_DELAY_MS;
+  const menuHintDetailChars = Math.min(menuFlightDetail.length, Math.max(0, Math.floor((menuHintElapsedMs - menuHintDetailStartMs) / MENU_HINT_DETAIL_TYPE_MS)));
+  const typedMenuFlightHint = menuFlightHint.slice(0, menuHintHeadlineChars);
+  const typedMenuFlightDetail = menuFlightDetail.slice(0, menuHintDetailChars);
+  const menuHintCursorOn = !menuHintBlinking && Math.floor(menuHintElapsedMs / 320) % 2 === 0;
+  const menuHintTypingHeadline = menuHintHeadlineChars < menuFlightHint.length;
+  const menuHintTypingDetail = !menuHintTypingHeadline && menuHintDetailChars < menuFlightDetail.length;
+  const menuHintOpacity = menuHintBlinkVisible ? 1 : 0.16;
+  const menuHintCount = Math.max(1, flightHints.length || DEFAULT_FLIGHT_HINTS.length);
+  const menuHintCounter = `${String((menuHintIdx % menuHintCount) + 1).padStart(2, "0")}/${String(menuHintCount).padStart(2, "0")}`;
+  const publicBoardStatus = playerIdentity.callsign
+    ? `PILOT ${playerIdentity.callsign} // PUBLIC BOARD ACTIVE`
+    : playerIdentity.authenticated
+      ? "CALLSIGN OPEN // PUBLIC BOARD STANDBY"
+      : "ANONYMOUS FLIGHT // LOCAL SCORE ONLY";
 
   return (
     <div
@@ -3005,21 +3055,107 @@ export default function MetatronVectorFOIL() {
           style={{
             position: "absolute",
             inset: 0,
-            padding: 22,
+            padding: "clamp(14px, 2.5vw, 26px)",
             color: "rgba(210,238,255,0.92)",
             fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-            background: "linear-gradient(180deg, rgba(2,6,12,0.28), rgba(0,0,0,0.16))",
+            background: "radial-gradient(circle at 50% 45%, rgba(28,72,104,0.12), rgba(0,0,0,0.34) 44%, rgba(0,0,0,0.62) 100%)",
           }}
         >
+          <style>{`
+            @keyframes mvfScopeSweep {
+              0% { transform: translateX(-125vw) rotate(12deg); opacity: 0; }
+              14% { opacity: 0.24; }
+              48% { opacity: 0.08; }
+              100% { transform: translateX(125vw) rotate(12deg); opacity: 0; }
+            }
+            @keyframes mvfTitlePhosphor {
+              0%, 100% { opacity: 0.96; filter: brightness(1.02); text-shadow: 0 0 20px rgba(176,230,255,0.28), 0 0 58px rgba(160,220,255,0.12), 0 0 104px rgba(140,210,255,0.05); }
+              24% { opacity: 1; filter: brightness(1.12); text-shadow: 0 0 28px rgba(198,242,255,0.34), 0 0 76px rgba(168,228,255,0.18), 0 0 132px rgba(140,210,255,0.08); }
+              48% { opacity: 0.90; filter: brightness(0.98); text-shadow: 0 0 14px rgba(160,220,255,0.18), 0 0 42px rgba(160,220,255,0.08); }
+              61% { opacity: 1; filter: brightness(1.72); text-shadow: 0 0 7px rgba(244,252,255,0.92), 0 0 28px rgba(206,244,255,0.70), 0 0 92px rgba(176,230,255,0.34), 0 0 164px rgba(140,210,255,0.16); }
+              62.4% { opacity: 0.80; filter: brightness(0.84); text-shadow: 0 0 10px rgba(160,220,255,0.12), 0 0 26px rgba(160,220,255,0.06); }
+              64% { opacity: 1; filter: brightness(1.34); text-shadow: 0 0 24px rgba(198,242,255,0.42), 0 0 84px rgba(150,220,255,0.22), 0 0 148px rgba(140,210,255,0.10); }
+            }
+            @keyframes mvfSubtitlePhosphor {
+              0%, 100% { opacity: 0.82; filter: brightness(1.02); text-shadow: 0 0 14px rgba(243,214,152,0.18), 0 0 38px rgba(243,214,152,0.08); }
+              38% { opacity: 0.96; filter: brightness(1.12); text-shadow: 0 0 22px rgba(243,214,152,0.30), 0 0 54px rgba(243,214,152,0.12); }
+              71% { opacity: 1; filter: brightness(1.52); text-shadow: 0 0 6px rgba(255,235,184,0.76), 0 0 30px rgba(243,214,152,0.40), 0 0 84px rgba(243,214,152,0.16); }
+              72.3% { opacity: 0.66; filter: brightness(0.86); text-shadow: 0 0 9px rgba(243,214,152,0.10); }
+              74% { opacity: 0.90; filter: brightness(1.08); text-shadow: 0 0 16px rgba(243,214,152,0.22), 0 0 42px rgba(243,214,152,0.08); }
+            }
+            @keyframes mvfLaunchPhosphor {
+              0%, 100% { opacity: 0.84; transform: scale(1); text-shadow: 0 0 14px rgba(176,255,218,0.24), 0 0 40px rgba(176,255,218,0.10), 0 0 86px rgba(176,255,218,0.05); }
+              42% { opacity: 1; transform: scale(1.016); text-shadow: 0 0 24px rgba(176,255,218,0.42), 0 0 68px rgba(176,255,218,0.18), 0 0 108px rgba(176,255,218,0.07); }
+              79% { opacity: 1; transform: scale(1.022); filter: brightness(1.62); text-shadow: 0 0 6px rgba(234,255,246,0.76), 0 0 30px rgba(176,255,218,0.58), 0 0 96px rgba(176,255,218,0.28), 0 0 140px rgba(176,255,218,0.10); }
+              80.5% { opacity: 0.58; transform: scale(0.998); filter: brightness(0.80); text-shadow: 0 0 8px rgba(176,255,218,0.12); }
+              82% { opacity: 1; transform: scale(1.010); filter: brightness(1.18); text-shadow: 0 0 20px rgba(176,255,218,0.34), 0 0 60px rgba(176,255,218,0.14); }
+            }
+            @keyframes mvfTraceFlicker {
+              0%, 100% { opacity: 0.72; }
+              6% { opacity: 0.42; }
+              8% { opacity: 0.9; }
+              38% { opacity: 0.64; }
+              41% { opacity: 0.84; }
+            }
+            @keyframes mvfHintSignal {
+              0% { transform: translateX(-110%); opacity: 0; }
+              16% { opacity: 0.78; }
+              58% { opacity: 0.26; }
+              100% { transform: translateX(112%); opacity: 0; }
+            }
+            @keyframes mvfHintCursor {
+              0%, 48% { opacity: 0.95; }
+              49%, 100% { opacity: 0.16; }
+            }
+            @keyframes mvfMetatronGhost {
+              0%, 100% { opacity: 0.58; filter: brightness(1); }
+              50% { opacity: 0.84; filter: brightness(1.18); }
+            }
+            @keyframes mvfPlatonicPulseA {
+              0%, 100% { opacity: 0.30; }
+              18%, 24% { opacity: 0.96; }
+              58% { opacity: 0.44; }
+            }
+            @keyframes mvfPlatonicPulseB {
+              0%, 100% { opacity: 0.26; }
+              34%, 40% { opacity: 0.92; }
+              75% { opacity: 0.40; }
+            }
+            @keyframes mvfPlatonicPulseC {
+              0%, 100% { opacity: 0.22; }
+              64%, 70% { opacity: 0.98; }
+              82% { opacity: 0.36; }
+            }
+          `}</style>
           <div
             aria-hidden
             style={{
               position: "absolute",
               inset: 0,
               pointerEvents: "none",
-              opacity: 0.12,
-              backgroundImage: "repeating-linear-gradient(180deg, rgba(170,220,255,0.22) 0px, rgba(170,220,255,0.22) 1px, transparent 1px, transparent 4px)",
+              opacity: 0.18,
+              backgroundImage: [
+                "linear-gradient(rgba(150,205,255,0.12) 1px, transparent 1px)",
+                "linear-gradient(90deg, rgba(150,205,255,0.10) 1px, transparent 1px)",
+                "repeating-linear-gradient(180deg, rgba(176,225,255,0.16) 0px, rgba(176,225,255,0.16) 1px, transparent 1px, transparent 4px)",
+                "radial-gradient(circle at center, transparent 0 28%, rgba(150,205,255,0.13) 28.2%, transparent 28.8%, transparent 45%, rgba(150,205,255,0.09) 45.2%, transparent 45.8%)",
+              ].join(", "),
+              backgroundSize: "48px 48px, 48px 48px, 100% 4px, 100% 100%",
               mixBlendMode: "screen",
+            }}
+          />
+          <div
+            aria-hidden
+            style={{
+              position: "absolute",
+              top: "-20vh",
+              bottom: "-20vh",
+              left: "48%",
+              width: 2,
+              pointerEvents: "none",
+              background: "linear-gradient(180deg, transparent, rgba(176,255,218,0.56), transparent)",
+              filter: "blur(1px)",
+              animation: "mvfScopeSweep 5.8s linear infinite",
             }}
           />
           <div
@@ -3028,53 +3164,55 @@ export default function MetatronVectorFOIL() {
               position: "absolute",
               inset: 14,
               pointerEvents: "none",
-              border: "1px solid rgba(152,206,255,0.08)",
-              boxShadow: "inset 0 0 28px rgba(90,150,210,0.06), 0 0 24px rgba(90,150,210,0.04)",
+              border: "1px solid rgba(152,206,255,0.10)",
+              boxShadow: "inset 0 0 42px rgba(90,150,210,0.08), 0 0 30px rgba(90,150,210,0.05)",
             }}
           />
 
-          <div style={{ position: "relative", zIndex: 2, display: "grid", gridTemplateRows: "auto 1fr", height: "100%" }}>
-            <div style={{ display: "grid", justifyItems: "center", gap: 8, marginTop: 48, textAlign: "center" }}>
-              <div style={{ fontSize: 10, letterSpacing: "0.38em", color: "rgba(144,198,245,0.74)" }}>{currentAttract.label}</div>
-              <div
-                style={{
-                  minHeight: 46,
-                  padding: "0 14px",
-                  fontSize: 34,
-                  letterSpacing: "0.18em",
-                  textTransform: "uppercase",
-                  color: `rgba(214,242,255,${featuredOpacity})`,
-                  textShadow: `0 0 ${18 + featuredGlow * 18}px rgba(160,220,255,${0.18 + featuredGlow * 0.28})`,
-                }}
-              >
-                {featuredHeadline}
+          <div style={{ position: "relative", zIndex: 2, display: "grid", gridTemplateRows: "auto minmax(0, 1fr) auto", height: "100%", gap: "clamp(10px, 2vh, 18px)" }}>
+            <div style={{ display: "grid", justifyItems: "center", gap: 7, textAlign: "center" }}>
+              <div style={{ fontSize: 10, letterSpacing: "0.42em", textTransform: "uppercase", color: "rgba(144,198,245,0.68)", animation: "mvfTraceFlicker 3.4s linear infinite" }}>
+                Live vector scope // attract mode
               </div>
               <div
                 style={{
-                  minHeight: 18,
-                  fontSize: 12,
-                  letterSpacing: "0.24em",
+                  fontSize: "clamp(28px, 5.6vw, 52px)",
+                  letterSpacing: "0.20em",
                   textTransform: "uppercase",
-                  color: `rgba(243,214,152,${0.72 + featuredGlow * 0.22})`,
-                  textShadow: `0 0 ${8 + featuredGlow * 8}px rgba(243,214,152,0.2)`,
+                  color: "rgba(218,244,255,0.96)",
+                  textShadow: "0 0 22px rgba(176,230,255,0.28), 0 0 62px rgba(160,220,255,0.14), 0 0 112px rgba(140,210,255,0.06)",
+                  lineHeight: 1.05,
+                  animation: "mvfTitlePhosphor 8.7s ease-in-out infinite",
                 }}
               >
-                {featuredSubline}
+                Metatron Vector Foil
+              </div>
+              <div style={{ fontSize: "clamp(10px, 1.55vw, 13px)", letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(243,214,152,0.78)", textShadow: "0 0 16px rgba(243,214,152,0.16), 0 0 42px rgba(243,214,152,0.08)", animation: "mvfSubtitlePhosphor 9.9s ease-in-out infinite" }}>
+                Defend Sol // Awaken the Tree // Surf the gravity well
+              </div>
+              <div style={{ marginTop: 4, display: "grid", justifyItems: "center", gap: 6 }}>
+                <div style={{ fontSize: "clamp(16px, 2.8vw, 24px)", letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(176,255,218,0.98)", textShadow: "0 0 16px rgba(176,255,218,0.22), 0 0 48px rgba(176,255,218,0.10)", animation: "mvfLaunchPhosphor 5.6s ease-in-out infinite", transformOrigin: "50% 50%" }}>
+                  Press Enter to Launch
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center", alignItems: "center", fontSize: 11, letterSpacing: "0.10em", color: "rgba(202,230,248,0.78)" }}>
+                  <Keycap>A/D</Keycap><span>Rotate</span>
+                  <Keycap>W</Keycap><span>Thrust</span>
+                  <Keycap>S</Keycap><span>Brake</span>
+                  <Keycap>Space</Keycap><span>Fire</span>
+                  <Keycap>P</Keycap><span>Pause</span>
+                </div>
               </div>
             </div>
 
-            <div style={{ display: "grid", placeItems: "center", marginTop: 18 }}>
-              <div style={{ width: "min(980px, 95vw)", display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: 18, alignItems: "stretch" }}>
-                <VectorFrame title="PILOT SCHOOL // INSERT COIN">
+            <div style={{ display: "grid", placeItems: "center", minHeight: 0 }}>
+              <div style={{ width: "min(1140px, 96vw)", display: "grid", gridTemplateColumns: "minmax(286px, 398px) minmax(42px, 1fr) minmax(286px, 420px)", gap: "clamp(12px, 2vw, 20px)", alignItems: "end" }}>
+                <VectorFrame title="PILOT // IDENTITY TRACE">
                   <div style={{ display: "grid", gap: 10 }}>
-                    <div style={{ fontSize: 22, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(243,214,152,0.96)", textShadow: "0 0 12px rgba(243,214,152,0.18)" }}>
-                      {insertCoinLines[0] ?? DEFAULT_INSERT_COIN_LINES[0]}
+                    <div style={{ fontSize: 15, lineHeight: 1.3, letterSpacing: "0.13em", textTransform: "uppercase", color: "rgba(176,255,218,0.86)", textShadow: "0 0 12px rgba(145,255,212,0.12)" }}>
+                      {publicBoardStatus}
                     </div>
-                    <div style={{ fontSize: 20, letterSpacing: "0.18em", textTransform: "uppercase", color: currentAttract.id === "start" || currentAttract.id === "dual" ? `rgba(176,255,218,${0.5 + featuredGlow * 0.45})` : "rgba(176,255,218,0.72)", textShadow: `0 0 ${10 + featuredGlow * 8}px rgba(145,255,212,0.24)` }}>
-                      {insertCoinLines[1] ?? DEFAULT_INSERT_COIN_LINES[1]}
-                    </div>
-                    <div style={{ fontSize: 11, letterSpacing: "0.18em", color: "rgba(170,214,248,0.72)", textTransform: "uppercase" }}>
-                      {insertCoinLines[2] ?? DEFAULT_INSERT_COIN_LINES[2]}
+                    <div style={{ fontSize: 11, lineHeight: 1.55, letterSpacing: "0.08em", color: "rgba(188,220,244,0.72)" }}>
+                      Fly now. Sign in only when you want a three-character callsign engraved on the public honor board.
                     </div>
                   </div>
 
@@ -3096,41 +3234,71 @@ export default function MetatronVectorFOIL() {
                     onLogout={logoutPlayer}
                   />
 
-                  <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "auto 1fr", gap: 10, alignItems: "center" }}>
-                    <Keycap>Enter</Keycap><span style={{ opacity: 0.92 }}>Launch</span>
-                    <Keycap>A/D</Keycap><span style={{ opacity: 0.86 }}>Rotate the foil</span>
-                    <Keycap>W</Keycap><span style={{ opacity: 0.86 }}>Thrust and catch light</span>
-                    <Keycap>S</Keycap><span style={{ opacity: 0.86 }}>Brake with drag</span>
-                    <Keycap>Space</Keycap><span style={{ opacity: 0.86 }}>Fire a salvo</span>
-                    <Keycap>P</Keycap><span style={{ opacity: 0.86 }}>Pause / tune the universe</span>
-                  </div>
-
-                  <div style={{ marginTop: 16, display: "grid", gap: 6, fontSize: 10, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(140,198,244,0.62)" }}>
-                    <div>Gravitic trace stable</div>
-                    <div>Solution envelope nominal</div>
-                    <div>Further in. Faster through.</div>
-                  </div>
+                  <LeaderboardConsole entries={leaderboard} status={scoreSubmitStatus} compact />
                 </VectorFrame>
 
-                <VectorFrame title="FLIGHT HINT // ATTRACT MODE">
-                  <div style={{ minHeight: 96, display: "grid", gap: 10, alignContent: "start" }}>
-                    <div style={{ fontSize: 22, lineHeight: 1.28, color: "rgba(243,214,152,0.96)", textShadow: "0 0 10px rgba(243,214,152,0.12)" }}>
-                      {flightHints[menuHintIdx] ?? DEFAULT_FLIGHT_HINTS[0]}
+                <div aria-hidden style={{ alignSelf: "stretch", minHeight: 220, display: "grid", placeItems: "center", pointerEvents: "none" }}>
+                  <GhostMetatronCube glow={featuredGlow} opacity={featuredOpacity} headline={featuredHeadline} subline={featuredSubline} />
+                </div>
+
+                <VectorFrame title="FLIGHT SCHOOL // ORBITAL TRACE">
+                  <div
+                    style={{
+                      position: "relative",
+                      overflow: "hidden",
+                      minHeight: 162,
+                      padding: "13px 14px 15px",
+                      border: "1px solid rgba(150,205,255,0.14)",
+                      background: "linear-gradient(180deg, rgba(6,18,28,0.58), rgba(0,0,0,0.18))",
+                      boxShadow: "inset 0 0 34px rgba(110,190,255,0.055), 0 0 18px rgba(110,190,255,0.035)",
+                      opacity: menuHintOpacity,
+                      transition: "opacity 80ms linear",
+                    }}
+                  >
+                    <div
+                      aria-hidden
+                      style={{
+                        position: "absolute",
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        height: 2,
+                        background: "linear-gradient(90deg, transparent, rgba(176,255,218,0.72), transparent)",
+                        animation: "mvfHintSignal 2.25s linear infinite",
+                      }}
+                    />
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "baseline", marginBottom: 12 }}>
+                      <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.62)" }}>
+                        Guidance teletype
+                      </div>
+                      <div style={{ fontSize: 10, letterSpacing: "0.16em", textTransform: "uppercase", color: menuHintBlinking ? "rgba(243,214,152,0.84)" : "rgba(176,255,218,0.58)" }}>
+                        {menuHintBlinking ? "Cycling trace" : menuHintCounter}
+                      </div>
                     </div>
-                    <div style={{ fontSize: 11, lineHeight: 1.55, color: "rgba(170,214,248,0.7)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
-                      Burn prograde to raise apoapsis. Burn retrograde to fall inward. Slingshots reward courage and geometry.
+                    <div style={{ minHeight: 70, display: "flex", alignItems: "center" }}>
+                      <div style={{ fontSize: "clamp(22px, 2.75vw, 31px)", lineHeight: 1.18, letterSpacing: "0.025em", color: "rgba(255,226,158,0.98)", textShadow: "0 0 14px rgba(243,214,152,0.19), 0 0 30px rgba(243,214,152,0.06)" }}>
+                        {typedMenuFlightHint}
+                        {menuHintTypingHeadline && menuHintCursorOn ? <span style={{ color: "rgba(176,255,218,0.92)", animation: "mvfHintCursor 640ms steps(1, end) infinite" }}>▌</span> : null}
+                      </div>
+                    </div>
+                    <div style={{ minHeight: 42, marginTop: 12, paddingTop: 11, borderTop: "1px solid rgba(150,205,255,0.11)", fontSize: "clamp(12px, 1.2vw, 14px)", lineHeight: 1.55, color: "rgba(213,235,249,0.82)", letterSpacing: "0.075em" }}>
+                      {typedMenuFlightDetail}
+                      {menuHintTypingDetail && menuHintCursorOn ? <span style={{ color: "rgba(176,255,218,0.76)", animation: "mvfHintCursor 640ms steps(1, end) infinite" }}>▌</span> : null}
                     </div>
                   </div>
 
-                  <div style={{ marginTop: 22, display: "grid", gap: 8 }}>
-                    <VectorTelemetry label="NEXT MESSAGE" value={attractSequence[(attractIdx + 1) % attractSequence.length].headline} />
-                    <VectorTelemetry label="ALERT BUS" value={playerIdentity.callsign ? `PILOT ${playerIdentity.callsign} INDEXED` : playerIdentity.authenticated ? "CALLSIGN REQUIRED" : "LOGIN REQUIRED"} />
-                    <VectorTelemetry label="TREE STATUS" value="AWAKEN WHAT YOU TOUCH" />
+                  <div style={{ marginTop: 15, display: "grid", gridTemplateColumns: "1fr", gap: 8 }}>
+                    <VectorTelemetry label="Tree Status" value="DORMANT // AWAKEN WHAT YOU TOUCH" />
+                    <VectorTelemetry label="Scope Signal" value={featuredSubline} />
                   </div>
-
-                  <LeaderboardConsole entries={leaderboard} status={scoreSubmitStatus} />
                 </VectorFrame>
               </div>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "center", gap: 18, flexWrap: "wrap", fontSize: 10, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(140,198,244,0.56)" }}>
+              <span>Graticule stable</span>
+              <span>Solution envelope nominal</span>
+              <span>Further in. Faster through.</span>
             </div>
           </div>
         </div>
@@ -3216,20 +3384,136 @@ export default function MetatronVectorFOIL() {
 }
 
 // ===================== UI COMPONENTS =====================
+function GhostMetatronCube({ glow, opacity, headline, subline }: { glow: number; opacity: number; headline: string; subline: string }) {
+  const outer = [
+    [0, -110],
+    [95, -55],
+    [95, 55],
+    [0, 110],
+    [-95, 55],
+    [-95, -55],
+  ] as const;
+  const inner = [
+    [0, -64],
+    [55, -32],
+    [55, 32],
+    [0, 64],
+    [-55, 32],
+    [-55, -32],
+  ] as const;
+  const cubeFront = [
+    [-48, -48],
+    [48, -48],
+    [48, 48],
+    [-48, 48],
+  ] as const;
+  const cubeBack = [
+    [-12, -82],
+    [82, -12],
+    [12, 82],
+    [-82, 12],
+  ] as const;
+  const tetra = [outer[0], outer[2], outer[4]] as const;
+  const octa = [outer[0], outer[1], outer[3], outer[5]] as const;
+  const line = (a: readonly [number, number], b: readonly [number, number], key: string, stroke: string, strokeWidth: number, extra?: React.CSSProperties) => (
+    <line key={key} x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} stroke={stroke} strokeWidth={strokeWidth} style={extra} />
+  );
+  const ringLines = outer.map((p, i) => line(p, outer[(i + 1) % outer.length], `outer-${i}`, "rgba(158,214,255,0.24)", 1.1));
+  const innerLines = inner.map((p, i) => line(p, inner[(i + 1) % inner.length], `inner-${i}`, "rgba(176,255,218,0.28)", 1.0));
+  const spokes = inner.map((p, i) => line([0, 0], p, `spoke-${i}`, "rgba(150,205,255,0.22)", 1.0));
+  const connectors = outer.flatMap((p, i) => [
+    line(p, inner[i], `connector-a-${i}`, "rgba(150,205,255,0.20)", 0.95),
+    line(p, inner[(i + outer.length - 1) % inner.length], `connector-b-${i}`, "rgba(150,205,255,0.16)", 0.9),
+  ]);
+  const star = [0, 1].flatMap(offset => outer.map((p, i) => line(p, outer[(i + 2 + offset) % outer.length], `star-${offset}-${i}`, "rgba(150,205,255,0.10)", 0.9)));
+  return (
+    <div
+      style={{
+        position: "relative",
+        width: "min(29vw, 290px)",
+        minWidth: 110,
+        aspectRatio: "1 / 1",
+        opacity: 0.54 + opacity * 0.34,
+        filter: `drop-shadow(0 0 ${18 + glow * 18}px rgba(140,210,255,0.14)) drop-shadow(0 0 ${42 + glow * 28}px rgba(176,255,218,0.08))`,
+      }}
+    >
+      <svg viewBox="-140 -140 280 280" style={{ width: "100%", height: "100%", overflow: "visible" }}>
+        <defs>
+          <filter id="mvfMetaGlow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="1.8" result="blur" />
+            <feMerge>
+              <feMergeNode in="blur" />
+              <feMergeNode in="SourceGraphic" />
+            </feMerge>
+          </filter>
+          <radialGradient id="mvfMetaCore" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stopColor="rgba(214,245,255,0.92)" />
+            <stop offset="28%" stopColor="rgba(176,255,218,0.32)" />
+            <stop offset="100%" stopColor="rgba(176,255,218,0)" />
+          </radialGradient>
+        </defs>
+        <g fill="none" strokeLinecap="round" filter="url(#mvfMetaGlow)" style={{ mixBlendMode: "screen" }}>
+          <g style={{ animation: "mvfMetatronGhost 8.6s ease-in-out infinite" }} opacity={0.42 + glow * 0.16}>
+            {ringLines}
+            {innerLines}
+            {spokes}
+            {connectors}
+            {star}
+          </g>
+          <g style={{ animation: "mvfPlatonicPulseA 7.2s ease-in-out infinite" }}>
+            {line(tetra[0], tetra[1], "tetra-a", "rgba(255,224,164,0.92)", 1.8)}
+            {line(tetra[1], tetra[2], "tetra-b", "rgba(255,224,164,0.92)", 1.8)}
+            {line(tetra[2], tetra[0], "tetra-c", "rgba(255,224,164,0.92)", 1.8)}
+            {line([0, 0], tetra[0], "tetra-d", "rgba(255,238,196,0.84)", 1.45)}
+            {line([0, 0], tetra[1], "tetra-e", "rgba(255,238,196,0.84)", 1.45)}
+            {line([0, 0], tetra[2], "tetra-f", "rgba(255,238,196,0.84)", 1.45)}
+          </g>
+          <g style={{ animation: "mvfPlatonicPulseB 8.4s ease-in-out infinite" }}>
+            {cubeFront.map((p, i) => line(p, cubeFront[(i + 1) % cubeFront.length], `cube-front-${i}`, "rgba(178,236,255,0.92)", 1.75))}
+            {cubeBack.map((p, i) => line(p, cubeBack[(i + 1) % cubeBack.length], `cube-back-${i}`, "rgba(178,236,255,0.72)", 1.55))}
+            {cubeFront.map((p, i) => line(p, cubeBack[i], `cube-link-${i}`, "rgba(178,236,255,0.78)", 1.45))}
+          </g>
+          <g style={{ animation: "mvfPlatonicPulseC 9.1s ease-in-out infinite" }}>
+            {line(octa[0], octa[1], "oct-a", "rgba(176,255,218,0.90)", 1.7)}
+            {line(octa[1], octa[2], "oct-b", "rgba(176,255,218,0.90)", 1.7)}
+            {line(octa[2], octa[3], "oct-c", "rgba(176,255,218,0.90)", 1.7)}
+            {line(octa[3], octa[0], "oct-d", "rgba(176,255,218,0.90)", 1.7)}
+            {line([0, 0], octa[0], "oct-e", "rgba(176,255,218,0.72)", 1.35)}
+            {line([0, 0], octa[1], "oct-f", "rgba(176,255,218,0.72)", 1.35)}
+            {line([0, 0], octa[2], "oct-g", "rgba(176,255,218,0.72)", 1.35)}
+            {line([0, 0], octa[3], "oct-h", "rgba(176,255,218,0.72)", 1.35)}
+          </g>
+        </g>
+        <circle cx="0" cy="0" r="16" fill="url(#mvfMetaCore)" opacity={0.44 + glow * 0.16} />
+      </svg>
+      <div style={{ position: "absolute", inset: 0, background: "radial-gradient(circle at center, rgba(144,206,255,0.06), transparent 52%)", animation: "mvfMetatronGhost 8.6s ease-in-out infinite" }} />
+      <div style={{ position: "absolute", left: "50%", bottom: -20, transform: "translateX(-50%)", width: 230, maxWidth: "72vw", textAlign: "center", fontSize: 9, letterSpacing: "0.28em", textTransform: "uppercase", color: `rgba(174,233,255,${0.46 + glow * 0.22})`, textShadow: "0 0 12px rgba(160,220,255,0.16)" }}>
+        Ghost Metatron Trace
+      </div>
+      <div style={{ position: "absolute", left: "50%", bottom: -36, transform: "translateX(-50%)", width: 230, maxWidth: "72vw", textAlign: "center", fontSize: 8, letterSpacing: "0.20em", textTransform: "uppercase", color: `rgba(202,230,248,${0.38 + glow * 0.16})` }}>
+        {headline} // {subline}
+      </div>
+    </div>
+  );
+}
+
 function VectorFrame({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div style={{
       position: "relative",
-      minHeight: 280,
-      border: "1px solid rgba(150,205,255,0.22)",
-      boxShadow: "inset 0 0 28px rgba(100,170,230,0.05), 0 0 18px rgba(100,170,230,0.04)",
-      background: "rgba(6,16,24,0.14)",
-      padding: "16px 18px 18px 18px",
+      minHeight: 248,
+      border: "1px solid rgba(150,205,255,0.18)",
+      boxShadow: "inset 0 0 34px rgba(100,170,230,0.055), 0 0 20px rgba(100,170,230,0.045)",
+      background: "linear-gradient(180deg, rgba(5,13,22,0.52), rgba(2,7,12,0.28))",
+      padding: "15px 17px 17px 17px",
       overflow: "hidden",
     }}>
-      <div aria-hidden style={{ position: "absolute", inset: 8, border: "1px solid rgba(150,205,255,0.08)", pointerEvents: "none" }} />
+      <div aria-hidden style={{ position: "absolute", inset: 8, border: "1px solid rgba(150,205,255,0.065)", pointerEvents: "none" }} />
+      <div aria-hidden style={{ position: "absolute", inset: 0, opacity: 0.13, pointerEvents: "none", backgroundImage: "linear-gradient(rgba(150,205,255,0.17) 1px, transparent 1px), linear-gradient(90deg, rgba(150,205,255,0.12) 1px, transparent 1px)", backgroundSize: "22px 22px" }} />
+      <div aria-hidden style={{ position: "absolute", left: 0, top: 0, width: 32, height: 32, borderLeft: "1px solid rgba(176,255,218,0.30)", borderTop: "1px solid rgba(176,255,218,0.30)" }} />
+      <div aria-hidden style={{ position: "absolute", right: 0, bottom: 0, width: 32, height: 32, borderRight: "1px solid rgba(243,214,152,0.24)", borderBottom: "1px solid rgba(243,214,152,0.24)" }} />
       <div style={{ position: "relative", zIndex: 1 }}>
-        <div style={{ marginBottom: 14, fontSize: 11, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(150,205,255,0.7)" }}>{title}</div>
+        <div style={{ marginBottom: 13, fontSize: 10, letterSpacing: "0.28em", textTransform: "uppercase", color: "rgba(150,205,255,0.68)" }}>{title}</div>
         {children}
       </div>
     </div>
@@ -3279,23 +3563,40 @@ function CallsignConsole({
   onLogout: () => void;
 }) {
   const canSubmit = authenticated && canChoose && /^[A-Za-z0-9]{3}$/.test(value);
-  const status = current ? `ACTIVE // ${current}` : authenticated ? "AUTHENTICATED" : "LOGIN REQUIRED";
+  const status = current
+    ? `CALLSIGN ${current}`
+    : authenticated
+      ? "READY TO CLAIM"
+      : "ANONYMOUS";
+  const guidance = current
+    ? "Public runs publish under this callsign."
+    : authenticated
+      ? "Choose exactly three letters or digits."
+      : "Local runs start immediately; public runs need sign-in.";
+  const authLine = authenticated ? `Signed in // ${authProvider}` : "Public board optional";
+  const showMessage = Boolean(message)
+    && !message.toLowerCase().startsWith("log in before")
+    && !message.toLowerCase().includes("public board stores");
   return (
-    <div style={{ marginTop: 18, display: "grid", gap: 8, padding: 10, border: "1px solid rgba(150,205,255,0.14)", background: "rgba(0,0,0,0.18)" }}>
+    <div style={{ marginTop: 14, display: "grid", gap: 9, padding: 10, border: "1px solid rgba(150,205,255,0.12)", background: "rgba(0,0,0,0.20)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-        <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.58)" }}>Pilot Callsign</div>
-        <div style={{ fontSize: 11, letterSpacing: "0.18em", color: current ? "rgba(176,255,218,0.82)" : authenticated ? "rgba(243,214,152,0.72)" : "rgba(255,150,150,0.72)" }}>
+        <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.58)" }}>Callsign</div>
+        <div style={{ fontSize: 11, letterSpacing: "0.16em", textTransform: "uppercase", color: current ? "rgba(176,255,218,0.84)" : authenticated ? "rgba(243,214,152,0.72)" : "rgba(170,214,248,0.64)" }}>
           {status}
         </div>
       </div>
 
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(170,214,248,0.62)" }}>
-        <span>Auth: {authProvider}</span>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", fontSize: 10, letterSpacing: "0.10em", textTransform: "uppercase", color: "rgba(170,214,248,0.60)" }}>
+        <span>{authLine}</span>
         {authenticated && <button type="button" onClick={onLogout} style={{ ...btnStyle, padding: "4px 7px", fontSize: 10 }}>Logout</button>}
       </div>
 
+      <div style={{ fontSize: 10, lineHeight: 1.45, letterSpacing: "0.08em", color: "rgba(190,224,248,0.70)" }}>
+        {guidance}
+      </div>
+
       {devAuthEnabled && !authenticated && (
-        <div style={{ display: "flex", gap: 8, alignItems: "center", padding: 8, border: "1px dashed rgba(243,214,152,0.25)", background: "rgba(243,214,152,0.04)" }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", padding: 8, border: "1px dashed rgba(243,214,152,0.22)", background: "rgba(243,214,152,0.035)" }}>
           <input
             value={devHandle}
             maxLength={48}
@@ -3341,7 +3642,7 @@ function CallsignConsole({
                 boxShadow: "0 0 16px rgba(145,255,212,0.08)",
               }}
             >
-              Login with Google
+              Sign in for board
             </button>
           ) : (
             <button
@@ -3349,15 +3650,15 @@ function CallsignConsole({
               disabled
               style={{ ...btnStyle, opacity: 0.42, cursor: "not-allowed" }}
             >
-              Login unavailable
+              Board offline
             </button>
           )}
-          <span style={{ fontSize: 10, letterSpacing: "0.10em", textTransform: "uppercase", color: "rgba(170,214,248,0.58)" }}>
-            Then claim a 3-character callsign.
+          <span style={{ fontSize: 10, letterSpacing: "0.10em", textTransform: "uppercase", color: "rgba(170,214,248,0.56)" }}>
+            Play remains available.
           </span>
         </div>
       ) : (
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <input
             value={value}
             maxLength={3}
@@ -3395,18 +3696,19 @@ function CallsignConsole({
             disabled={!canSubmit}
             style={{ ...btnStyle, opacity: canSubmit ? 1 : 0.44, cursor: canSubmit ? "pointer" : "not-allowed" }}
           >
-            Set callsign
+            Claim
           </button>
         </div>
       )}
-      <div style={{ fontSize: 10, lineHeight: 1.45, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(170,214,248,0.64)" }}>
-        {message} Public board stores callsign and score, not Google name or email.
+
+      <div style={{ fontSize: 9, lineHeight: 1.45, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(170,214,248,0.52)" }}>
+        {showMessage ? message : "Public board stores callsign and score only."}
       </div>
     </div>
   );
 }
 
-function LeaderboardConsole({ entries, status }: { entries: LeaderboardEntry[]; status: ScoreSubmitStatus }) {
+function LeaderboardConsole({ entries, status, compact = false }: { entries: LeaderboardEntry[]; status: ScoreSubmitStatus; compact?: boolean }) {
   const statusText = status === "submitted"
     ? "LAST RUN PUBLISHED"
     : status === "submitting"
@@ -3419,7 +3721,7 @@ function LeaderboardConsole({ entries, status }: { entries: LeaderboardEntry[]; 
           ? "LAST RUN NOT ACCEPTED"
           : "PUBLIC HONOR BOARD";
   return (
-    <div style={{ marginTop: 18, display: "grid", gap: 8, paddingTop: 12, borderTop: "1px solid rgba(150,205,255,0.12)" }}>
+    <div style={{ marginTop: compact ? 14 : 18, display: "grid", gap: compact ? 6 : 8, paddingTop: compact ? 10 : 12, borderTop: "1px solid rgba(150,205,255,0.12)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
         <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.56)" }}>Top Callsigns</div>
         <div style={{ fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase", color: "rgba(243,214,152,0.68)" }}>{statusText}</div>
@@ -3430,13 +3732,13 @@ function LeaderboardConsole({ entries, status }: { entries: LeaderboardEntry[]; 
         </div>
       ) : (
         <div style={{ display: "grid", gap: 5 }}>
-          {entries.slice(0, 7).map((entry) => (
-            <div key={`${entry.rank}-${entry.callsign}-${entry.score}`} style={{ display: "grid", gridTemplateColumns: "2.5ch 4ch 1fr 5ch 6ch", gap: 8, alignItems: "baseline", fontSize: 12, letterSpacing: "0.08em", color: "rgba(222,242,255,0.82)" }}>
+          {entries.slice(0, compact ? 3 : 5).map((entry) => (
+            <div key={`${entry.rank}-${entry.callsign}-${entry.score}`} style={{ display: "grid", gridTemplateColumns: compact ? "2.2ch 4ch 1fr 4.5ch" : "2.5ch 4ch 1fr 5ch 6ch", gap: compact ? 6 : 8, alignItems: "baseline", fontSize: compact ? 11 : 12, letterSpacing: "0.08em", color: "rgba(222,242,255,0.82)" }}>
               <span style={{ color: "rgba(150,205,255,0.48)" }}>{entry.rank}</span>
               <span style={{ color: "rgba(176,255,218,0.9)", fontWeight: 700 }}>{entry.callsign}</span>
               <span style={{ textAlign: "right" }}>{entry.score.toLocaleString()}</span>
               <span style={{ color: "rgba(243,214,152,0.72)" }}>W{entry.wave}</span>
-              <span style={{ color: "rgba(150,205,255,0.58)" }}>{formatLeaderboardTime(entry.survivalTimeSec)}</span>
+              {!compact ? <span style={{ color: "rgba(150,205,255,0.58)" }}>{formatLeaderboardTime(entry.survivalTimeSec)}</span> : null}
             </div>
           ))}
         </div>
