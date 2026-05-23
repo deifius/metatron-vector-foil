@@ -463,7 +463,8 @@ type AudioSampleKey =
   | "nextWave"
   | "oortBreak"
   | "oortStrike"
-  | "oortDust";
+  | "oortDust"
+  | "sphereActivate";
 
 class AudioEngine {
   ctx: AudioContext | null = null;
@@ -492,6 +493,7 @@ class AudioEngine {
     oortBreak: null,
     oortStrike: null,
     oortDust: null,
+    sphereActivate: null,
   };
   sampleLoads = new Set<AudioSampleKey>();
 
@@ -561,6 +563,7 @@ class AudioEngine {
     this.loadSample("oortBreak", T.AUDIO_OORT_BREAK_URL);
     this.loadSample("oortStrike", T.AUDIO_OORT_STRIKE_URL);
     this.loadSample("oortDust", T.AUDIO_OORT_DUST_URL);
+    this.loadSample("sphereActivate", T.AUDIO_SPHERE_ACTIVATE_URL);
   }
 
   async ensureDroneBuffer() {
@@ -839,6 +842,13 @@ class AudioEngine {
     if (!this.playSample("oortStrike", T.AUDIO_OORT_STRIKE_GAIN, rand(0.94, 1.06))) {
       this.hit();
     }
+  }
+  sphereActivate() {
+    if (this.playSample("sphereActivate", T.AUDIO_SPHERE_ACTIVATE_GAIN, rand(0.96, 1.04))) return;
+    // Fallback: a small glass-bell chord, so missing optional WAVs do not leave the awakening silent.
+    this.blip(432, 0.16, 0.11);
+    this.blip(648, 0.18, 0.085);
+    this.blip(864, 0.20, 0.065);
   }
   nextWave() {
     if (!this.playSample("nextWave", T.AUDIO_NEXT_WAVE_GAIN)) {
@@ -1382,7 +1392,11 @@ export default function MetatronVectorFOIL() {
       pos: new V2(metaRadius, 0),
       vel: new V2(0, 0),
       angle: 0,
+      angularVel: 0,
       thrust: 0,
+      brakeAnim: 0,
+      thrustGlow: 0,
+      inActivatedSphere: false,
       fuel: T.FUEL_MAX,
       stuckTime: 0,
       hitsTaken: 0,
@@ -1563,6 +1577,10 @@ export default function MetatronVectorFOIL() {
       const v0 = Math.sqrt((gm) / metaRadius) * T.ORBIT_GAIN;
       player.vel = new V2(0, v0);
       player.angle = Math.atan2(player.vel.y, player.vel.x);
+      player.angularVel = 0;
+      player.brakeAnim = 0;
+      player.thrustGlow = 0;
+      player.inActivatedSphere = false;
       player.fuel = T.FUEL_MAX;
       player.stuckTime = 0;
       player.hitsTaken = 0;
@@ -2076,11 +2094,46 @@ export default function MetatronVectorFOIL() {
       return awardPoints(scoreForEnemy(key) + nearSolBonus + extra, "destruction", { countsTowardChain: true });
     };
 
+    const activatedSphereMediumAt = (point: V2) => {
+      let depth = 0;
+      let nodeIndex = -1;
+      let nodeKind: MetaNodeKind | null = null;
+      let overcharged = false;
+
+      for (const node of metaNodes) {
+        if (node.kind === "center" || !node.awakened) continue;
+        const nodePos = metaNodeWorld[node.index];
+        if (!nodePos) continue;
+        const d = point.copy().sub(nodePos).len();
+        if (d > T.META_CIRCLE_RADIUS) continue;
+        const localDepth = 1 - d / Math.max(1, T.META_CIRCLE_RADIUS);
+        if (localDepth > depth) {
+          depth = localDepth;
+          nodeIndex = node.index;
+          nodeKind = node.kind;
+          overcharged = node.overcharged;
+        }
+      }
+
+      return { inside: depth > 0, depth, nodeIndex, nodeKind, overcharged };
+    };
+
+    const applyActivatedSphereMediumDrag = (vel: V2, point: V2, dt: number, dragPerSecond: number) => {
+      if (dragPerSecond <= 0) return 0;
+      const medium = activatedSphereMediumAt(point);
+      if (!medium.inside) return 0;
+      const factor = Math.exp(-dragPerSecond * medium.depth * dt);
+      vel.mul(clamp(factor, 0, 1));
+      return medium.depth;
+    };
+
     const getMetaNodeBonuses = () => {
       let passiveFuel = 0;
       let sphereFuel = 0;
       let shieldRepair = 0;
       let occupiedNode = -1;
+      let insideAwakenedSphere = false;
+      let mediumDepth = 0;
 
       for (const node of metaNodes) {
         if (node.kind === "center") continue;
@@ -2094,6 +2147,8 @@ export default function MetatronVectorFOIL() {
         passiveFuel = Math.max(passiveFuel, passive);
 
         if (node.awakened) {
+          insideAwakenedSphere = true;
+          mediumDepth = Math.max(mediumDepth, 1 - d / Math.max(1, T.META_CIRCLE_RADIUS));
           const sphereFuelRate = node.kind === "outer" ? T.META_SPHERE_FUEL_OUTER : T.META_SPHERE_FUEL_INNER;
           const shieldRateBase = node.kind === "outer" ? T.META_SPHERE_SHIELD_REGEN_OUTER : T.META_SPHERE_SHIELD_REGEN;
           sphereFuel = Math.max(sphereFuel, sphereFuelRate);
@@ -2101,7 +2156,7 @@ export default function MetatronVectorFOIL() {
         }
       }
 
-      return { passiveFuel, sphereFuel, shieldRepair, occupiedNode };
+      return { passiveFuel, sphereFuel, shieldRepair, occupiedNode, insideAwakenedSphere, mediumDepth };
     };
 
     const settleFuelBitsFromShards = (dt: number) => {
@@ -2141,6 +2196,48 @@ export default function MetatronVectorFOIL() {
       const filament = 0.5 + 0.5 * Math.sin(a * 7 + timeSec * 0.17 + Math.sin(r * 0.018));
       const glitter = 0.5 + 0.5 * Math.sin(a * 17 - timeSec * 0.11 + r * 0.041);
       return clamp(radial * (0.34 + 0.46 * filament + 0.20 * glitter), 0, 1);
+    };
+
+    const oortMediumDepthAt = (p: V2, timeSec: number) => {
+      if (!T.OORT_CONSTELLATIONS_ENABLED) return 0;
+      return smoothstep(0.05, 0.55, oortDustDensityAt(p, timeSec));
+    };
+
+    const applyOortPassiveDrag = (dt: number, timeSec: number) => {
+      if (!T.OORT_CONSTELLATIONS_ENABLED || T.OORT_PASSIVE_DRAG <= 0) return 0;
+      const depth = oortMediumDepthAt(player.pos, timeSec);
+      if (depth <= 0) return 0;
+      player.vel.mul(clamp(Math.exp(-T.OORT_PASSIVE_DRAG * depth * dt), 0, 1));
+      return depth;
+    };
+
+    const applyOortInwardPressure = (dt: number) => {
+      if (!T.OORT_INWARD_PRESSURE_ENABLED || T.OORT_INWARD_PRESSURE_ACCEL <= 0) return 0;
+      const r = player.pos.len();
+      const startR = oortOuter * T.OORT_INWARD_PRESSURE_START_MULT;
+      const fullR = oortOuter * T.OORT_INWARD_PRESSURE_FULL_MULT;
+      if (r <= startR) return 0;
+      const inward = player.pos.copy().mul(-1);
+      if (inward.len() <= 0.0001) return 0;
+      const pressure = smoothstep(startR, fullR, r) * T.OORT_INWARD_PRESSURE_ACCEL;
+      player.vel.add(inward.norm().mul(pressure * dt));
+      return pressure;
+    };
+
+    const applyOortCollisionRecovery = () => {
+      if (T.OORT_COLLISION_SPEED_DAMPING > 0) {
+        player.vel.mul(clamp(T.OORT_COLLISION_SPEED_DAMPING, 0, 1));
+      }
+      const bias = clamp(T.OORT_COLLISION_INWARD_BIAS, 0, 1);
+      if (bias <= 0) return;
+      const speed = player.vel.len();
+      const inward = player.pos.copy().mul(-1);
+      if (speed <= 0.0001 || inward.len() <= 0.0001) return;
+      const biased = player.vel.copy().norm().mul(1 - bias).add(inward.norm().mul(bias));
+      if (biased.len() <= 0.0001) return;
+      const next = biased.norm().mul(speed);
+      player.vel.x = next.x;
+      player.vel.y = next.y;
     };
 
     const applyOortAmbientAbrasion = (dt: number, timeSec: number) => {
@@ -2208,7 +2305,9 @@ export default function MetatronVectorFOIL() {
         if (struck) {
           c.pulseUntil = timeSec + 0.72;
           const damage = (T.OORT_COLLISION_BASE_DAMAGE + speed * T.OORT_COLLISION_SPEED_DAMAGE) * c.hazard;
-          return applyShipHit(center, "oort", damage, T.OORT_COLLISION_KNOCKBACK);
+          const died = applyShipHit(center, "oort", damage, T.OORT_COLLISION_KNOCKBACK);
+          if (!died) applyOortCollisionRecovery();
+          return died;
         }
       }
       return false;
@@ -2338,8 +2437,24 @@ export default function MetatronVectorFOIL() {
       player.hitInvuln = Math.max(0, player.hitInvuln - dt);
 
       // ---- ship input (A/D + W/S) ----
-      if (keys.has("a") || keys.has("A") || keys.has("ArrowLeft")) player.angle -= T.ROT_SPEED * dt;
-      if (keys.has("d") || keys.has("D") || keys.has("ArrowRight")) player.angle += T.ROT_SPEED * dt;
+      const turnLeft = keys.has("a") || keys.has("A") || keys.has("ArrowLeft");
+      const turnRight = keys.has("d") || keys.has("D") || keys.has("ArrowRight");
+      const turnInput = (turnRight ? 1 : 0) - (turnLeft ? 1 : 0);
+      if (T.SHIP_ROTATIONAL_INERTIA_ENABLED) {
+        player.angularVel = clamp(
+          player.angularVel + turnInput * T.SHIP_ANGULAR_ACCEL * dt,
+          -T.SHIP_MAX_ANGULAR_SPEED,
+          T.SHIP_MAX_ANGULAR_SPEED,
+        );
+        if (turnInput === 0 && T.SHIP_ANGULAR_DAMPING > 0) {
+          player.angularVel *= Math.exp(-T.SHIP_ANGULAR_DAMPING * dt);
+        }
+        player.angle += player.angularVel * dt;
+      } else {
+        player.angularVel = 0;
+        if (turnLeft) player.angle -= T.ROT_SPEED * dt;
+        if (turnRight) player.angle += T.ROT_SPEED * dt;
+      }
 
       const want = (keys.has("w") || keys.has("W") || keys.has("ArrowUp")) ? 1 : ((keys.has("s") || keys.has("S") || keys.has("ArrowDown")) ? -1 : 0);
       player.thrust = lerp(player.thrust, want, want !== 0 ? 0.16 : 0.10);
@@ -2351,6 +2466,7 @@ export default function MetatronVectorFOIL() {
       if (use > 0.03 && player.fuel > 0) player.fuel = Math.max(0, player.fuel - T.FUEL_BURN * use * dt);
 
       const nodeBonuses = getMetaNodeBonuses();
+      player.inActivatedSphere = nodeBonuses.insideAwakenedSphere;
       const baseFuelRegen = outside ? T.FUEL_REGEN_OUTER : T.FUEL_REGEN_INNER;
       const totalFuelRegen = baseFuelRegen + nodeBonuses.passiveFuel + nodeBonuses.sphereFuel;
       if (totalFuelRegen > 0) player.fuel = Math.min(T.FUEL_MAX, player.fuel + totalFuelRegen * dt);
@@ -2375,10 +2491,26 @@ export default function MetatronVectorFOIL() {
       player.vel.add(engine.mul(dt / T.SHIP_MASS));
 
       const brake = clamp(-player.thrust, 0, 1);
-      if (brake > 0.001) {
-        const brakeMul = lerp(1, T.BRAKE_COEFF, brake);
+      const oortBrakeMedium = T.OORT_ALLOWS_BRAKING
+        ? T.OORT_BRAKE_MULTIPLIER * oortMediumDepthAt(player.pos, metaPulseClock)
+        : 0;
+      const brakeMedium = T.BRAKING_REQUIRES_ACTIVATED_SPHERE
+        ? (nodeBonuses.insideAwakenedSphere ? 1 : Math.max(T.OPEN_SPACE_BRAKE_MULTIPLIER, oortBrakeMedium))
+        : 1;
+      const effectiveBrake = brake * brakeMedium;
+      player.brakeAnim = lerp(player.brakeAnim, effectiveBrake, effectiveBrake > 0 ? 0.22 : 0.11);
+      player.thrustGlow = lerp(player.thrustGlow, (player.fuel > 0 ? 1 : 0) * Math.max(0, player.thrust), player.thrust > 0 ? 0.18 : 0.10);
+      if (effectiveBrake > 0.001) {
+        const brakeMul = lerp(1, T.BRAKE_COEFF, effectiveBrake);
         player.vel.mul(brakeMul);
       }
+
+      if (nodeBonuses.mediumDepth > 0 && T.META_SPHERE_PLAYER_MEDIUM_DRAG > 0) {
+        const mediumDrag = Math.exp(-T.META_SPHERE_PLAYER_MEDIUM_DRAG * nodeBonuses.mediumDepth * dt);
+        player.vel.mul(clamp(mediumDrag, 0, 1));
+      }
+      applyOortPassiveDrag(dt, metaPulseClock);
+      applyOortInwardPressure(dt);
 
       // no passive drag
       if (T.DRAG > 0) player.vel.mul(1 - T.DRAG * dt);
@@ -2389,6 +2521,11 @@ export default function MetatronVectorFOIL() {
 
       const playerPrevPos = player.pos.copy();
       player.pos.add(player.vel.copy().mul(dt));
+      const solCrashR = Math.max(1, T.STAR_COLLISION_RADIUS + T.SHIP_HIT_RADIUS * 0.25);
+      if (pointSegmentDistanceSq(new V2(0, 0), playerPrevPos, player.pos) <= solCrashR * solCrashR) {
+        loseRun("ship", "sol");
+        return;
+      }
       if (applyOortPlayerHazards(dt, playerPrevPos)) return;
 
       const accel = player.vel.copy().sub(velBefore).mul(1 / Math.max(dt, 1e-6));
@@ -2513,6 +2650,8 @@ export default function MetatronVectorFOIL() {
           e.vel.add(activeMetaNodeGravityAt(e.pos, lvl.gravityGM * T.ENEMY_GRAVITY_MULT).mul(dt));
         }
 
+        applyActivatedSphereMediumDrag(e.vel, e.pos, dt, T.META_SPHERE_ENEMY_MEDIUM_DRAG);
+
         e.vel.mul(0.999);
         e.pos.add(e.vel.copy().mul(dt));
 
@@ -2569,6 +2708,7 @@ export default function MetatronVectorFOIL() {
           const chargeResult = chargeMetaNodeAt(impact.point, overchargeSphere);
           if (chargeResult.newlyAwakened) {
             runAwakenedCount += 1;
+            audioRef.current.sphereActivate();
             awardCitation("nodeAwakened", "geometry");
           }
           if (chargeResult.allLit && !allSpheresLitAwarded) {
@@ -2595,6 +2735,7 @@ export default function MetatronVectorFOIL() {
         if (T.META_NODE_GRAVITY_AFFECTS_SHRAPNEL) {
           s.vel.add(activeMetaNodeGravityAt(s.pos, lvl.gravityGM * T.SHRAPNEL_GRAVITY_MULT).mul(dt));
         }
+        applyActivatedSphereMediumDrag(s.vel, s.pos, dt, T.META_SPHERE_SHRAPNEL_MEDIUM_DRAG);
         s.pos.add(s.vel.copy().mul(dt));
         s.ang += s.spin * dt;
         s.life -= dt;
@@ -3463,7 +3604,7 @@ function render(
   S: {
     mode: GameMode;
     level: Level;
-    player: { pos: V2; vel: V2; angle: number; thrust: number; fuel: number; stuckTime: number; hitsTaken: number; hitInvuln: number };
+    player: { pos: V2; vel: V2; angle: number; angularVel: number; thrust: number; brakeAnim: number; thrustGlow: number; inActivatedSphere: boolean; fuel: number; stuckTime: number; hitsTaken: number; hitInvuln: number };
     camera: { pos: V2; zoom: number };
     meta: { ax: number; ay: number; az: number; alignT: number; centers3: V3[]; nodes: MetaNode[]; pulseClock: number };
     oort: { clusters: OortCluster[]; timeSec: number };
@@ -3567,6 +3708,11 @@ function render(
   grad.addColorStop(1, "rgba(255,180,120,0)");
   ctx.fillStyle = grad;
   ctx.beginPath(); arcSafe(ctx, 0, 0, T.STAR_RADIUS); ctx.fill();
+  ctx.fillStyle = "rgba(255,250,220,0.92)";
+  ctx.beginPath(); arcSafe(ctx, 0, 0, T.STAR_COLLISION_RADIUS); ctx.fill();
+  ctx.strokeStyle = "rgba(255,230,180,0.28)";
+  ctx.lineWidth = 0.85 / S.camera.zoom;
+  ctx.beginPath(); arcSafe(ctx, 0, 0, T.STAR_COLLISION_RADIUS); ctx.stroke();
   ctx.restore();
 
   // metatron (animated)
@@ -3777,6 +3923,24 @@ function render(
   ctx.stroke();
   ctx.restore();
 
+  if (T.THRUST_TRAIL_GLOW_ENABLED && S.player.thrustGlow > 0.02 && S.entities.trail.length > 2) {
+    ctx.save();
+    ctx.globalAlpha = worldAlpha;
+    ctx.lineCap = "round";
+    const count = Math.min(T.THRUST_TRAIL_GLOW_POINTS, S.entities.trail.length - 1);
+    const start = S.entities.trail.length - count;
+    for (let i = Math.max(1, start); i < S.entities.trail.length; i++) {
+      const p0 = S.entities.trail[i - 1];
+      const p1 = S.entities.trail[i];
+      const k = (i - start) / Math.max(1, count);
+      const alpha = S.player.thrustGlow * T.THRUST_TRAIL_GLOW_INTENSITY * Math.pow(k, 2.25);
+      ctx.strokeStyle = `rgba(175,255,230,${alpha})`;
+      ctx.lineWidth = (1.6 + 4.8 * S.player.thrustGlow * k) / S.camera.zoom;
+      ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   // ship
   ctx.save();
   ctx.globalAlpha = worldAlpha;
@@ -3785,9 +3949,28 @@ function render(
   ctx.lineWidth = 2.2 / S.camera.zoom;
   const hitFlash = S.player.hitInvuln > 0 && Math.floor(performance.now() / 60) % 2 === 0;
   ctx.strokeStyle = hitFlash ? "rgba(255,240,200,0.98)" : "rgba(120,255,200,0.95)";
+  const brakeOpen = T.BRAKE_UNFOLD_ENABLED ? clamp(S.player.brakeAnim, 0, 1) * T.BRAKE_UNFOLD_AMOUNT : 0;
+  const rearX = -10 - brakeOpen * 2.5;
+  const innerX = -6 + brakeOpen * 3.5;
+  const wingY = 7 + brakeOpen * 8.0;
   ctx.beginPath();
-  ctx.moveTo(12, 0); ctx.lineTo(-10, -7); ctx.lineTo(-6, 0); ctx.lineTo(-10, 7); ctx.closePath();
+  ctx.moveTo(12, 0); ctx.lineTo(rearX, -wingY); ctx.lineTo(innerX, 0); ctx.lineTo(rearX, wingY); ctx.closePath();
   ctx.stroke();
+
+  if (brakeOpen > 0.035 && T.BRAKE_WAKE_LINES_ENABLED) {
+    const wakeAlpha = T.BRAKE_WAKE_INTENSITY * brakeOpen;
+    ctx.strokeStyle = `rgba(205,240,255,${0.20 * wakeAlpha})`;
+    ctx.lineWidth = (1.0 + brakeOpen * 1.1) / S.camera.zoom;
+    ctx.beginPath();
+    ctx.moveTo(-2, -wingY * 0.55); ctx.lineTo(rearX - 10 - 6 * brakeOpen, -wingY * 1.15);
+    ctx.moveTo(-2, wingY * 0.55); ctx.lineTo(rearX - 10 - 6 * brakeOpen, wingY * 1.15);
+    ctx.stroke();
+    ctx.strokeStyle = `rgba(120,255,220,${0.18 * wakeAlpha})`;
+    ctx.beginPath();
+    ctx.moveTo(rearX - 2, -wingY * 0.62); ctx.quadraticCurveTo(rearX - 15, -wingY * 0.30, rearX - 26, -wingY * 0.80);
+    ctx.moveTo(rearX - 2, wingY * 0.62); ctx.quadraticCurveTo(rearX - 15, wingY * 0.30, rearX - 26, wingY * 0.80);
+    ctx.stroke();
+  }
   ctx.restore();
 
 
