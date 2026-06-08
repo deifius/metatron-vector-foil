@@ -328,6 +328,43 @@ type MultiplayerRoomPhase = "closed" | "lobby" | "countdown" | "playing" | "debr
 type MultiplayerRoomSource = "LOCAL" | "SERVER";
 type MultiplayerPilotStatus = "HOST LOCKED" | "AWAITING CARRIER" | "VECTOR SENT" | "SIGNAL ACQUIRED" | "PHOSPHOR LOCK" | "TRACE PREVIEW" | "TRACE DECLINED" | "TRACE LOST";
 type MultiplayerPilot = { callsign: string; role: "HOST" | "ALLY" | "SLOT"; status: MultiplayerPilotStatus; signalAgeMs: number };
+type MultiplayerPilotTraceStatus = "ACTIVE" | "PAUSED" | "LOST" | "DEBRIEF";
+type MultiplayerPilotTraceMessage = {
+  type: "pilot_trace";
+  seq: number;
+  roomId: string | null;
+  fromCallsign: string;
+  toCallsign: string | null;
+  sentAt: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  angle: number;
+  shieldPct: number;
+  fuelPct: number;
+  score: number;
+  status: MultiplayerPilotTraceStatus;
+};
+type MultiplayerCarrierHeartbeatMessage = {
+  type: "carrier_heartbeat";
+  roomId: string | null;
+  fromCallsign: string;
+  toCallsign: string | null;
+  sentAt: number;
+};
+type MultiplayerDataMessage = MultiplayerCarrierHeartbeatMessage | MultiplayerPilotTraceMessage;
+type MultiplayerPilotTracePoint = { x: number; y: number; vx: number; vy: number; angle: number; sentAt: number; receivedAtMs: number };
+type MultiplayerPilotTraceState = MultiplayerPilotTracePoint & {
+  callsign: string;
+  seq: number;
+  shieldPct: number;
+  fuelPct: number;
+  score: number;
+  status: MultiplayerPilotTraceStatus;
+  previous?: MultiplayerPilotTracePoint;
+};
+type MultiplayerPilotTraceSample = { pos: V2; vel: V2; angle: number; shieldPct: number; fuelPct: number; score: number; status: MultiplayerPilotTraceStatus; ageMs: number };
 type MultiplayerCarrierStatus = "idle" | "searching" | "locked" | "lost" | "error";
 type MultiplayerCarrierRole = "none" | "host" | "client";
 type MultiplayerCarrierState = {
@@ -1225,6 +1262,8 @@ export default function MetatronVectorFOIL() {
   const carrierRoleRef = useRef<MultiplayerCarrierRole>("none");
   const signalPollSeqRef = useRef(0);
   const heartbeatTimerRef = useRef<number | null>(null);
+  const remotePilotTracesRef = useRef<Record<string, MultiplayerPilotTraceState>>({});
+  const pilotTraceSeqRef = useRef(0);
   const signalSendChainRef = useRef<Promise<void>>(Promise.resolve());
   const lastSignalSendAtRef = useRef(0);
   const submitScoreRef = useRef<(snapshot: DebriefSnapshot) => void>(() => undefined);
@@ -1358,6 +1397,7 @@ export default function MetatronVectorFOIL() {
     carrierTargetRef.current = null;
     carrierRoleRef.current = "none";
     signalPollSeqRef.current = 0;
+    remotePilotTracesRef.current = {};
     if (playLost) audioRef.current.signalLost();
     setMultiplayerCarrier({ ...coldMultiplayerCarrier(), status: playLost ? "lost" : "idle", lastMessage: message });
   };
@@ -1381,16 +1421,63 @@ export default function MetatronVectorFOIL() {
     await next;
   };
 
+  const sendCarrierMessage = (message: MultiplayerDataMessage) => {
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== "open") return false;
+    try {
+      const encoded = JSON.stringify(message);
+      if (encoded.length > T.MULTIPLAYER_TRACE_MAX_BYTES) return false;
+      channel.send(encoded);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const roomAuthorizesPeer = (callsign: string) => {
+    const room = multiplayerRoomRef.current;
+    return room.pilots.some((pilot) => pilot.callsign === callsign && pilot.role !== "SLOT");
+  };
+
+  const receivePilotTrace = (message: MultiplayerPilotTraceMessage) => {
+    const peerCallsign = carrierTargetRef.current;
+    if (!peerCallsign || message.fromCallsign !== peerCallsign || !roomAuthorizesPeer(message.fromCallsign)) return;
+    const nextSeq = Number(message.seq);
+    if (!Number.isFinite(nextSeq) || nextSeq < 0) return;
+    const x = Number(message.x);
+    const y = Number(message.y);
+    const vx = Number(message.vx);
+    const vy = Number(message.vy);
+    const angle = Number(message.angle);
+    if (![x, y, vx, vy, angle].every(Number.isFinite)) return;
+    const receivedAtMs = performance.now();
+    const prior = remotePilotTracesRef.current[message.fromCallsign];
+    if (prior && nextSeq <= prior.seq) return;
+    const status: MultiplayerPilotTraceStatus = ["ACTIVE", "PAUSED", "LOST", "DEBRIEF"].includes(message.status) ? message.status : "ACTIVE";
+    remotePilotTracesRef.current = {
+      ...remotePilotTracesRef.current,
+      [message.fromCallsign]: {
+        callsign: message.fromCallsign,
+        seq: nextSeq,
+        x, y, vx, vy, angle,
+        sentAt: Number.isFinite(Number(message.sentAt)) ? Number(message.sentAt) : Date.now(),
+        receivedAtMs,
+        shieldPct: clamp(Number(message.shieldPct), 0, 100),
+        fuelPct: clamp(Number(message.fuelPct), 0, 100),
+        score: Math.max(0, Number.isFinite(Number(message.score)) ? Number(message.score) : 0),
+        status,
+        previous: prior ? { x: prior.x, y: prior.y, vx: prior.vx, vy: prior.vy, angle: prior.angle, sentAt: prior.sentAt, receivedAtMs: prior.receivedAtMs } : undefined,
+      },
+    };
+    markCarrierPilot(message.fromCallsign, status === "LOST" ? "TRACE LOST" : "PHOSPHOR LOCK", `LIVE TRACE // ${message.fromCallsign}`, "LOCAL PHOSPHOR LOCK");
+  };
+
   const startHeartbeat = (targetCallsign: string) => {
     if (heartbeatTimerRef.current !== null) window.clearInterval(heartbeatTimerRef.current);
     const sendBeat = () => {
-      const channel = dataChannelRef.current;
-      if (!channel || channel.readyState !== "open") return;
       const room = multiplayerRoomRef.current;
       const callsign = playerIdentityRef.current.callsign ?? "???";
-      try {
-        channel.send(JSON.stringify({ type: "carrier_heartbeat", roomId: room.roomId, fromCallsign: callsign, toCallsign: targetCallsign, sentAt: Date.now() }));
-      } catch {}
+      sendCarrierMessage({ type: "carrier_heartbeat", roomId: room.roomId, fromCallsign: callsign, toCallsign: targetCallsign, sentAt: Date.now() });
     };
     sendBeat();
     heartbeatTimerRef.current = window.setInterval(sendBeat, 1500);
@@ -1405,11 +1492,13 @@ export default function MetatronVectorFOIL() {
       markCarrierPilot(targetCallsign, "PHOSPHOR LOCK", `PHOSPHOR LOCK // ${targetCallsign}`, "LOCAL PHOSPHOR LOCK");
     };
     channel.onmessage = (event) => {
-      let payload: { type?: string; sentAt?: number } = {};
+      let payload: MultiplayerDataMessage | { type?: string; sentAt?: number } = {};
       try { payload = JSON.parse(String(event.data)); } catch { return; }
       if (payload.type === "carrier_heartbeat") {
         const age = typeof payload.sentAt === "number" ? Math.max(0, Date.now() - payload.sentAt) : 0;
         updateCarrier({ status: "locked", heartbeatAgeMs: age, lastMessage: `HEARTBEAT ${targetCallsign} // ${String(age).padStart(3, "0")}MS` });
+      } else if (payload.type === "pilot_trace") {
+        receivePilotTrace(payload as MultiplayerPilotTraceMessage);
       }
     };
     channel.onclose = () => {
@@ -2659,6 +2748,40 @@ export default function MetatronVectorFOIL() {
     let topCitationTier = 0;
     let topCitationScore = 0;
     let waveFlags: WaveCitationFlags = { oortReach: false, farOortReach: false, returnToTheBurn: false, periapsisKiss: false };
+    let lastPilotTraceAtMs = 0;
+
+    const publishPilotTrace = (nowMs: number) => {
+      if (nowMs - lastPilotTraceAtMs < T.MULTIPLAYER_TRACE_SEND_MS) return;
+      const channel = dataChannelRef.current;
+      const carrier = multiplayerCarrierRef.current;
+      const room = multiplayerRoomRef.current;
+      const callsign = playerIdentityRef.current.callsign;
+      if (!callsign || !channel || channel.readyState !== "open" || carrier.status !== "locked") return;
+      if (modeRef.current === "menu" || modeRef.current === "transition") return;
+      lastPilotTraceAtMs = nowMs;
+      const shieldPct = clamp(((T.SHIP_RESILIENCE - player.hitsTaken) / Math.max(1, T.SHIP_RESILIENCE)) * 100, 0, 100);
+      const fuelPct = clamp((player.fuel / T.FUEL_MAX) * 100, 0, 100);
+      const status: MultiplayerPilotTraceStatus = modeRef.current === "debrief"
+        ? "DEBRIEF"
+        : (modeRef.current === "paused" ? "PAUSED" : "ACTIVE");
+      sendCarrierMessage({
+        type: "pilot_trace",
+        seq: ++pilotTraceSeqRef.current,
+        roomId: room.roomId,
+        fromCallsign: callsign,
+        toCallsign: carrier.targetCallsign,
+        sentAt: Date.now(),
+        x: Number(player.pos.x.toFixed(3)),
+        y: Number(player.pos.y.toFixed(3)),
+        vx: Number(player.vel.x.toFixed(3)),
+        vy: Number(player.vel.y.toFixed(3)),
+        angle: Number(player.angle.toFixed(5)),
+        shieldPct: Number(shieldPct.toFixed(1)),
+        fuelPct: Number(fuelPct.toFixed(1)),
+        score: Math.round(score),
+        status,
+      });
+    };
 
     const resetWaveFlags = () => {
       waveFlags = { oortReach: false, farOortReach: false, returnToTheBurn: false, periapsisKiss: false };
@@ -3616,6 +3739,7 @@ export default function MetatronVectorFOIL() {
         step(T.FIXED_DT);
         acc -= T.FIXED_DT;
       }
+      publishPilotTrace(t);
 
       render(ctx, canvas, dpr, {
         mode: modeRef.current,
@@ -3634,6 +3758,7 @@ export default function MetatronVectorFOIL() {
           snapshot: debriefSnapshot,
         },
         multiplayer: multiplayerRoomRef.current,
+        remotePilotTraces: remotePilotTracesRef.current,
       });
 
       raf = requestAnimationFrame(loop);
@@ -4776,6 +4901,41 @@ const scopeInputStyle: React.CSSProperties = {
   outline: "none",
 };
 
+function lerpAngle(a: number, b: number, t: number) {
+  let d = (b - a) % TAU;
+  if (d > Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return a + d * t;
+}
+
+function remotePilotTraceSample(trace: MultiplayerPilotTraceState, nowMs: number): MultiplayerPilotTraceSample {
+  const ageMs = Math.max(0, nowMs - trace.receivedAtMs);
+  const previous = trace.previous;
+  let x = trace.x;
+  let y = trace.y;
+  let angle = trace.angle;
+  if (previous) {
+    const t = clamp(ageMs / Math.max(1, T.MULTIPLAYER_TRACE_INTERP_MS), 0, 1);
+    x = lerp(previous.x, trace.x, t);
+    y = lerp(previous.y, trace.y, t);
+    angle = lerpAngle(previous.angle, trace.angle, t);
+  }
+  const extrapolateSec = clamp((ageMs - T.MULTIPLAYER_TRACE_INTERP_MS) / 1000, 0, T.MULTIPLAYER_TRACE_MAX_EXTRAPOLATE_SEC);
+  x += trace.vx * extrapolateSec;
+  y += trace.vy * extrapolateSec;
+  const status = ageMs > T.MULTIPLAYER_TRACE_STALE_MS ? "LOST" : trace.status;
+  return {
+    pos: new V2(x, y),
+    vel: new V2(trace.vx, trace.vy),
+    angle,
+    shieldPct: trace.shieldPct,
+    fuelPct: trace.fuelPct,
+    score: trace.score,
+    status,
+    ageMs,
+  };
+}
+
 function drawRemotePilotTrace(
   ctx: CanvasRenderingContext2D,
   pilot: MultiplayerPilot,
@@ -4785,6 +4945,7 @@ function drawRemotePilotTrace(
   cameraZoom: number,
   alpha: number,
   timeSec: number,
+  trace?: MultiplayerPilotTraceSample,
 ) {
   const jitter = Math.sin(timeSec * 19.0 + pilot.callsign.charCodeAt(0)) * 0.7 / cameraZoom;
   const tail = vel.copy().norm().mul(-22 / cameraZoom);
@@ -4820,10 +4981,15 @@ function drawRemotePilotTrace(
   ctx.shadowColor = "rgba(120,210,255,0.20)";
   ctx.shadowBlur = 10 / cameraZoom;
   ctx.fillText(`△ ${pilot.callsign}`, pos.x + 16 / cameraZoom, pos.y - 13 / cameraZoom);
-  if (pilot.status === "TRACE PREVIEW") {
+  const secondary = trace
+    ? (trace.status === "LOST"
+      ? "TRACE LOST"
+      : (trace.shieldPct < 30 ? `SHIELD ${Math.round(trace.shieldPct)}%` : (trace.fuelPct < 25 ? `FUEL ${Math.round(trace.fuelPct)}%` : (trace.status === "PAUSED" ? "PAUSED TRACE" : "LIVE TRACE"))))
+    : (pilot.status === "TRACE PREVIEW" ? "TRACE PREVIEW" : "");
+  if (secondary) {
     ctx.font = `${Math.max(7, 8 / cameraZoom)}px ui-monospace, Menlo, monospace`;
-    ctx.fillStyle = "rgba(243,214,152,0.52)";
-    ctx.fillText("TRACE PREVIEW", pos.x + 16 / cameraZoom, pos.y + 1 / cameraZoom);
+    ctx.fillStyle = trace?.status === "LOST" ? "rgba(255,165,176,0.62)" : "rgba(243,214,152,0.52)";
+    ctx.fillText(secondary, pos.x + 16 / cameraZoom, pos.y + 1 / cameraZoom);
   }
   ctx.restore();
 }
@@ -4849,6 +5015,7 @@ function render(
     waveBannerText: string;
     debrief: { phase: DebriefPhase; phaseElapsedMs: number; snapshot: DebriefSnapshot | null };
     multiplayer: MultiplayerRoomState;
+    remotePilotTraces: Record<string, MultiplayerPilotTraceState>;
   }
 ) {
   const w = canvas.width / dpr;
@@ -5174,20 +5341,30 @@ function render(
     ctx.restore();
   }
 
-  // allied multiplayer traces / local scaffold preview
+  // allied multiplayer traces: prefer live P2P telemetry, fall back to a dim local scaffold preview.
   const alliedPilots = S.multiplayer.phase !== "closed"
     ? S.multiplayer.pilots.filter((pilot) => pilot.role === "ALLY")
     : [];
   if (alliedPilots.length > 0 && S.mode !== "debrief") {
-    const timeSec = performance.now() / 1000;
+    const nowMs = performance.now();
+    const timeSec = nowMs / 1000;
     ctx.save();
     for (let i = 0; i < alliedPilots.length; i++) {
       const pilot = alliedPilots[i];
+      const liveTrace = S.remotePilotTraces[pilot.callsign];
+      if (liveTrace) {
+        const sample = remotePilotTraceSample(liveTrace, nowMs);
+        const livePilot = { ...pilot, status: sample.status === "LOST" ? "TRACE LOST" as MultiplayerPilotStatus : "PHOSPHOR LOCK" as MultiplayerPilotStatus };
+        const alpha = sample.status === "LOST" ? 0.24 : 0.70;
+        drawRemotePilotTrace(ctx, livePilot, sample.pos, sample.vel, sample.angle, S.camera.zoom, alpha, timeSec, sample);
+        continue;
+      }
       const orbit = T.META_PLAYFIELD_RADIUS * (1.28 + i * 0.24);
       const a = timeSec * (0.22 + i * 0.018) + i * TAU / Math.max(1, alliedPilots.length);
       const pos = new V2(Math.cos(a) * orbit, Math.sin(a) * orbit);
       const vel = new V2(-Math.sin(a), Math.cos(a)).mul(orbit * (0.22 + i * 0.018));
-      drawRemotePilotTrace(ctx, pilot, pos, vel, a + Math.PI / 2, S.camera.zoom, 0.55, timeSec);
+      const previewPilot = { ...pilot, status: "TRACE PREVIEW" as MultiplayerPilotStatus };
+      drawRemotePilotTrace(ctx, previewPilot, pos, vel, a + Math.PI / 2, S.camera.zoom, 0.42, timeSec);
     }
     ctx.restore();
   }

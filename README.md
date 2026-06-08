@@ -134,7 +134,7 @@ The multiplayer roadmap is documented in [`docs/MULTIPLAYER_SYSTEM.md`](docs/MUL
 
 Multiplayer must preserve the retro oscilloscope aesthetic. Rooms are defense channels, callsign invites are signal vectors, joins are signal locks, and remote pilots are dim phosphor traces rather than modern avatar markers. Gameplay HUD widgets should remain hidden until an active run begins so the front/title screen stays sparse.
 
-Current multiplayer status: UI/audio/remote-trace scaffolding, a lightweight Flask room/invite coordination layer, and identity-checked WebRTC signal-lock scaffolding now exist. Accepted callsigns can negotiate a P2P DataChannel and exchange heartbeats. Live remote pilot movement, host-authoritative world sync, combat scoring, relay fallback, and ranked verification are still future passes. ICE servers are empty by default for privacy/LAN testing; configure `MVF_MULTIPLAYER_ICE_SERVERS_JSON` for remote STUN/TURN routing.
+Current multiplayer status: UI/audio/remote-trace scaffolding, a lightweight Flask room/invite coordination layer, and identity-checked WebRTC signal-lock scaffolding now exist. Accepted callsigns can negotiate a P2P DataChannel, exchange heartbeats, and stream live `pilot_trace` telemetry so allied sphenic corsairs render from real peer movement instead of only the local preview. Host-authoritative world sync, combat scoring, relay fallback, and ranked verification are still future passes. ICE servers are empty by default for privacy/LAN testing; configure `MVF_MULTIPLAYER_ICE_SERVERS_JSON` for remote STUN/TURN routing.
 
 ## Tech Stack
 

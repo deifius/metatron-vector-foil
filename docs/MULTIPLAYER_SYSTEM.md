@@ -309,16 +309,18 @@ Assist scoring is important so multiplayer does not become last-hit competition.
 
 Current limitation: this phase uses in-memory Flask process state. That is appropriate for the first signaling scaffold, but production multi-worker deployments will need Redis, SQLite persistence, or a dedicated signaling service before WebRTC matchmaking is reliable across processes/restarts.
 
-### Phase 3 — WebRTC signaling
+### Phase 3 — WebRTC signaling and live pilot traces
 
 - Exchange offers/answers through the server.
 - Exchange ICE candidates through a server-side, identity-checked signal mailbox.
 - Establish a WebRTC DataChannel.
 - Send heartbeat messages over the DataChannel.
+- Send live `pilot_trace` packets over the DataChannel.
+- Interpolate remote pilot position, velocity, heading, shield, fuel, score, and status.
 - Show carrier states using scope language: searching, phosphor lock, trace lost.
 - Play signal lock/lost audio.
 
-Current limitation: this establishes a P2P carrier lock and heartbeat only. It does not yet sync live pilot movement, enemy state, Sol integrity, shots, or score. ICE servers are intentionally empty by default for privacy/LAN testing; remote P2P can be enabled by setting `MVF_MULTIPLAYER_ICE_SERVERS_JSON` to a JSON array of STUN/TURN server objects.
+Current limitation: this establishes a P2P carrier lock, heartbeat, and live `pilot_trace` telemetry only. Remote allied corsairs can now render from real peer position, velocity, heading, shield, fuel, score, and status packets. It does not yet sync enemy state, Sol integrity, shots, host-authoritative scoring, or shared game-over state. ICE servers are intentionally empty by default for privacy/LAN testing; remote P2P can be enabled by setting `MVF_MULTIPLAYER_ICE_SERVERS_JSON` to a JSON array of STUN/TURN server objects.
 
 ### Phase 4 — Host-authoritative gameplay sync
 
