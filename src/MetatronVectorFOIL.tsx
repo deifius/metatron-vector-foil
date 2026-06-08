@@ -394,6 +394,8 @@ type MultiplayerCarrierHeartbeatMessage = {
   fromCallsign: string;
   toCallsign: string | null;
   sentAt: number;
+  beatSeq?: number;
+  replyToSeq?: number;
 };
 type MultiplayerWorldEnemyTrace = {
   id: string;
@@ -447,7 +449,10 @@ type MultiplayerRemotePilotInputState = MultiplayerPilotTraceState & {
 };
 type MultiplayerEnemyDamageRecord = { hits: number; damage: number; score: number; lastAtMs: number };
 type MultiplayerPilotTraceSample = { pos: V2; vel: V2; angle: number; shieldPct: number; fuelPct: number; score: number; status: MultiplayerPilotTraceStatus; ageMs: number };
-type MultiplayerHostWorldSnapshot = MultiplayerWorldSnapshotMessage & { receivedAtMs: number };
+type MultiplayerHostWorldSnapshot = MultiplayerWorldSnapshotMessage & {
+  receivedAtMs: number;
+  previous?: { receivedAtMs: number; enemies: MultiplayerWorldEnemyTrace[]; spheres: MultiplayerWorldSphereTrace[] };
+};
 type MultiplayerCarrierStatus = "idle" | "searching" | "locked" | "lost" | "error";
 type MultiplayerCarrierRole = "none" | "host" | "client";
 type MultiplayerCarrierState = {
@@ -456,6 +461,9 @@ type MultiplayerCarrierState = {
   targetCallsign: string | null;
   lastMessage: string;
   heartbeatAgeMs: number | null;
+  rttMs: number | null;
+  lastPacketAgeMs: number | null;
+  droppedPackets: number;
   signalSeq: number;
 };
 type MultiplayerSignalType = "offer" | "answer" | "ice" | "heartbeat";
@@ -515,6 +523,9 @@ function coldMultiplayerCarrier(): MultiplayerCarrierState {
     targetCallsign: null,
     lastMessage: "P2P CARRIER COLD",
     heartbeatAgeMs: null,
+    rttMs: null,
+    lastPacketAgeMs: null,
+    droppedPackets: 0,
     signalSeq: 0,
   };
 }
@@ -1346,6 +1357,10 @@ export default function MetatronVectorFOIL() {
   const carrierRoleRef = useRef<MultiplayerCarrierRole>("none");
   const signalPollSeqRef = useRef(0);
   const heartbeatTimerRef = useRef<number | null>(null);
+  const heartbeatSeqRef = useRef(0);
+  const heartbeatSentAtRef = useRef<Record<number, number>>({});
+  const lastCarrierPacketAtRef = useRef<number | null>(null);
+  const lastCarrierDegradedAtRef = useRef(0);
   const remotePilotTracesRef = useRef<Record<string, MultiplayerPilotTraceState>>({});
   const remotePilotInputsRef = useRef<Record<string, MultiplayerRemotePilotInputState>>({});
   const multiplayerWorldSnapshotRef = useRef<MultiplayerHostWorldSnapshot | null>(null);
@@ -1487,6 +1502,9 @@ export default function MetatronVectorFOIL() {
     carrierTargetRef.current = null;
     carrierRoleRef.current = "none";
     signalPollSeqRef.current = 0;
+    heartbeatSentAtRef.current = {};
+    lastCarrierPacketAtRef.current = null;
+    lastCarrierDegradedAtRef.current = 0;
     remotePilotTracesRef.current = {};
     remotePilotInputsRef.current = {};
     multiplayerWorldSnapshotRef.current = null;
@@ -1519,10 +1537,18 @@ export default function MetatronVectorFOIL() {
     if (!channel || channel.readyState !== "open") return false;
     try {
       const encoded = JSON.stringify(message);
-      if (encoded.length > T.MULTIPLAYER_CARRIER_MAX_BYTES) return false;
+      if (encoded.length > T.MULTIPLAYER_CARRIER_MAX_BYTES) {
+        bumpDroppedCarrierPacket("OUTBOUND TRACE TOO LARGE");
+        return false;
+      }
+      if (channel.bufferedAmount > 65536) {
+        bumpDroppedCarrierPacket("P2P BUFFER SATURATED");
+        return false;
+      }
       channel.send(encoded);
       return true;
     } catch {
+      bumpDroppedCarrierPacket("CARRIER SEND FAULT");
       return false;
     }
   };
@@ -1530,6 +1556,35 @@ export default function MetatronVectorFOIL() {
   const roomAuthorizesPeer = (callsign: string) => {
     const room = multiplayerRoomRef.current;
     return room.pilots.some((pilot) => pilot.callsign === callsign && pilot.role !== "SLOT");
+  };
+
+  const noteCarrierPacket = () => {
+    const nowMs = performance.now();
+    lastCarrierPacketAtRef.current = nowMs;
+    setMultiplayerCarrier((carrier) => ({
+      ...carrier,
+      lastPacketAgeMs: 0,
+      heartbeatAgeMs: carrier.heartbeatAgeMs === null ? 0 : carrier.heartbeatAgeMs,
+      status: carrier.status === "lost" ? "locked" : carrier.status,
+    }));
+  };
+
+  const bumpDroppedCarrierPacket = (reason: string) => {
+    const nowMs = performance.now();
+    setMultiplayerCarrier((carrier) => ({
+      ...carrier,
+      droppedPackets: carrier.droppedPackets + 1,
+      lastMessage: nowMs - lastCarrierDegradedAtRef.current > 900 ? reason : carrier.lastMessage,
+    }));
+    lastCarrierDegradedAtRef.current = nowMs;
+  };
+
+  const previousTraceIfSmooth = (prior: MultiplayerPilotTraceState | undefined, x: number, y: number): MultiplayerPilotTracePoint | undefined => {
+    if (!prior) return undefined;
+    const dx = prior.x - x;
+    const dy = prior.y - y;
+    if (Math.hypot(dx, dy) > T.MULTIPLAYER_TRACE_SNAP_DISTANCE) return undefined;
+    return { x: prior.x, y: prior.y, vx: prior.vx, vy: prior.vy, angle: prior.angle, sentAt: prior.sentAt, receivedAtMs: prior.receivedAtMs };
   };
 
   const receivePilotTrace = (message: MultiplayerPilotTraceMessage) => {
@@ -1559,7 +1614,7 @@ export default function MetatronVectorFOIL() {
         fuelPct: clamp(Number(message.fuelPct), 0, 100),
         score: Math.max(0, Number.isFinite(Number(message.score)) ? Number(message.score) : 0),
         status,
-        previous: prior ? { x: prior.x, y: prior.y, vx: prior.vx, vy: prior.vy, angle: prior.angle, sentAt: prior.sentAt, receivedAtMs: prior.receivedAtMs } : undefined,
+        previous: previousTraceIfSmooth(prior, x, y),
       },
     };
     markCarrierPilot(message.fromCallsign, status === "LOST" ? "TRACE LOST" : "PHOSPHOR LOCK", `LIVE TRACE // ${message.fromCallsign}`, "LOCAL PHOSPHOR LOCK");
@@ -1590,7 +1645,7 @@ export default function MetatronVectorFOIL() {
       fuelPct: clamp(Number(message.fuelPct), 0, 100),
       score: Math.max(0, Number.isFinite(Number(message.score)) ? Number(message.score) : 0),
       status,
-      previous: prior ? { x: prior.x, y: prior.y, vx: prior.vx, vy: prior.vy, angle: prior.angle, sentAt: prior.sentAt, receivedAtMs: prior.receivedAtMs } : undefined,
+      previous: previousTraceIfSmooth(prior, x, y),
     };
     remotePilotTracesRef.current = {
       ...remotePilotTracesRef.current,
@@ -1680,6 +1735,7 @@ export default function MetatronVectorFOIL() {
       teamScore: Math.max(0, Math.round(Number(message.teamScore ?? message.score) || 0)),
       pilotScores,
       receivedAtMs: performance.now(),
+      previous: prior ? { receivedAtMs: prior.receivedAtMs, enemies: prior.enemies, spheres: prior.spheres } : undefined,
     };
     multiplayerWorldSnapshotRef.current = snapshot;
     setMultiplayerWorldSnapshot(snapshot);
@@ -1691,32 +1747,61 @@ export default function MetatronVectorFOIL() {
     const sendBeat = () => {
       const room = multiplayerRoomRef.current;
       const callsign = playerIdentityRef.current.callsign ?? "???";
-      sendCarrierMessage({ type: "carrier_heartbeat", roomId: room.roomId, fromCallsign: callsign, toCallsign: targetCallsign, sentAt: Date.now() });
+      const beatSeq = ++heartbeatSeqRef.current;
+      heartbeatSentAtRef.current[beatSeq] = performance.now();
+      // Keep only a tiny echo ledger; this is telemetry, not gameplay authority.
+      const sentKeys = Object.keys(heartbeatSentAtRef.current);
+      if (sentKeys.length > 12) {
+        for (const key of sentKeys.slice(0, sentKeys.length - 12)) delete heartbeatSentAtRef.current[Number(key)];
+      }
+      sendCarrierMessage({ type: "carrier_heartbeat", roomId: room.roomId, fromCallsign: callsign, toCallsign: targetCallsign, sentAt: Date.now(), beatSeq });
     };
     sendBeat();
-    heartbeatTimerRef.current = window.setInterval(sendBeat, 1500);
+    heartbeatTimerRef.current = window.setInterval(sendBeat, T.MULTIPLAYER_HEARTBEAT_MS);
   };
 
   const setupDataChannel = (channel: RTCDataChannel, targetCallsign: string, role: MultiplayerCarrierRole) => {
     dataChannelRef.current = channel;
     channel.onopen = () => {
       audioRef.current.signalLock();
+      lastCarrierPacketAtRef.current = performance.now();
       startHeartbeat(targetCallsign);
-      updateCarrier({ status: "locked", role, targetCallsign, heartbeatAgeMs: 0, lastMessage: `PHOSPHOR LOCK // ${targetCallsign}` });
+      updateCarrier({ status: "locked", role, targetCallsign, heartbeatAgeMs: 0, rttMs: null, lastPacketAgeMs: 0, droppedPackets: 0, lastMessage: `PHOSPHOR LOCK // ${targetCallsign}` });
       markCarrierPilot(targetCallsign, "PHOSPHOR LOCK", `PHOSPHOR LOCK // ${targetCallsign}`, "LOCAL PHOSPHOR LOCK");
     };
     channel.onmessage = (event) => {
-      let payload: MultiplayerDataMessage | { type?: string; sentAt?: number } = {};
-      try { payload = JSON.parse(String(event.data)); } catch { return; }
+      const raw = String(event.data);
+      if (raw.length > T.MULTIPLAYER_CARRIER_MAX_BYTES) {
+        bumpDroppedCarrierPacket("INBOUND TRACE TOO LARGE");
+        return;
+      }
+      noteCarrierPacket();
+      let payload: MultiplayerDataMessage | { type?: string; sentAt?: number; beatSeq?: number; replyToSeq?: number } = {};
+      try { payload = JSON.parse(raw); } catch { bumpDroppedCarrierPacket("CARRIER DECODER STATIC"); return; }
       if (payload.type === "carrier_heartbeat") {
         const age = typeof payload.sentAt === "number" ? Math.max(0, Date.now() - payload.sentAt) : 0;
-        updateCarrier({ status: "locked", heartbeatAgeMs: age, lastMessage: `HEARTBEAT ${targetCallsign} // ${String(age).padStart(3, "0")}MS` });
+        const replyToSeq = typeof payload.replyToSeq === "number" ? payload.replyToSeq : null;
+        const beatSeq = typeof payload.beatSeq === "number" ? payload.beatSeq : null;
+        if (replyToSeq !== null && heartbeatSentAtRef.current[replyToSeq] !== undefined) {
+          const rttMs = Math.max(0, performance.now() - heartbeatSentAtRef.current[replyToSeq]);
+          delete heartbeatSentAtRef.current[replyToSeq];
+          updateCarrier({ status: "locked", heartbeatAgeMs: age, rttMs, lastPacketAgeMs: 0, lastMessage: `ECHO ${targetCallsign} // ${Math.round(rttMs)}MS` });
+        } else {
+          updateCarrier({ status: "locked", heartbeatAgeMs: age, lastPacketAgeMs: 0, lastMessage: `HEARTBEAT ${targetCallsign} // ${String(age).padStart(3, "0")}MS` });
+        }
+        if (beatSeq !== null && replyToSeq === null) {
+          const room = multiplayerRoomRef.current;
+          const callsign = playerIdentityRef.current.callsign ?? "???";
+          sendCarrierMessage({ type: "carrier_heartbeat", roomId: room.roomId, fromCallsign: callsign, toCallsign: targetCallsign, sentAt: Date.now(), replyToSeq: beatSeq });
+        }
       } else if (payload.type === "pilot_trace") {
         receivePilotTrace(payload as MultiplayerPilotTraceMessage);
       } else if (payload.type === "pilot_input") {
         receivePilotInput(payload as MultiplayerPilotInputMessage);
       } else if (payload.type === "world_snapshot") {
         receiveWorldSnapshot(payload as MultiplayerWorldSnapshotMessage);
+      } else {
+        bumpDroppedCarrierPacket("UNKNOWN CARRIER SYMBOL");
       }
     };
     channel.onclose = () => {
@@ -1878,6 +1963,27 @@ export default function MetatronVectorFOIL() {
     return () => { cancelled = true; window.clearInterval(id); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [multiplayerRoom.source, multiplayerRoom.roomId, multiplayerRoom.phase, playerIdentity.callsign]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const carrier = multiplayerCarrierRef.current;
+      if (carrier.status === "idle") return;
+      const nowMs = performance.now();
+      const lastPacketAt = lastCarrierPacketAtRef.current;
+      const packetAge = lastPacketAt === null ? null : Math.max(0, nowMs - lastPacketAt);
+      if (packetAge === null) return;
+      if (carrier.status === "locked" && packetAge > T.MULTIPLAYER_HEARTBEAT_LOST_MS) {
+        updateCarrier({ status: "lost", lastPacketAgeMs: packetAge, heartbeatAgeMs: packetAge, lastMessage: `TRACE LOST // ${carrier.targetCallsign ?? "NO PEER"}` });
+        markCarrierPilot(carrier.targetCallsign, "TRACE LOST", `TRACE LOST // ${carrier.targetCallsign ?? "NO PEER"}`, "SIGNAL SERVER");
+        audioRef.current.signalLost();
+      } else if (carrier.status === "locked" && packetAge > T.MULTIPLAYER_HEARTBEAT_WARN_MS) {
+        updateCarrier({ lastPacketAgeMs: packetAge, heartbeatAgeMs: packetAge, lastMessage: `CARRIER NOISE // ${Math.round(packetAge)}MS SILENCE` });
+      } else if (carrier.status === "locked") {
+        updateCarrier({ lastPacketAgeMs: packetAge, heartbeatAgeMs: carrier.heartbeatAgeMs === null ? packetAge : Math.max(0, carrier.heartbeatAgeMs) });
+      }
+    }, 500);
+    return () => window.clearInterval(id);
+  }, []);
 
   useEffect(() => {
     refreshSecurityStatus();
@@ -4928,6 +5034,21 @@ function VectorTelemetry({ label, value }: { label: string; value: string }) {
   );
 }
 
+function formatCarrierMs(value: number | null | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "---";
+  return `${Math.round(value)}MS`;
+}
+
+function carrierQualityLabel(carrier: MultiplayerCarrierState) {
+  const silence = carrier.lastPacketAgeMs ?? carrier.heartbeatAgeMs ?? 0;
+  if (carrier.status === "idle") return "COLD";
+  if (carrier.status === "searching") return "SEARCHING";
+  if (carrier.status === "lost") return "TRACE LOST";
+  if (carrier.status === "error") return "CARRIER NOISE";
+  if (silence > T.MULTIPLAYER_HEARTBEAT_WARN_MS) return "NOISY LOCK";
+  return "PHOSPHOR LOCK";
+}
+
 function MultiplayerConsole({
   room,
   carrier,
@@ -4975,7 +5096,8 @@ function MultiplayerConsole({
         <VectorTelemetry label="Signal Route" value={room.route} />
         <VectorTelemetry label="Config" value={open ? `${room.visibility} // ${room.configPolicy}` : "P2P SCAFFOLD // UNRANKED"} />
         <VectorTelemetry label="Source" value={open ? `${room.source} // ${room.hostCallsign ?? "NO HOST"}` : "LOCAL // COLD"} />
-        <VectorTelemetry label="P2P Carrier" value={open ? `${carrier.status.toUpperCase()} // ${carrier.targetCallsign ?? "NO PEER"}` : "COLD // NO PEER"} />
+        <VectorTelemetry label="P2P Carrier" value={open ? `${carrierQualityLabel(carrier)} // ${carrier.targetCallsign ?? "NO PEER"}` : "COLD // NO PEER"} />
+        <VectorTelemetry label="Signal Echo" value={open ? `RTT ${formatCarrierMs(carrier.rttMs)} // SILENCE ${formatCarrierMs(carrier.lastPacketAgeMs ?? carrier.heartbeatAgeMs)} // DROP ${carrier.droppedPackets}` : "RTT --- // DROP 0"} />
       </div>
 
       <div style={{ display: "grid", gap: 5, padding: "7px 0", borderTop: "1px solid rgba(150,205,255,0.10)", borderBottom: "1px solid rgba(150,205,255,0.10)" }}>
@@ -5080,7 +5202,7 @@ function MultiplayerRosterOverlay({ room, carrier, hostWorld, debrief = false }:
       <div style={{ marginTop: 8, paddingTop: 7, borderTop: "1px solid rgba(150,205,255,0.10)", fontSize: 9, lineHeight: 1.38, letterSpacing: "0.09em", textTransform: "uppercase", color: "rgba(190,224,248,0.58)" }}>
         {debrief
           ? (hostWorld ? `TEAM SCOPE W${hostWorld.wave} // SOL ${Math.round(hostWorld.solIntegrityPct)} // TEAM ${Math.round(hostWorld.teamScore ?? hostWorld.score).toLocaleString()}` : "Team metrics await host snapshot lock.")
-          : (hostWorld ? `HOST SNAPSHOT #${hostWorld.seq} // W${hostWorld.wave} // ${hostWorld.enemyCount} FOILS // ${carrier.status.toUpperCase()}` : `${room.source} // ${room.route} // ${carrier.status.toUpperCase()}`)}
+          : (hostWorld ? `HOST SNAPSHOT #${hostWorld.seq} // W${hostWorld.wave} // ${hostWorld.enemyCount} FOILS // ${carrierQualityLabel(carrier)} // RTT ${formatCarrierMs(carrier.rttMs)}` : `${room.source} // ${room.route} // ${carrierQualityLabel(carrier)} // RTT ${formatCarrierMs(carrier.rttMs)}`)}
       </div>
     </div>
   );
@@ -5522,12 +5644,17 @@ function remotePilotTraceSample(trace: MultiplayerPilotTraceState, nowMs: number
   let y = trace.y;
   let angle = trace.angle;
   if (previous) {
-    const t = clamp(ageMs / Math.max(1, T.MULTIPLAYER_TRACE_INTERP_MS), 0, 1);
-    x = lerp(previous.x, trace.x, t);
-    y = lerp(previous.y, trace.y, t);
-    angle = lerpAngle(previous.angle, trace.angle, t);
+    const jump = Math.hypot(previous.x - trace.x, previous.y - trace.y);
+    if (jump <= T.MULTIPLAYER_TRACE_SNAP_DISTANCE) {
+      const t = clamp(ageMs / Math.max(1, T.MULTIPLAYER_TRACE_INTERP_MS), 0, 1);
+      x = lerp(previous.x, trace.x, t);
+      y = lerp(previous.y, trace.y, t);
+      angle = lerpAngle(previous.angle, trace.angle, t);
+    }
   }
-  const extrapolateSec = clamp((ageMs - T.MULTIPLAYER_TRACE_INTERP_MS) / 1000, 0, T.MULTIPLAYER_TRACE_MAX_EXTRAPOLATE_SEC);
+  const extrapolateSec = ageMs > T.MULTIPLAYER_TRACE_STALE_MS
+    ? 0
+    : clamp((ageMs - T.MULTIPLAYER_TRACE_INTERP_MS) / 1000, 0, T.MULTIPLAYER_TRACE_MAX_EXTRAPOLATE_SEC);
   x += trace.vx * extrapolateSec;
   y += trace.vy * extrapolateSec;
   const status = ageMs > T.MULTIPLAYER_TRACE_STALE_MS ? "LOST" : trace.status;
@@ -5601,6 +5728,25 @@ function drawRemotePilotTrace(
   ctx.restore();
 }
 
+function hostWorldEnemySample(snapshot: MultiplayerHostWorldSnapshot, enemy: MultiplayerWorldEnemyTrace, nowMs: number) {
+  const ageMs = Math.max(0, nowMs - snapshot.receivedAtMs);
+  const previous = snapshot.previous?.enemies.find((prior) => prior.id === enemy.id);
+  let x = enemy.x;
+  let y = enemy.y;
+  if (previous) {
+    const jump = Math.hypot(previous.x - enemy.x, previous.y - enemy.y);
+    if (jump <= T.MULTIPLAYER_WORLD_SNAP_DISTANCE) {
+      const t = clamp(ageMs / Math.max(1, T.MULTIPLAYER_WORLD_INTERP_MS), 0, 1);
+      x = lerp(previous.x, enemy.x, t);
+      y = lerp(previous.y, enemy.y, t);
+    }
+  }
+  const extrapolateSec = clamp((ageMs - T.MULTIPLAYER_WORLD_INTERP_MS) / 1000, 0, T.MULTIPLAYER_TRACE_MAX_EXTRAPOLATE_SEC);
+  x += enemy.vx * extrapolateSec;
+  y += enemy.vy * extrapolateSec;
+  return new V2(x, y);
+}
+
 function drawHostWorldSnapshot(ctx: CanvasRenderingContext2D, snapshot: MultiplayerHostWorldSnapshot, cameraZoom: number, nowMs: number) {
   const ageMs = Math.max(0, nowMs - snapshot.receivedAtMs);
   const fresh = ageMs <= T.MULTIPLAYER_WORLD_STALE_MS;
@@ -5611,7 +5757,7 @@ function drawHostWorldSnapshot(ctx: CanvasRenderingContext2D, snapshot: Multipla
   ctx.lineCap = "round";
 
   for (const enemy of snapshot.enemies) {
-    const pos = new V2(enemy.x, enemy.y);
+    const pos = hostWorldEnemySample(snapshot, enemy, nowMs);
     const vel = new V2(enemy.vx, enemy.vy);
     const speedTail = vel.len() > 0.01 ? vel.copy().norm().mul(-18 / cameraZoom) : new V2(-10 / cameraZoom, 0);
     const r = Math.max(5 / cameraZoom, enemy.r * 0.34);

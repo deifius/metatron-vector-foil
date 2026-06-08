@@ -19,6 +19,54 @@ The multiplayer system design lives in `docs/MULTIPLAYER_SYSTEM.md`. Any multipl
 - Do not show gameplay HUD widgets on the title/loading screen; the front page should remain sparse and readable.
 - Multiplayer audio should load optional files from `/static/audio/` and fall back to restrained synthetic carrier/signal sounds when files are missing.
 
+
+
+### Pending 2+ Multiplayer Roadmap
+
+The current multiplayer implementation should be treated as a two-player P2P shared-Sol prototype until it has been tested in browser-to-browser conditions. Do not start broad rewrites while testing the existing two-player path. Preserve the retro oscilloscope aesthetic at every stage.
+
+When work resumes for **2+ multiplayer**, the next target is **multi-pilot fanout beyond one host plus one peer**:
+
+- Replace single-peer assumptions with per-pilot maps, such as `peerConnectionsByPilotId`, `peerChannelsByPilotId`, `remotePilotInputsByPilotId`, and `remotePilotTracesByPilotId`.
+- The host should maintain one WebRTC DataChannel per joined pilot and broadcast `world_snapshot`, roster, and score/contribution updates to all locked peers.
+- Each client should render every authorized pilot in the room: local ship, host trace, and other allied traces.
+- Host simulation should accept `pilot_input` from multiple authorized pilots, spawn each pilot's allied fire in the host simulation, and credit hits/kills/assists through the host contribution ledger.
+- Keep callsign identity server-authorized. Peer packets may carry `pilotId`/sequence/tick data, but callsign display and room membership must come from the server-approved room roster.
+- Normalize scoring around stable pilot IDs/callsigns so 3-6 player debriefs remain clean.
+- Do not let additional pilots create modern UI clutter. More pilots should appear as additional signal traces, not as floating gamer tags or HUD boxes.
+
+Recommended compact roster language for 2+ pilots:
+
+```text
+CONSTELLATION CHANNEL / P2P UNVERIFIED
+
+SABLE-7   HOST   LOCK  31ms   8120
+MOTH-11   TRACE  LOCK  44ms   6450
+JENI-3    TRACE  NOISE 88ms   5120
+```
+
+Label discipline for multiple pilots:
+
+- Nearby pilots may show a tiny callsign/transponder label.
+- Distant pilots should collapse to small dim transponder marks.
+- Damaged, low-fuel, pinging, or recently joined/lost pilots may temporarily get brighter labels.
+- Offscreen pilots should use subtle directional tags only when useful.
+- Never let remote labels cover the center playfield or overwhelm Sol, spheres, enemies, or the gravitic trace.
+
+After fanout, the next implementation priorities are:
+
+1. Invite/session hardening: expired invites, closed rooms, duplicate joins, host-gone behavior, reconnect handling, rate limits, and better error readouts.
+2. Config policy enforcement: Host Locked, Personal Ships / Shared Star, Open Lab, config hashes, ranked/unranked labels, and prevention of silent shared-star parameter drift.
+3. Relay/privacy fallback: TURN or relay mode for failed P2P or privacy-sensitive/public rooms; display `LOCAL PHOSPHOR LOCK`, `DIRECT DARK FOREST LINK`, or `RELAYED THROUGH METATRON NODE` as appropriate.
+4. Ranked/server-verified mode later: server-authoritative or replay-audited submissions, signed results, and verified leaderboards. Do not mix verified results with P2P/unverified friend games.
+
+Testing guidance before 2+ work:
+
+- First test same-browser or two-tab limitations cautiously; real WebRTC behavior is best tested with two browsers/devices.
+- Test LAN before internet play.
+- Confirm offer/answer/ICE exchange, DataChannel heartbeat, live pilot traces, host snapshots, allied fire, Sol integrity, and multiplayer debrief before adding more peers.
+- Watch for stale traces, duplicate pilot rows, over-bright labels, packet flood, and front-page/HUD clutter.
+
 ## Core Design Priorities
 
 - Orbital motion is central. Movement should reward momentum, slingshots, tangential approaches, and gravity reading.
@@ -371,7 +419,7 @@ When samples are missing, procedural fallbacks should continue to work.
 
 ## Current Development Priority
 
-The active multiplayer track is **Constellation Defense**. The current code includes the retro lobby/front-page shell, server-backed room/invite/status scaffolding, WebRTC DataChannel signal lock, live remote pilot traces, client-to-host `pilot_input` telemetry, host-authored `world_snapshot` telemetry, and unverified P2P contribution debriefs. The host is the first shared-defense authority: peer input can spawn allied fire in the host simulation, host snapshots carry shared enemy/sphere/Sol/team-score summaries, host-side ledgers credit hits/kills/assists/awakenings from actual impacts, and clients suppress local enemy simulation while rendering/adopting fresh host scope telemetry. Keep all additions retro-oscilloscope in language and presentation.
+The active multiplayer track is **Constellation Defense**. The current code includes the retro lobby/front-page shell, server-backed room/invite/status scaffolding, WebRTC DataChannel signal lock, live remote pilot traces, client-to-host `pilot_input` telemetry, host-authored `world_snapshot` telemetry, unverified P2P contribution debriefs, and first-pass carrier stability telemetry. The host is the first shared-defense authority: peer input can spawn allied fire in the host simulation, host snapshots carry shared enemy/sphere/Sol/team-score summaries, host-side ledgers credit hits/kills/assists/awakenings from actual impacts, and clients suppress local enemy simulation while rendering/adopting fresh host scope telemetry. The P2P layer now reports heartbeat echo/RTT, silence age, dropped carrier packets, and performs interpolation/snap-threshold smoothing for remote pilots and host contact traces. Keep all additions retro-oscilloscope in language and presentation.
 
 Near-term multiplayer goals:
 
@@ -379,7 +427,7 @@ Near-term multiplayer goals:
 - Maintain identity authority on the Flask server; do not trust peer-provided callsigns.
 - Keep early P2P results unranked/unverified.
 - Use WebRTC DataChannel for gameplay packets after PHOSPHOR LOCK.
-- Improve prediction/correction rules before treating P2P shared-defense results as ranked or server-verified.
+- Continue improving prediction/correction/reconciliation before treating P2P shared-defense results as ranked or server-verified.
 - Keep gameplay HUD widgets hidden from the front/title screen.
 
 Metatron cube tuning remains important; preserve the existing recoupled visible/gameplay sphere behavior unless explicitly asked to change it.

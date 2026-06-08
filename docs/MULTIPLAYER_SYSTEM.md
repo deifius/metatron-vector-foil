@@ -320,7 +320,7 @@ Current limitation: this phase uses in-memory Flask process state. That is appro
 - Show carrier states using scope language: searching, phosphor lock, trace lost.
 - Play signal lock/lost audio.
 
-Current limitation: this now establishes a P2P carrier lock, heartbeat, live `pilot_trace` telemetry, client-to-host `pilot_input`, and a host `world_snapshot` stream. Remote allied corsairs render from real peer position, velocity, heading, shield, fuel, score, and status packets. The host can rate-limit authorized peer fire into real host bullets, apply those bullets to host enemies, steer hostiles toward the nearest pilot trace, and broadcast shared wave, score, Sol-integrity, enemy-contact, bullet/shard, pilot-score, and sphere-state telemetry. Host-side ledgers credit per-pilot hits, kills, assists, awakenings, and score from real host-simulated impacts, and the debrief presents a `P2P / UNVERIFIED` contribution lattice. Clients with fresh host snapshots suppress local enemy simulation and adopt the host scope for shared Sol defense. This is still an unranked two-peer prototype: server verification, relay fallback, multi-peer fanout, host migration, strong correction, and persistent multiplayer run history are future passes. ICE servers are intentionally empty by default for privacy/LAN testing; remote P2P can be enabled by setting `MVF_MULTIPLAYER_ICE_SERVERS_JSON` to a JSON array of STUN/TURN server objects.
+Current limitation: this now establishes a P2P carrier lock, heartbeat echo/RTT telemetry, live `pilot_trace` telemetry, client-to-host `pilot_input`, and a host `world_snapshot` stream. Remote allied corsairs render from real peer position, velocity, heading, shield, fuel, score, and status packets. The host can rate-limit authorized peer fire into real host bullets, apply those bullets to host enemies, steer hostiles toward the nearest pilot trace, and broadcast shared wave, score, Sol-integrity, enemy-contact, bullet/shard, pilot-score, and sphere-state telemetry. Host-side ledgers credit per-pilot hits, kills, assists, awakenings, and score from real host-simulated impacts, and the debrief presents a `P2P / UNVERIFIED` contribution lattice. Clients with fresh host snapshots suppress local enemy simulation and adopt the host scope for shared Sol defense. The stability layer now shows RTT/silence/drop metrics, detects heartbeat loss, guards against carrier buffer saturation, and smooths remote pilot/host contact traces with snap thresholds so corrections feel like scope re-locks instead of UI jumps. This is still an unranked two-peer prototype: server verification, relay fallback, multi-peer fanout, host migration, deeper reconciliation, and persistent multiplayer run history are future passes. ICE servers are intentionally empty by default for privacy/LAN testing; remote P2P can be enabled by setting `MVF_MULTIPLAYER_ICE_SERVERS_JSON` to a JSON array of STUN/TURN server objects.
 
 ### Phase 4 — Host-authoritative gameplay sync
 
@@ -363,17 +363,19 @@ Implemented so far:
 - ephemeral Flask room and invite layer;
 - identity-checked signaling mailbox for offer/answer/ICE envelopes;
 - WebRTC DataChannel negotiation between accepted callsigns;
-- DataChannel heartbeat and carrier status display;
+- DataChannel heartbeat/echo telemetry and carrier status display;
 - signal lock/lost audio events;
 - live remote pilot motion sync;
 - client-to-host `pilot_input` packets;
 - host-spawned allied fire from authorized peer input;
 - host-authored enemy/sphere/Sol/team-score snapshots;
-- client adoption of fresh host scope telemetry for shared defense.
+- client adoption of fresh host scope telemetry for shared defense;
+- carrier health metrics: RTT, silence age, dropped packets, stale heartbeat detection;
+- interpolation/snap-threshold smoothing for live pilots and host world contacts.
 
 Not implemented yet:
 
-- robust prediction/correction and reconciliation;
+- deeper prediction/correction and reconciliation beyond the current smoothing pass;
 - multi-peer fanout beyond the first accepted carrier target;
 - complete per-pilot scoring/debrief persistence;
 - relay fallback;
