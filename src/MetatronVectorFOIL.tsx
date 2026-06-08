@@ -321,7 +321,94 @@ function scoreAlertSeverity(tier: 1 | 2 | 3): HUDState["alert"]["severity"] {
 
 // ===================== WEB AUDIO (DRONES + SFX) =====================
 type GameMode = "menu" | "playing" | "paused" | "transition" | "debrief";
+type MultiplayerRoomVisibility = "PUBLIC" | "UNLISTED" | "PRIVATE";
+type MultiplayerConfigPolicy = "HOST LOCKED" | "PERSONAL SHIPS" | "OPEN LAB";
+type MultiplayerRoute = "NO CARRIER" | "LOCAL SCAFFOLD" | "SIGNAL SERVER" | "LOCAL PHOSPHOR LOCK" | "DIRECT DARK FOREST LINK" | "RELAYED THROUGH METATRON NODE";
+type MultiplayerRoomPhase = "closed" | "lobby" | "countdown" | "playing" | "debrief";
+type MultiplayerRoomSource = "LOCAL" | "SERVER";
+type MultiplayerPilotStatus = "HOST LOCKED" | "AWAITING CARRIER" | "VECTOR SENT" | "SIGNAL ACQUIRED" | "PHOSPHOR LOCK" | "TRACE PREVIEW" | "TRACE DECLINED" | "TRACE LOST";
+type MultiplayerPilot = { callsign: string; role: "HOST" | "ALLY" | "SLOT"; status: MultiplayerPilotStatus; signalAgeMs: number };
+type MultiplayerCarrierStatus = "idle" | "searching" | "locked" | "lost" | "error";
+type MultiplayerCarrierRole = "none" | "host" | "client";
+type MultiplayerCarrierState = {
+  status: MultiplayerCarrierStatus;
+  role: MultiplayerCarrierRole;
+  targetCallsign: string | null;
+  lastMessage: string;
+  heartbeatAgeMs: number | null;
+  signalSeq: number;
+};
+type MultiplayerSignalType = "offer" | "answer" | "ice" | "heartbeat";
+type MultiplayerSignalMessage = {
+  seq: number;
+  roomId: string;
+  fromCallsign: string;
+  toCallsign: string;
+  signalType: MultiplayerSignalType;
+  payload: Record<string, unknown>;
+  createdAt: string;
+};
+type MultiplayerRoomState = {
+  phase: MultiplayerRoomPhase;
+  source: MultiplayerRoomSource;
+  roomId: string | null;
+  roomCode: string;
+  hostCallsign: string | null;
+  visibility: MultiplayerRoomVisibility;
+  configPolicy: MultiplayerConfigPolicy;
+  route: MultiplayerRoute;
+  pilots: MultiplayerPilot[];
+  lastSignal: string;
+  openedAtMs: number;
+};
+type MultiplayerInvite = {
+  inviteId: string;
+  roomId: string;
+  roomCode: string;
+  fromCallsign: string;
+  toCallsign: string;
+  status: "PENDING" | "ACCEPTED" | "DECLINED";
+  createdAt: string;
+  expiresAt: string;
+};
 
+function closedMultiplayerRoom(): MultiplayerRoomState {
+  return {
+    phase: "closed",
+    source: "LOCAL",
+    roomId: null,
+    roomCode: "---",
+    hostCallsign: null,
+    visibility: T.MULTIPLAYER_DEFAULT_VISIBILITY as MultiplayerRoomVisibility,
+    configPolicy: T.MULTIPLAYER_DEFAULT_CONFIG_POLICY as MultiplayerConfigPolicy,
+    route: "NO CARRIER",
+    pilots: [],
+    lastSignal: "CONSTELLATION DEFENSE CHANNEL COLD",
+    openedAtMs: 0,
+  };
+}
+
+function coldMultiplayerCarrier(): MultiplayerCarrierState {
+  return {
+    status: "idle",
+    role: "none",
+    targetCallsign: null,
+    lastMessage: "P2P CARRIER COLD",
+    heartbeatAgeMs: null,
+    signalSeq: 0,
+  };
+}
+
+function makeRoomCode() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < 4; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)] ?? "X";
+  return out;
+}
+
+function normalizeCallsignInput(value: string) {
+  return value.replace(/[^A-Za-z0-9]/g, "").slice(0, 3);
+}
 
 
 class DroneVoice {
@@ -464,7 +551,16 @@ type AudioSampleKey =
   | "oortBreak"
   | "oortStrike"
   | "oortDust"
-  | "sphereActivate";
+  | "sphereActivate"
+  | "roomCreate"
+  | "roomInvite"
+  | "roomInviteReceived"
+  | "roomJoin"
+  | "roomLeave"
+  | "signalLock"
+  | "signalLost"
+  | "transponderPing"
+  | "relayFallback";
 
 class AudioEngine {
   ctx: AudioContext | null = null;
@@ -494,6 +590,15 @@ class AudioEngine {
     oortStrike: null,
     oortDust: null,
     sphereActivate: null,
+    roomCreate: null,
+    roomInvite: null,
+    roomInviteReceived: null,
+    roomJoin: null,
+    roomLeave: null,
+    signalLock: null,
+    signalLost: null,
+    transponderPing: null,
+    relayFallback: null,
   };
   sampleLoads = new Set<AudioSampleKey>();
 
@@ -564,6 +669,15 @@ class AudioEngine {
     this.loadSample("oortStrike", T.AUDIO_OORT_STRIKE_URL);
     this.loadSample("oortDust", T.AUDIO_OORT_DUST_URL);
     this.loadSample("sphereActivate", T.AUDIO_SPHERE_ACTIVATE_URL);
+    this.loadSample("roomCreate", T.AUDIO_ROOM_CREATE_URL);
+    this.loadSample("roomInvite", T.AUDIO_ROOM_INVITE_URL);
+    this.loadSample("roomInviteReceived", T.AUDIO_ROOM_INVITE_RECEIVED_URL);
+    this.loadSample("roomJoin", T.AUDIO_ROOM_JOIN_URL);
+    this.loadSample("roomLeave", T.AUDIO_ROOM_LEAVE_URL);
+    this.loadSample("signalLock", T.AUDIO_SIGNAL_LOCK_URL);
+    this.loadSample("signalLost", T.AUDIO_SIGNAL_LOST_URL);
+    this.loadSample("transponderPing", T.AUDIO_TRANSPONDER_PING_URL);
+    this.loadSample("relayFallback", T.AUDIO_RELAY_FALLBACK_URL);
   }
 
   async ensureDroneBuffer() {
@@ -850,6 +964,52 @@ class AudioEngine {
     this.blip(648, 0.18, 0.085);
     this.blip(864, 0.20, 0.065);
   }
+  roomCreate() {
+    if (this.playSample("roomCreate", T.AUDIO_ROOM_CREATE_GAIN, rand(0.98, 1.02))) return;
+    this.blip(108, 0.12, 0.10);
+    this.blip(216, 0.16, 0.085);
+    this.blip(432, 0.22, 0.065);
+  }
+  roomInvite() {
+    if (this.playSample("roomInvite", T.AUDIO_ROOM_INVITE_GAIN, rand(0.98, 1.04))) return;
+    this.blip(990, 0.035, 0.085);
+    this.blip(1320, 0.045, 0.055);
+  }
+  roomInviteReceived() {
+    if (this.playSample("roomInviteReceived", T.AUDIO_ROOM_INVITE_RECEIVED_GAIN, rand(0.96, 1.04))) return;
+    this.blip(660, 0.055, 0.075);
+    this.blip(660, 0.075, 0.06);
+  }
+  roomJoin() {
+    if (this.playSample("roomJoin", T.AUDIO_ROOM_JOIN_GAIN, rand(0.98, 1.02))) return;
+    this.blip(324, 0.13, 0.085);
+    this.blip(486, 0.16, 0.065);
+    this.blip(648, 0.19, 0.05);
+  }
+  roomLeave() {
+    if (this.playSample("roomLeave", T.AUDIO_ROOM_LEAVE_GAIN, rand(0.96, 1.02))) return;
+    this.blip(360, 0.08, 0.06);
+    this.blip(180, 0.12, 0.075);
+  }
+  signalLock() {
+    if (this.playSample("signalLock", T.AUDIO_SIGNAL_LOCK_GAIN, rand(0.98, 1.02))) return;
+    this.blip(432, 0.10, 0.075);
+    this.blip(648, 0.12, 0.06);
+  }
+  signalLost() {
+    if (this.playSample("signalLost", T.AUDIO_SIGNAL_LOST_GAIN, rand(0.96, 1.02))) return;
+    this.noiseBurst(0.11, 0.12, 840);
+    this.blip(144, 0.18, 0.075);
+  }
+  transponderPing() {
+    if (this.playSample("transponderPing", T.AUDIO_TRANSPONDER_PING_GAIN, rand(0.98, 1.04))) return;
+    this.blip(1188, 0.026, 0.045);
+  }
+  relayFallback() {
+    if (this.playSample("relayFallback", T.AUDIO_RELAY_FALLBACK_GAIN, rand(0.96, 1.04))) return;
+    this.noiseBurst(0.09, 0.10, 1200);
+    this.blip(420, 0.07, 0.055);
+  }
   nextWave() {
     if (!this.playSample("nextWave", T.AUDIO_NEXT_WAVE_GAIN)) {
       this.blip(660, 0.08, 0.16);
@@ -910,9 +1070,27 @@ class AudioEngine {
 // ===================== PLAYER IDENTITY + LEADERBOARD API =====================
 type PublicPlayer = { authenticated: boolean; authProvider: string; callsign: string | null; canChooseCallsign: boolean };
 type LeaderboardEntry = { rank: number; callsign: string; score: number; wave: number; survivalTimeSec: number; createdAt: string };
-type SecurityStatus = { ok: boolean; csrfToken: string; player: PublicPlayer; devAuthEnabled?: boolean; googleAuthEnabled?: boolean; googleLoginUrl?: string | null };
+type SecurityStatus = { ok: boolean; csrfToken: string; player: PublicPlayer; devAuthEnabled?: boolean; googleAuthEnabled?: boolean; googleLoginUrl?: string | null; multiplayerIceServers?: RTCIceServer[] };
 type LeaderboardResponse = { ok: boolean; entries: LeaderboardEntry[] };
 type ScoreSubmitStatus = "idle" | "submitting" | "submitted" | "needs_login" | "needs_callsign" | "error";
+type MultiplayerRoomResponse = { ok: boolean; room: MultiplayerServerRoom };
+type MultiplayerInviteResponse = { ok: boolean; room?: MultiplayerServerRoom | null; invite?: MultiplayerInvite };
+type MultiplayerInvitesResponse = { ok: boolean; invites: MultiplayerInvite[] };
+type MultiplayerSignalPostResponse = { ok: boolean; signal: MultiplayerSignalMessage };
+type MultiplayerSignalInboxResponse = { ok: boolean; signals: MultiplayerSignalMessage[]; latestSeq: number };
+type MultiplayerServerRoom = {
+  roomId: string;
+  roomCode: string;
+  hostCallsign: string;
+  visibility: MultiplayerRoomVisibility;
+  configPolicy: MultiplayerConfigPolicy;
+  status: "LOBBY" | "COUNTDOWN" | "PLAYING" | "DEBRIEF";
+  route: MultiplayerRoute | string;
+  lastSignal: string;
+  createdAt: string;
+  updatedAt: string;
+  pilots: MultiplayerPilot[];
+};
 
 async function readJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, { credentials: "same-origin", ...init });
@@ -950,6 +1128,30 @@ function callsignStatusMessage(player: PublicPlayer) {
   if (!player.authenticated) return "Log in before choosing a callsign.";
   if (player.callsign) return `Pilot ${player.callsign} indexed. Callsigns are account-bound.`;
   return "Choose exactly three letters or digits. This claim is permanent from the arcade UI.";
+}
+
+function multiplayerPhaseFromServer(status: string): MultiplayerRoomPhase {
+  const normalized = status.toLowerCase();
+  if (normalized === "countdown") return "countdown";
+  if (normalized === "playing") return "playing";
+  if (normalized === "debrief") return "debrief";
+  return "lobby";
+}
+
+function multiplayerRoomFromServer(room: MultiplayerServerRoom): MultiplayerRoomState {
+  return {
+    phase: multiplayerPhaseFromServer(room.status),
+    source: "SERVER",
+    roomId: room.roomId,
+    roomCode: room.roomCode,
+    hostCallsign: room.hostCallsign,
+    visibility: room.visibility,
+    configPolicy: room.configPolicy,
+    route: (room.route === "SIGNAL SERVER" || room.route === "LOCAL PHOSPHOR LOCK" || room.route === "DIRECT DARK FOREST LINK" || room.route === "RELAYED THROUGH METATRON NODE") ? room.route : "SIGNAL SERVER",
+    pilots: room.pilots.slice(0, T.MULTIPLAYER_MAX_PILOTS),
+    lastSignal: room.lastSignal || "DEFENSE CHANNEL OPEN // SIGNAL SERVER READY",
+    openedAtMs: performance.now(),
+  };
 }
 
 const MENU_HINT_TICK_MS = 50;
@@ -1000,6 +1202,10 @@ export default function MetatronVectorFOIL() {
   const [devHandle, setDevHandle] = useState("dev");
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [scoreSubmitStatus, setScoreSubmitStatus] = useState<ScoreSubmitStatus>("idle");
+  const [multiplayerRoom, setMultiplayerRoom] = useState<MultiplayerRoomState>(() => closedMultiplayerRoom());
+  const [multiplayerCarrier, setMultiplayerCarrier] = useState<MultiplayerCarrierState>(() => coldMultiplayerCarrier());
+  const [multiplayerInvite, setMultiplayerInvite] = useState("");
+  const [multiplayerInvites, setMultiplayerInvites] = useState<MultiplayerInvite[]>([]);
   const [menuHintIdx, setMenuHintIdx] = useState(0);
   const [menuHintTick, setMenuHintTick] = useState(0);
   const [attractIdx, setAttractIdx] = useState(0);
@@ -1010,6 +1216,17 @@ export default function MetatronVectorFOIL() {
   const togglesRef = useRef(toggles);
   const csrfTokenRef = useRef("");
   const playerIdentityRef = useRef<PublicPlayer>(DEFAULT_PLAYER);
+  const multiplayerRoomRef = useRef<MultiplayerRoomState>(closedMultiplayerRoom());
+  const multiplayerCarrierRef = useRef<MultiplayerCarrierState>(coldMultiplayerCarrier());
+  const multiplayerIceServersRef = useRef<RTCIceServer[]>([]);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const carrierTargetRef = useRef<string | null>(null);
+  const carrierRoleRef = useRef<MultiplayerCarrierRole>("none");
+  const signalPollSeqRef = useRef(0);
+  const heartbeatTimerRef = useRef<number | null>(null);
+  const signalSendChainRef = useRef<Promise<void>>(Promise.resolve());
+  const lastSignalSendAtRef = useRef(0);
   const submitScoreRef = useRef<(snapshot: DebriefSnapshot) => void>(() => undefined);
   const clientStartupLoggedRef = useRef(false);
   const commendationMapRef = useRef<Record<string, CommendationDefinition>>(buildCommendationMap(DEFAULT_COMMENDATIONS));
@@ -1043,6 +1260,8 @@ export default function MetatronVectorFOIL() {
   useEffect(() => { togglesRef.current = toggles; }, [toggles]);
   useEffect(() => { csrfTokenRef.current = csrfToken; }, [csrfToken]);
   useEffect(() => { playerIdentityRef.current = playerIdentity; }, [playerIdentity]);
+  useEffect(() => { multiplayerRoomRef.current = multiplayerRoom; }, [multiplayerRoom]);
+  useEffect(() => { multiplayerCarrierRef.current = multiplayerCarrier; }, [multiplayerCarrier]);
 
   const refreshLeaderboard = async () => {
     try {
@@ -1057,6 +1276,36 @@ export default function MetatronVectorFOIL() {
     }
   };
 
+  const refreshMultiplayerInvites = async () => {
+    const identity = playerIdentityRef.current;
+    if (!identity.authenticated || !identity.callsign) {
+      setMultiplayerInvites([]);
+      return;
+    }
+    try {
+      const payload = await readJson<MultiplayerInvitesResponse>("/api/multiplayer/invites");
+      setMultiplayerInvites(payload.invites ?? []);
+    } catch (err) {
+      void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
+        endpoint: "/api/multiplayer/invites",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  };
+
+  const refreshMultiplayerRoom = async (roomId: string) => {
+    try {
+      const payload = await readJson<MultiplayerRoomResponse>(`/api/multiplayer/rooms/${encodeURIComponent(roomId)}`);
+      setMultiplayerRoom(multiplayerRoomFromServer(payload.room));
+    } catch (err) {
+      setMultiplayerRoom((room) => room.roomId === roomId ? { ...room, route: "NO CARRIER", lastSignal: "SIGNAL SERVER LOST // LOCAL TRACE REMAINS" } : room);
+      void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
+        endpoint: "/api/multiplayer/rooms/:id",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  };
+
   const refreshSecurityStatus = async () => {
     try {
       const status = await readJson<SecurityStatus>("/api/security/status");
@@ -1065,6 +1314,7 @@ export default function MetatronVectorFOIL() {
       setDevAuthEnabled(Boolean(status.devAuthEnabled));
       setGoogleAuthEnabled(Boolean(status.googleAuthEnabled));
       setGoogleLoginUrl(status.googleLoginUrl ?? null);
+      multiplayerIceServersRef.current = Array.isArray(status.multiplayerIceServers) ? status.multiplayerIceServers : [];
       setCallsignInput(status.player?.callsign ?? "");
       setCallsignMessage(callsignStatusMessage(status.player ?? DEFAULT_PLAYER));
       if (!clientStartupLoggedRef.current) {
@@ -1079,12 +1329,268 @@ export default function MetatronVectorFOIL() {
     }
   };
 
+  const updateCarrier = (patch: Partial<MultiplayerCarrierState>) => {
+    setMultiplayerCarrier((carrier) => ({ ...carrier, ...patch }));
+  };
+
+  const markCarrierPilot = (targetCallsign: string | null, status: MultiplayerPilotStatus, lastSignal: string, route?: MultiplayerRoute) => {
+    if (!targetCallsign) return;
+    setMultiplayerRoom((room) => {
+      if (room.phase === "closed") return room;
+      return {
+        ...room,
+        route: route ?? room.route,
+        lastSignal,
+        pilots: room.pilots.map((pilot) => pilot.callsign === targetCallsign ? { ...pilot, status, signalAgeMs: 0 } : pilot),
+      };
+    });
+  };
+
+  const stopWebRtcCarrier = (message = "P2P CARRIER COLD", playLost = false) => {
+    if (heartbeatTimerRef.current !== null) {
+      window.clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+    try { dataChannelRef.current?.close(); } catch {}
+    try { peerConnectionRef.current?.close(); } catch {}
+    dataChannelRef.current = null;
+    peerConnectionRef.current = null;
+    carrierTargetRef.current = null;
+    carrierRoleRef.current = "none";
+    signalPollSeqRef.current = 0;
+    if (playLost) audioRef.current.signalLost();
+    setMultiplayerCarrier({ ...coldMultiplayerCarrier(), status: playLost ? "lost" : "idle", lastMessage: message });
+  };
+
+  const postSignalMessage = async (toCallsign: string, signalType: MultiplayerSignalType, payload: Record<string, unknown>) => {
+    const room = multiplayerRoomRef.current;
+    const token = csrfTokenRef.current;
+    if (!token || !room.roomId) return;
+    const send = async () => {
+      const elapsed = Date.now() - lastSignalSendAtRef.current;
+      if (elapsed < 130) await new Promise((resolve) => window.setTimeout(resolve, 130 - elapsed));
+      lastSignalSendAtRef.current = Date.now();
+      await readJson<MultiplayerSignalPostResponse>("/api/multiplayer/signal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: JSON.stringify({ roomId: room.roomId, toCallsign, signalType, payload }),
+      });
+    };
+    const next = signalSendChainRef.current.then(send, send);
+    signalSendChainRef.current = next.catch(() => undefined);
+    await next;
+  };
+
+  const startHeartbeat = (targetCallsign: string) => {
+    if (heartbeatTimerRef.current !== null) window.clearInterval(heartbeatTimerRef.current);
+    const sendBeat = () => {
+      const channel = dataChannelRef.current;
+      if (!channel || channel.readyState !== "open") return;
+      const room = multiplayerRoomRef.current;
+      const callsign = playerIdentityRef.current.callsign ?? "???";
+      try {
+        channel.send(JSON.stringify({ type: "carrier_heartbeat", roomId: room.roomId, fromCallsign: callsign, toCallsign: targetCallsign, sentAt: Date.now() }));
+      } catch {}
+    };
+    sendBeat();
+    heartbeatTimerRef.current = window.setInterval(sendBeat, 1500);
+  };
+
+  const setupDataChannel = (channel: RTCDataChannel, targetCallsign: string, role: MultiplayerCarrierRole) => {
+    dataChannelRef.current = channel;
+    channel.onopen = () => {
+      audioRef.current.signalLock();
+      startHeartbeat(targetCallsign);
+      updateCarrier({ status: "locked", role, targetCallsign, heartbeatAgeMs: 0, lastMessage: `PHOSPHOR LOCK // ${targetCallsign}` });
+      markCarrierPilot(targetCallsign, "PHOSPHOR LOCK", `PHOSPHOR LOCK // ${targetCallsign}`, "LOCAL PHOSPHOR LOCK");
+    };
+    channel.onmessage = (event) => {
+      let payload: { type?: string; sentAt?: number } = {};
+      try { payload = JSON.parse(String(event.data)); } catch { return; }
+      if (payload.type === "carrier_heartbeat") {
+        const age = typeof payload.sentAt === "number" ? Math.max(0, Date.now() - payload.sentAt) : 0;
+        updateCarrier({ status: "locked", heartbeatAgeMs: age, lastMessage: `HEARTBEAT ${targetCallsign} // ${String(age).padStart(3, "0")}MS` });
+      }
+    };
+    channel.onclose = () => {
+      updateCarrier({ status: "lost", lastMessage: `TRACE LOST // ${targetCallsign}` });
+      markCarrierPilot(targetCallsign, "TRACE LOST", `TRACE LOST // ${targetCallsign}`, "SIGNAL SERVER");
+      audioRef.current.signalLost();
+    };
+    channel.onerror = () => {
+      updateCarrier({ status: "error", lastMessage: `CARRIER NOISE // ${targetCallsign}` });
+    };
+  };
+
+  const createPeerConnection = (targetCallsign: string, role: MultiplayerCarrierRole) => {
+    const pc = new RTCPeerConnection({ iceServers: multiplayerIceServersRef.current });
+    peerConnectionRef.current = pc;
+    carrierTargetRef.current = targetCallsign;
+    carrierRoleRef.current = role;
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        void postSignalMessage(targetCallsign, "ice", event.candidate.toJSON() as Record<string, unknown>);
+      }
+    };
+    pc.ondatachannel = (event) => setupDataChannel(event.channel, targetCallsign, role);
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState;
+      if (state === "connected") {
+        updateCarrier({ status: "locked", role, targetCallsign, lastMessage: `DIRECT CARRIER CONNECTED // ${targetCallsign}` });
+      } else if (state === "failed" || state === "disconnected") {
+        updateCarrier({ status: "lost", role, targetCallsign, lastMessage: `P2P CARRIER ${state.toUpperCase()} // ${targetCallsign}` });
+        markCarrierPilot(targetCallsign, "TRACE LOST", `P2P CARRIER ${state.toUpperCase()} // ${targetCallsign}`, "SIGNAL SERVER");
+        audioRef.current.signalLost();
+      }
+    };
+    return pc;
+  };
+
+  const chooseCarrierTarget = (room: MultiplayerRoomState): { target: string; role: MultiplayerCarrierRole } | null => {
+    const me = playerIdentityRef.current.callsign;
+    if (!me || room.source !== "SERVER" || !room.roomId || room.phase === "closed") return null;
+    const isHost = room.hostCallsign === me;
+    if (isHost) {
+      const ally = room.pilots.find((pilot) => pilot.role === "ALLY" && ["SIGNAL ACQUIRED", "PHOSPHOR LOCK"].includes(pilot.status));
+      return ally ? { target: ally.callsign, role: "host" } : null;
+    }
+    const selfInRoom = room.pilots.some((pilot) => pilot.callsign === me && pilot.role !== "SLOT");
+    if (selfInRoom && room.hostCallsign && room.hostCallsign !== me) return { target: room.hostCallsign, role: "client" };
+    return null;
+  };
+
+  const startWebRtcCarrier = async (targetCallsign: string, role: MultiplayerCarrierRole) => {
+    if (typeof RTCPeerConnection === "undefined") {
+      updateCarrier({ status: "error", role, targetCallsign, lastMessage: "WEBRTC ABSENT // BROWSER CANNOT LOCK" });
+      return;
+    }
+    if (carrierTargetRef.current === targetCallsign && carrierRoleRef.current === role && peerConnectionRef.current) return;
+    stopWebRtcCarrier(`SEARCHING CARRIER // ${targetCallsign}`, false);
+    audioRef.current.transponderPing();
+    signalPollSeqRef.current = 0;
+    updateCarrier({ status: "searching", role, targetCallsign, signalSeq: 0, lastMessage: role === "host" ? `OFFER TRACE ARMING // ${targetCallsign}` : `AWAITING OFFER TRACE // ${targetCallsign}` });
+    markCarrierPilot(targetCallsign, "SIGNAL ACQUIRED", `SEARCHING CARRIER // ${targetCallsign}`, "SIGNAL SERVER");
+    const pc = createPeerConnection(targetCallsign, role);
+    if (role === "host") {
+      const channel = pc.createDataChannel("metatron-carrier", { ordered: false, maxRetransmits: 0 });
+      setupDataChannel(channel, targetCallsign, role);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      if (pc.localDescription) {
+        await postSignalMessage(targetCallsign, "offer", { type: pc.localDescription.type, sdp: pc.localDescription.sdp });
+        updateCarrier({ status: "searching", role, targetCallsign, lastMessage: `OFFER TRACE SENT // ${targetCallsign}` });
+      }
+    }
+  };
+
+  const handleSignalMessage = async (signal: MultiplayerSignalMessage) => {
+    const target = carrierTargetRef.current;
+    if (!target || signal.fromCallsign !== target) return;
+    let pc = peerConnectionRef.current;
+    const role = carrierRoleRef.current;
+    try {
+      if (signal.signalType === "offer") {
+        if (!pc) pc = createPeerConnection(signal.fromCallsign, "client");
+        const type = String(signal.payload.type || "offer") as RTCSdpType;
+        const sdp = typeof signal.payload.sdp === "string" ? signal.payload.sdp : "";
+        if (!sdp) return;
+        await pc.setRemoteDescription({ type, sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        if (pc.localDescription) {
+          await postSignalMessage(signal.fromCallsign, "answer", { type: pc.localDescription.type, sdp: pc.localDescription.sdp });
+          updateCarrier({ status: "searching", role: "client", targetCallsign: signal.fromCallsign, lastMessage: `ANSWER TRACE SENT // ${signal.fromCallsign}` });
+        }
+      } else if (signal.signalType === "answer" && pc) {
+        const type = String(signal.payload.type || "answer") as RTCSdpType;
+        const sdp = typeof signal.payload.sdp === "string" ? signal.payload.sdp : "";
+        if (sdp && pc.signalingState !== "stable") {
+          await pc.setRemoteDescription({ type, sdp });
+          updateCarrier({ status: "searching", role, targetCallsign: signal.fromCallsign, lastMessage: `ANSWER TRACE RECEIVED // ${signal.fromCallsign}` });
+        }
+      } else if (signal.signalType === "ice" && pc) {
+        const candidate = signal.payload as RTCIceCandidateInit;
+        if (typeof candidate.candidate === "string") await pc.addIceCandidate(candidate);
+      } else if (signal.signalType === "heartbeat") {
+        updateCarrier({ heartbeatAgeMs: 0, lastMessage: `SIGNAL HEARTBEAT // ${signal.fromCallsign}` });
+      }
+    } catch (err) {
+      updateCarrier({ status: "error", lastMessage: `SIGNAL DECODER FAULT // ${signal.fromCallsign}` });
+      void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
+        endpoint: "webrtc.signal",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  };
+
+  useEffect(() => {
+    const plan = chooseCarrierTarget(multiplayerRoom);
+    if (!plan) {
+      if (multiplayerRoom.phase === "closed" || multiplayerRoom.source !== "SERVER") stopWebRtcCarrier("P2P CARRIER COLD", false);
+      return;
+    }
+    void startWebRtcCarrier(plan.target, plan.role);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    multiplayerRoom.source,
+    multiplayerRoom.roomId,
+    multiplayerRoom.hostCallsign,
+    multiplayerRoom.phase,
+    playerIdentity.callsign,
+    multiplayerRoom.pilots.map((pilot) => `${pilot.callsign}:${pilot.role}:${pilot.status}`).join("|"),
+  ]);
+
+  useEffect(() => {
+    if (multiplayerRoom.source !== "SERVER" || !multiplayerRoom.roomId || multiplayerRoom.phase === "closed" || !playerIdentity.callsign) return;
+    let cancelled = false;
+    const roomId = multiplayerRoom.roomId;
+    const poll = async () => {
+      const token = csrfTokenRef.current;
+      if (!token || cancelled) return;
+      try {
+        const payload = await readJson<MultiplayerSignalInboxResponse>(`/api/multiplayer/signal?roomId=${encodeURIComponent(roomId)}&since=${signalPollSeqRef.current}`);
+        if (cancelled) return;
+        for (const signal of payload.signals ?? []) {
+          signalPollSeqRef.current = Math.max(signalPollSeqRef.current, signal.seq);
+          await handleSignalMessage(signal);
+        }
+        signalPollSeqRef.current = Math.max(signalPollSeqRef.current, payload.latestSeq ?? signalPollSeqRef.current);
+        setMultiplayerCarrier((carrier) => ({ ...carrier, signalSeq: signalPollSeqRef.current }));
+      } catch (err) {
+        if (!cancelled) {
+          updateCarrier({ status: multiplayerCarrierRef.current.status === "locked" ? "lost" : "searching", lastMessage: "SIGNAL MAILBOX DEGRADED" });
+          void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
+            endpoint: "/api/multiplayer/signal",
+            message: err instanceof Error ? err.message : "unknown",
+          });
+        }
+      }
+    };
+    poll();
+    const id = window.setInterval(poll, 900);
+    return () => { cancelled = true; window.clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [multiplayerRoom.source, multiplayerRoom.roomId, multiplayerRoom.phase, playerIdentity.callsign]);
+
   useEffect(() => {
     refreshSecurityStatus();
     refreshLeaderboard();
     const id = window.setInterval(refreshLeaderboard, 30000);
     return () => window.clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    refreshMultiplayerInvites();
+    const id = window.setInterval(refreshMultiplayerInvites, 5000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    if (multiplayerRoom.source !== "SERVER" || !multiplayerRoom.roomId || multiplayerRoom.phase === "closed") return;
+    const roomId = multiplayerRoom.roomId;
+    const id = window.setInterval(() => refreshMultiplayerRoom(roomId), 3000);
+    return () => window.clearInterval(id);
+  }, [multiplayerRoom.source, multiplayerRoom.roomId, multiplayerRoom.phase]);
 
   submitScoreRef.current = (snapshot: DebriefSnapshot) => {
     const token = csrfTokenRef.current;
@@ -1208,6 +1714,154 @@ export default function MetatronVectorFOIL() {
       setScoreSubmitStatus("idle");
     } catch (err) {
       setCallsignMessage(`Logout failed: ${err instanceof Error ? err.message : "unknown"}`);
+    }
+  };
+
+
+  const localMultiplayerRoom = (lastSignal = "DEFENSE CHANNEL OPEN // LOCAL SCAFFOLD ONLY"): MultiplayerRoomState => {
+    const hostCallsign = playerIdentityRef.current.callsign ?? "YOU";
+    return {
+      phase: "lobby",
+      source: "LOCAL",
+      roomId: null,
+      roomCode: makeRoomCode(),
+      hostCallsign,
+      visibility: T.MULTIPLAYER_DEFAULT_VISIBILITY as MultiplayerRoomVisibility,
+      configPolicy: T.MULTIPLAYER_DEFAULT_CONFIG_POLICY as MultiplayerConfigPolicy,
+      route: "LOCAL SCAFFOLD",
+      openedAtMs: performance.now(),
+      lastSignal,
+      pilots: [
+        { callsign: hostCallsign, role: "HOST", status: "HOST LOCKED", signalAgeMs: 0 },
+        { callsign: "___", role: "SLOT", status: "AWAITING CARRIER", signalAgeMs: 0 },
+      ],
+    };
+  };
+
+  const openMultiplayerChannel = async () => {
+    audioRef.current.init();
+    audioRef.current.roomCreate();
+    window.setTimeout(() => audioRef.current.signalLock(), 140);
+
+    const identity = playerIdentityRef.current;
+    if (!csrfTokenRef.current || !identity.authenticated || !identity.callsign) {
+      setMultiplayerRoom(localMultiplayerRoom("LOCAL DEFENSE CHANNEL OPEN // CLAIM CALLSIGN FOR SERVER INVITES"));
+      return;
+    }
+
+    try {
+      const payload = await readJson<MultiplayerRoomResponse>("/api/multiplayer/rooms", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfTokenRef.current },
+        body: JSON.stringify({
+          visibility: T.MULTIPLAYER_DEFAULT_VISIBILITY,
+          configPolicy: T.MULTIPLAYER_DEFAULT_CONFIG_POLICY,
+        }),
+      });
+      setMultiplayerRoom(multiplayerRoomFromServer(payload.room));
+    } catch (err) {
+      setMultiplayerRoom(localMultiplayerRoom("SIGNAL SERVER REJECTED // LOCAL SCAFFOLD ONLINE"));
+      void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
+        endpoint: "/api/multiplayer/rooms",
+        message: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  };
+
+  const closeMultiplayerChannel = async () => {
+    audioRef.current.init();
+    audioRef.current.roomLeave();
+    const closingRoom = multiplayerRoomRef.current;
+    stopWebRtcCarrier("DEFENSE CHANNEL CLOSED", false);
+    setMultiplayerRoom(closedMultiplayerRoom());
+    setMultiplayerInvite("");
+    if (closingRoom.source === "SERVER" && closingRoom.roomId && csrfTokenRef.current && closingRoom.hostCallsign === playerIdentityRef.current.callsign) {
+      try {
+        await readJson<{ ok: boolean }>(`/api/multiplayer/rooms/${encodeURIComponent(closingRoom.roomId)}/close`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfTokenRef.current },
+          body: JSON.stringify({}),
+        });
+      } catch (err) {
+        void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
+          endpoint: "/api/multiplayer/rooms/:id/close",
+          message: err instanceof Error ? err.message : "unknown",
+        });
+      }
+    }
+  };
+
+  const addLocalInviteTrace = (callsign: string, status: MultiplayerPilotStatus = "TRACE PREVIEW", signal = `CALLSIGN VECTOR SENT // ${callsign}`) => {
+    setMultiplayerRoom((room) => {
+      const base = room.phase !== "closed" ? room : localMultiplayerRoom();
+      const withoutSlots = base.pilots.filter((p) => p.role !== "SLOT" && p.callsign !== callsign);
+      return {
+        ...base,
+        source: base.source,
+        lastSignal: signal,
+        pilots: [
+          ...withoutSlots,
+          { callsign, role: "ALLY" as const, status, signalAgeMs: 0 },
+          ...(withoutSlots.length + 1 < T.MULTIPLAYER_MAX_PILOTS ? [{ callsign: "___", role: "SLOT" as const, status: "AWAITING CARRIER" as const, signalAgeMs: 0 }] : []),
+        ].slice(0, T.MULTIPLAYER_MAX_PILOTS),
+      };
+    });
+  };
+
+  const sendMultiplayerInvite = async () => {
+    const callsign = normalizeCallsignInput(multiplayerInvite);
+    if (!/^[A-Za-z0-9]{3}$/.test(callsign)) return;
+    audioRef.current.init();
+    audioRef.current.roomInvite();
+    window.setTimeout(() => audioRef.current.transponderPing(), 100);
+
+    const room = multiplayerRoomRef.current;
+    if (room.source === "SERVER" && room.roomId && csrfTokenRef.current) {
+      try {
+        const payload = await readJson<MultiplayerInviteResponse>(`/api/multiplayer/rooms/${encodeURIComponent(room.roomId)}/invite`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfTokenRef.current },
+          body: JSON.stringify({ callsign }),
+        });
+        if (payload.room) setMultiplayerRoom(multiplayerRoomFromServer(payload.room));
+        setMultiplayerInvite("");
+        return;
+      } catch (err) {
+        addLocalInviteTrace(callsign, "TRACE PREVIEW", `SERVER VECTOR FAILED // LOCAL TRACE ${callsign}`);
+        void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
+          endpoint: "/api/multiplayer/rooms/:id/invite",
+          message: err instanceof Error ? err.message : "unknown",
+        });
+        setMultiplayerInvite("");
+        return;
+      }
+    }
+
+    addLocalInviteTrace(callsign);
+    setMultiplayerInvite("");
+  };
+
+  const respondToMultiplayerInvite = async (invite: MultiplayerInvite, decision: "accept" | "decline") => {
+    if (!csrfTokenRef.current) return;
+    audioRef.current.init();
+    if (decision === "accept") audioRef.current.roomInviteReceived();
+    else audioRef.current.roomLeave();
+    try {
+      const payload = await readJson<MultiplayerInviteResponse>(`/api/multiplayer/invites/${encodeURIComponent(invite.inviteId)}/respond`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfTokenRef.current },
+        body: JSON.stringify({ decision }),
+      });
+      setMultiplayerInvites((items) => items.filter((item) => item.inviteId !== invite.inviteId));
+      if (decision === "accept" && payload.room) {
+        window.setTimeout(() => audioRef.current.roomJoin(), 120);
+        setMultiplayerRoom(multiplayerRoomFromServer(payload.room));
+      }
+    } catch (err) {
+      void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
+        endpoint: "/api/multiplayer/invites/:id/respond",
+        message: err instanceof Error ? err.message : "unknown",
+      });
     }
   };
 
@@ -2979,6 +3633,7 @@ export default function MetatronVectorFOIL() {
           phaseElapsedMs: debriefPhaseElapsedMs,
           snapshot: debriefSnapshot,
         },
+        multiplayer: multiplayerRoomRef.current,
       });
 
       raf = requestAnimationFrame(loop);
@@ -2989,6 +3644,7 @@ export default function MetatronVectorFOIL() {
     return () => {
       resetToMenuRef.current = null;
       cancelAnimationFrame(raf);
+      stopWebRtcCarrier("COMPONENT UNMOUNT", false);
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onKeyDown as any);
       window.removeEventListener("keyup", onKeyUp as any);
@@ -3045,9 +3701,14 @@ export default function MetatronVectorFOIL() {
           height: "100%",
         }}
       />
-            <div style={{ opacity: debriefHudFade, pointerEvents: debriefHudFade <= 0.001 ? "none" : undefined }}>
-        <HUDRoot state={hudState} config={hudConfig} />
-      </div>
+      {mode !== "menu" && (
+        <div style={{ opacity: debriefHudFade, pointerEvents: debriefHudFade <= 0.001 ? "none" : undefined }}>
+          <HUDRoot state={hudState} config={hudConfig} />
+        </div>
+      )}
+      {mode !== "menu" && multiplayerRoom.phase !== "closed" && (
+        <MultiplayerRosterOverlay room={multiplayerRoom} carrier={multiplayerCarrier} debrief={mode === "debrief"} />
+      )}
 
       {/* Start screen */}
       {mode === "menu" && (
@@ -3223,7 +3884,7 @@ export default function MetatronVectorFOIL() {
             </div>
 
             <div style={{ display: "grid", placeItems: "center", minHeight: 0 }}>
-              <div style={{ width: "min(1140px, 96vw)", display: "grid", gridTemplateColumns: "minmax(286px, 398px) minmax(42px, 1fr) minmax(286px, 420px)", gap: "clamp(12px, 2vw, 20px)", alignItems: "end" }}>
+              <div style={{ width: "min(1100px, 96vw)", display: "grid", gridTemplateColumns: "minmax(278px, 382px) minmax(252px, 316px) minmax(278px, 382px)", gap: "clamp(12px, 1.8vw, 18px)", alignItems: "end" }}>
                 <VectorFrame title="PILOT // IDENTITY TRACE">
                   <div style={{ display: "grid", gap: 10 }}>
                     <div style={{ fontSize: 15, lineHeight: 1.3, letterSpacing: "0.13em", textTransform: "uppercase", color: "rgba(176,255,218,0.86)", textShadow: "0 0 12px rgba(145,255,212,0.12)" }}>
@@ -3255,8 +3916,22 @@ export default function MetatronVectorFOIL() {
                   <LeaderboardConsole entries={leaderboard} status={scoreSubmitStatus} compact />
                 </VectorFrame>
 
-                <div aria-hidden style={{ alignSelf: "stretch", minHeight: 220, display: "grid", placeItems: "center", pointerEvents: "none" }}>
-                  <GhostMetatronCube glow={featuredGlow} opacity={featuredOpacity} headline={featuredHeadline} subline={featuredSubline} />
+                <div style={{ alignSelf: "stretch", minHeight: 220, display: "grid", gap: 12, placeItems: "center" }}>
+                  <div aria-hidden style={{ pointerEvents: "none" }}>
+                    <GhostMetatronCube glow={featuredGlow} opacity={featuredOpacity} headline={featuredHeadline} subline={featuredSubline} />
+                  </div>
+                  <MultiplayerConsole
+                    room={multiplayerRoom}
+                    carrier={multiplayerCarrier}
+                    invite={multiplayerInvite}
+                    invites={multiplayerInvites}
+                    onInviteChange={setMultiplayerInvite}
+                    onOpen={openMultiplayerChannel}
+                    onInvite={sendMultiplayerInvite}
+                    onClose={closeMultiplayerChannel}
+                    onAcceptInvite={(pending) => respondToMultiplayerInvite(pending, "accept")}
+                    onDeclineInvite={(pending) => respondToMultiplayerInvite(pending, "decline")}
+                  />
                 </div>
 
                 <VectorFrame title="FLIGHT SCHOOL // ORBITAL TRACE">
@@ -3568,6 +4243,156 @@ function VectorTelemetry({ label, value }: { label: string; value: string }) {
     <div style={{ display: "grid", gap: 4, borderTop: "1px solid rgba(150,205,255,0.14)", paddingTop: 8 }}>
       <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.56)" }}>{label}</div>
       <div style={{ fontSize: 13, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(214,242,255,0.86)" }}>{value}</div>
+    </div>
+  );
+}
+
+function MultiplayerConsole({
+  room,
+  carrier,
+  invite,
+  invites,
+  onInviteChange,
+  onOpen,
+  onInvite,
+  onClose,
+  onAcceptInvite,
+  onDeclineInvite,
+}: {
+  room: MultiplayerRoomState;
+  carrier: MultiplayerCarrierState;
+  invite: string;
+  invites: MultiplayerInvite[];
+  onInviteChange: (value: string) => void;
+  onOpen: () => void | Promise<void>;
+  onInvite: () => void | Promise<void>;
+  onClose: () => void | Promise<void>;
+  onAcceptInvite: (invite: MultiplayerInvite) => void | Promise<void>;
+  onDeclineInvite: (invite: MultiplayerInvite) => void | Promise<void>;
+}) {
+  const open = room.phase === "lobby";
+  const inviteReady = /^[A-Za-z0-9]{3}$/.test(invite);
+  const pilotRows = open && room.pilots.length > 0 ? room.pilots : [
+    { callsign: "___", role: "SLOT" as const, status: "AWAITING CARRIER" as const, signalAgeMs: 0 },
+  ];
+  return (
+    <div style={{
+      width: "min(300px, 100%)",
+      display: "grid",
+      gap: 8,
+      padding: 10,
+      border: "1px solid rgba(176,255,218,0.16)",
+      background: "linear-gradient(180deg, rgba(4,17,20,0.56), rgba(0,0,0,0.18))",
+      boxShadow: "inset 0 0 24px rgba(98,220,180,0.055), 0 0 18px rgba(98,220,180,0.035)",
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+        <div style={{ fontSize: 9, letterSpacing: "0.25em", textTransform: "uppercase", color: "rgba(176,255,218,0.72)" }}>Constellation Defense</div>
+        <div style={{ fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: open ? "rgba(176,255,218,0.84)" : "rgba(150,205,255,0.48)" }}>{open ? room.roomCode : "COLD"}</div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 5 }}>
+        <VectorTelemetry label="Signal Route" value={room.route} />
+        <VectorTelemetry label="Config" value={open ? `${room.visibility} // ${room.configPolicy}` : "P2P SCAFFOLD // UNRANKED"} />
+        <VectorTelemetry label="Source" value={open ? `${room.source} // ${room.hostCallsign ?? "NO HOST"}` : "LOCAL // COLD"} />
+        <VectorTelemetry label="P2P Carrier" value={open ? `${carrier.status.toUpperCase()} // ${carrier.targetCallsign ?? "NO PEER"}` : "COLD // NO PEER"} />
+      </div>
+
+      <div style={{ display: "grid", gap: 5, padding: "7px 0", borderTop: "1px solid rgba(150,205,255,0.10)", borderBottom: "1px solid rgba(150,205,255,0.10)" }}>
+        {pilotRows.slice(0, T.MULTIPLAYER_MAX_PILOTS).map((pilot, idx) => (
+          <div key={`${pilot.callsign}-${pilot.role}-${idx}`} style={{ display: "grid", gridTemplateColumns: "4ch 4ch 1fr", gap: 6, alignItems: "baseline", fontSize: 10, letterSpacing: "0.10em", textTransform: "uppercase", color: pilot.role === "SLOT" ? "rgba(150,205,255,0.44)" : "rgba(218,244,255,0.82)" }}>
+            <span style={{ color: pilot.role === "HOST" ? "rgba(176,255,218,0.88)" : "rgba(150,205,255,0.66)" }}>{pilot.callsign}</span>
+            <span style={{ color: "rgba(243,214,152,0.58)" }}>{pilot.role}</span>
+            <span>{pilot.status}</span>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ fontSize: 9, lineHeight: 1.42, letterSpacing: "0.09em", textTransform: "uppercase", color: "rgba(190,224,248,0.60)" }}>
+        {open ? `${room.lastSignal} // ${carrier.lastMessage}` : "Open a local defense-channel shell. WebRTC signal lock arms after a callsign invite is accepted."}
+      </div>
+
+      {invites.length > 0 && (
+        <div style={{ display: "grid", gap: 6, padding: "7px 0", borderTop: "1px solid rgba(243,214,152,0.14)", borderBottom: "1px solid rgba(243,214,152,0.10)" }}>
+          <div style={{ fontSize: 9, letterSpacing: "0.20em", textTransform: "uppercase", color: "rgba(243,214,152,0.72)" }}>Inbound callsign vectors</div>
+          {invites.slice(0, 3).map((pending) => (
+            <div key={pending.inviteId} style={{ display: "grid", gap: 5, padding: 6, border: "1px solid rgba(243,214,152,0.12)", background: "rgba(243,214,152,0.035)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 10, letterSpacing: "0.10em", textTransform: "uppercase", color: "rgba(238,238,210,0.78)" }}>
+                <span>{pending.fromCallsign}</span>
+                <span>{pending.roomCode}</span>
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <button type="button" onClick={() => onAcceptInvite(pending)} style={{ ...btnStyle, padding: "5px 7px", fontSize: 9, borderColor: "rgba(176,255,218,0.24)", color: "rgba(212,255,230,0.90)" }}>Accept</button>
+                <button type="button" onClick={() => onDeclineInvite(pending)} style={{ ...btnStyle, padding: "5px 7px", fontSize: 9 }}>Decline</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+        {!open ? (
+          <button type="button" onClick={onOpen} style={{ ...btnStyle, padding: "6px 8px", fontSize: 10, borderColor: "rgba(176,255,218,0.26)", color: "rgba(212,255,230,0.92)" }}>Open Channel</button>
+        ) : (
+          <button type="button" onClick={onClose} style={{ ...btnStyle, padding: "6px 8px", fontSize: 10 }}>Close</button>
+        )}
+        <input
+          value={invite}
+          maxLength={3}
+          spellCheck={false}
+          autoComplete="off"
+          aria-label="Invite callsign"
+          placeholder="ABC"
+          onChange={(e) => onInviteChange(normalizeCallsignInput(e.target.value))}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") {
+              e.preventDefault();
+              if (inviteReady) onInvite();
+            }
+          }}
+          style={{ ...scopeInputStyle, width: 58, fontSize: 14, letterSpacing: "0.14em", textTransform: "uppercase" }}
+        />
+        <button type="button" onClick={onInvite} disabled={!inviteReady} style={{ ...btnStyle, padding: "6px 8px", fontSize: 10, opacity: inviteReady ? 1 : 0.42, cursor: inviteReady ? "pointer" : "not-allowed" }}>Vector</button>
+      </div>
+    </div>
+  );
+}
+
+function MultiplayerRosterOverlay({ room, carrier, debrief = false }: { room: MultiplayerRoomState; carrier: MultiplayerCarrierState; debrief?: boolean }) {
+  if (room.phase === "closed" || room.pilots.length === 0) return null;
+  const activePilots = room.pilots.filter((pilot) => pilot.role !== "SLOT");
+  if (activePilots.length === 0) return null;
+  return (
+    <div style={{
+      position: "absolute",
+      right: 18,
+      bottom: debrief ? 26 : 18,
+      width: "min(290px, calc(100vw - 36px))",
+      pointerEvents: "none",
+      color: "rgba(210,238,255,0.86)",
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      border: "1px solid rgba(176,255,218,0.13)",
+      background: "linear-gradient(180deg, rgba(2,13,15,0.62), rgba(0,0,0,0.28))",
+      boxShadow: "inset 0 0 26px rgba(98,220,180,0.055), 0 0 16px rgba(98,220,180,0.035)",
+      padding: 10,
+      zIndex: 4,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline", marginBottom: 8 }}>
+        <div style={{ fontSize: 9, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(176,255,218,0.72)" }}>{debrief ? "Team Debrief Shell" : "Pilot Traces"}</div>
+        <div style={{ fontSize: 9, letterSpacing: "0.16em", textTransform: "uppercase", color: "rgba(150,205,255,0.58)" }}>{room.roomCode}</div>
+      </div>
+      <div style={{ display: "grid", gap: 5 }}>
+        {activePilots.slice(0, T.MULTIPLAYER_MAX_PILOTS).map((pilot, idx) => (
+          <div key={`${pilot.callsign}-${idx}`} style={{ display: "grid", gridTemplateColumns: "4ch 4ch 1fr", gap: 6, alignItems: "baseline", fontSize: 10, letterSpacing: "0.10em", textTransform: "uppercase", color: "rgba(218,244,255,0.78)" }}>
+            <span style={{ color: pilot.role === "HOST" ? "rgba(176,255,218,0.90)" : "rgba(150,205,255,0.72)" }}>{pilot.callsign}</span>
+            <span style={{ color: "rgba(243,214,152,0.58)" }}>{pilot.role}</span>
+            <span>{debrief ? "UNRANKED P2P PENDING" : pilot.status}</span>
+          </div>
+        ))}
+      </div>
+      <div style={{ marginTop: 8, paddingTop: 7, borderTop: "1px solid rgba(150,205,255,0.10)", fontSize: 9, lineHeight: 1.38, letterSpacing: "0.09em", textTransform: "uppercase", color: "rgba(190,224,248,0.58)" }}>
+        {debrief ? "Team metrics will bind after host-authoritative sync." : `${room.source} // ${room.route} // ${carrier.status.toUpperCase()}`}
+      </div>
     </div>
   );
 }
@@ -3941,6 +4766,68 @@ const btnStyle: React.CSSProperties = {
   cursor: "pointer",
 };
 
+const scopeInputStyle: React.CSSProperties = {
+  padding: "6px 8px",
+  border: "1px solid rgba(150,205,255,0.24)",
+  borderRadius: 0,
+  background: "rgba(0,0,0,0.36)",
+  color: "rgba(232,248,255,0.94)",
+  fontFamily: "ui-monospace, Menlo, monospace",
+  outline: "none",
+};
+
+function drawRemotePilotTrace(
+  ctx: CanvasRenderingContext2D,
+  pilot: MultiplayerPilot,
+  pos: V2,
+  vel: V2,
+  angle: number,
+  cameraZoom: number,
+  alpha: number,
+  timeSec: number,
+) {
+  const jitter = Math.sin(timeSec * 19.0 + pilot.callsign.charCodeAt(0)) * 0.7 / cameraZoom;
+  const tail = vel.copy().norm().mul(-22 / cameraZoom);
+
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  ctx.lineCap = "round";
+  ctx.strokeStyle = "rgba(150,225,255,0.44)";
+  ctx.lineWidth = 1.0 / cameraZoom;
+  ctx.beginPath();
+  ctx.moveTo(pos.x, pos.y);
+  ctx.lineTo(pos.x + tail.x, pos.y + tail.y);
+  ctx.stroke();
+
+  ctx.translate(pos.x + jitter, pos.y - jitter);
+  ctx.rotate(angle);
+  ctx.strokeStyle = "rgba(154,232,255,0.62)";
+  ctx.lineWidth = 1.45 / cameraZoom;
+  ctx.beginPath();
+  ctx.moveTo(10 / cameraZoom, 0);
+  ctx.lineTo(-8 / cameraZoom, -6 / cameraZoom);
+  ctx.lineTo(-4 / cameraZoom, 0);
+  ctx.lineTo(-8 / cameraZoom, 6 / cameraZoom);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  ctx.globalAlpha *= alpha * 0.86;
+  ctx.font = `${Math.max(9, 11 / cameraZoom)}px ui-monospace, Menlo, monospace`;
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(188,238,255,0.70)";
+  ctx.shadowColor = "rgba(120,210,255,0.20)";
+  ctx.shadowBlur = 10 / cameraZoom;
+  ctx.fillText(`△ ${pilot.callsign}`, pos.x + 16 / cameraZoom, pos.y - 13 / cameraZoom);
+  if (pilot.status === "TRACE PREVIEW") {
+    ctx.font = `${Math.max(7, 8 / cameraZoom)}px ui-monospace, Menlo, monospace`;
+    ctx.fillStyle = "rgba(243,214,152,0.52)";
+    ctx.fillText("TRACE PREVIEW", pos.x + 16 / cameraZoom, pos.y + 1 / cameraZoom);
+  }
+  ctx.restore();
+}
+
 // ===================== RENDERING + CAMERA =====================
 function render(
   ctx: CanvasRenderingContext2D,
@@ -3961,6 +4848,7 @@ function render(
     waveBannerTimer: number;
     waveBannerText: string;
     debrief: { phase: DebriefPhase; phaseElapsedMs: number; snapshot: DebriefSnapshot | null };
+    multiplayer: MultiplayerRoomState;
   }
 ) {
   const w = canvas.width / dpr;
@@ -4282,6 +5170,24 @@ function render(
       ctx.strokeStyle = `rgba(175,255,230,${alpha})`;
       ctx.lineWidth = (1.6 + 4.8 * S.player.thrustGlow * k) / S.camera.zoom;
       ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // allied multiplayer traces / local scaffold preview
+  const alliedPilots = S.multiplayer.phase !== "closed"
+    ? S.multiplayer.pilots.filter((pilot) => pilot.role === "ALLY")
+    : [];
+  if (alliedPilots.length > 0 && S.mode !== "debrief") {
+    const timeSec = performance.now() / 1000;
+    ctx.save();
+    for (let i = 0; i < alliedPilots.length; i++) {
+      const pilot = alliedPilots[i];
+      const orbit = T.META_PLAYFIELD_RADIUS * (1.28 + i * 0.24);
+      const a = timeSec * (0.22 + i * 0.018) + i * TAU / Math.max(1, alliedPilots.length);
+      const pos = new V2(Math.cos(a) * orbit, Math.sin(a) * orbit);
+      const vel = new V2(-Math.sin(a), Math.cos(a)).mul(orbit * (0.22 + i * 0.018));
+      drawRemotePilotTrace(ctx, pilot, pos, vel, a + Math.PI / 2, S.camera.zoom, 0.55, timeSec);
     }
     ctx.restore();
   }

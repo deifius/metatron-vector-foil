@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -10,6 +11,23 @@ def env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_json_list(name: str, default: list[dict[str, object]] | None = None) -> list[dict[str, object]]:
+    raw = os.environ.get(name)
+    if not raw:
+        return list(default or [])
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return list(default or [])
+    if not isinstance(parsed, list):
+        return list(default or [])
+    clean: list[dict[str, object]] = []
+    for item in parsed:
+        if isinstance(item, dict) and ("urls" in item or "url" in item):
+            clean.append(item)
+    return clean[:8]
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -101,6 +119,17 @@ DEV_AUTH_RATE_LIMIT_SECONDS = 0.75
 OAUTH_LOGIN_RATE_LIMIT_SECONDS = 0.75
 CLIENT_EVENT_RATE_LIMIT_SECONDS = 0.35
 SCORE_SUBMIT_RATE_LIMIT_SECONDS = 1.25
+MULTIPLAYER_ROOM_RATE_LIMIT_SECONDS = 0.75
+MULTIPLAYER_INVITE_RATE_LIMIT_SECONDS = 0.75
+MULTIPLAYER_SIGNAL_RATE_LIMIT_SECONDS = 0.10
+MULTIPLAYER_ROOM_TTL_SECONDS = int(os.environ.get("MVF_MULTIPLAYER_ROOM_TTL_SECONDS", str(2 * 60 * 60)))
+MULTIPLAYER_INVITE_TTL_SECONDS = int(os.environ.get("MVF_MULTIPLAYER_INVITE_TTL_SECONDS", str(10 * 60)))
+MULTIPLAYER_SIGNAL_TTL_SECONDS = int(os.environ.get("MVF_MULTIPLAYER_SIGNAL_TTL_SECONDS", "90"))
+MULTIPLAYER_MAX_PILOTS = int(os.environ.get("MVF_MULTIPLAYER_MAX_PILOTS", "6"))
+MULTIPLAYER_MAX_SIGNAL_BYTES = int(os.environ.get("MVF_MULTIPLAYER_MAX_SIGNAL_BYTES", "12000"))
+# Keep empty by default for privacy/LAN testing. Add STUN/TURN when remote P2P is desired, e.g.
+# MVF_MULTIPLAYER_ICE_SERVERS_JSON='[{"urls":"stun:stun.example.net:3478"}]'
+MULTIPLAYER_ICE_SERVERS = env_json_list("MVF_MULTIPLAYER_ICE_SERVERS_JSON", [])
 
 # Security headers. React currently uses inline style attributes, so style-src keeps unsafe-inline.
 CONTENT_SECURITY_POLICY = "; ".join(

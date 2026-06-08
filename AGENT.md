@@ -6,6 +6,19 @@ Metatron Vector FOIL is an oscilloscope/vector-arcade sacred-geometry shooter. I
 
 The player pilots a sphenic gravjammer around Sol, defending the Metatron lattice from hostile Platonic vector foils. Preserve the strange, ritual, analog, phosphor-burn aesthetic. Do not make the game look like a generic modern sci-fi dashboard.
 
+## Multiplayer / Constellation Defense Guidance
+
+The multiplayer system design lives in `docs/MULTIPLAYER_SYSTEM.md`. Any multiplayer work must keep the same retro oscilloscope/vector-scope identity as the rest of the game.
+
+- Treat rooms as defense channels or carrier traces, not modern lobbies.
+- Treat invites as callsign vectors and joins as signal locks.
+- Render remote pilots as dim sphenic corsair traces with small transponder labels.
+- Use the central server for identity, callsigns, rooms, invites, WebRTC signaling, config hashes, and leaderboards.
+- Prefer peer-to-peer WebRTC DataChannels for gameplay traffic, with host-authoritative simulation as the first network model.
+- Keep early P2P multiplayer unranked or clearly marked as unverified until server verification/anti-cheat exists.
+- Do not show gameplay HUD widgets on the title/loading screen; the front page should remain sparse and readable.
+- Multiplayer audio should load optional files from `/static/audio/` and fall back to restrained synthetic carrier/signal sounds when files are missing.
+
 ## Core Design Priorities
 
 - Orbital motion is central. Movement should reward momentum, slingshots, tangential approaches, and gravity reading.
@@ -358,19 +371,18 @@ When samples are missing, procedural fallbacks should continue to work.
 
 ## Current Development Priority
 
-The next major work area is the Metatron cube node system.
+The active multiplayer track is **Constellation Defense**. The current code includes the retro lobby/front-page shell, server-backed room/invite scaffolding, and WebRTC DataChannel signal-lock scaffolding. The next multiplayer pass should synchronize live remote pilot traces over the locked DataChannel while preserving the oscilloscope aesthetic.
 
-Goals:
+Near-term multiplayer goals:
 
-- Separate Metatron circle radius from node spacing.
-- Keep circle size, node spacing, and playfield/camera scale independently tunable.
-- For the current build, Metatron gameplay regions are intentionally recoupled to visible circle size: awakening, refuel, and charging all use `META_CIRCLE_RADIUS`.
-- Ensure the arrangement becomes clearly camera-aligned after approximately three node activations.
-- Preserve rotation around Sol after alignment.
-- Give activated spheres separately tunable gravity.
-- Draw faint activated-node line segments.
-- Pulse newly activated connections.
-- Reveal the complete Metatron cube when all thirteen nodes are active.
+- Keep room/invite/callsign UI phrased as carrier/signal/trace language.
+- Maintain identity authority on the Flask server; do not trust peer-provided callsigns.
+- Keep early P2P results unranked/unverified.
+- Use WebRTC DataChannel for gameplay packets after PHOSPHOR LOCK.
+- Synchronize live remote pilot traces before attempting host-authoritative enemy/Sol sync.
+- Keep gameplay HUD widgets hidden from the front/title screen.
+
+Metatron cube tuning remains important; preserve the existing recoupled visible/gameplay sphere behavior unless explicitly asked to change it.
 
 ## Do Not
 

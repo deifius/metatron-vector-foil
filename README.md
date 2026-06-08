@@ -125,6 +125,16 @@ You are not just dodging enemies in space. You are defending a metaphysical mach
 - Node awakening, fuel recovery, and shield regeneration
 - Expanding camera instead of screen wrap
 - Stylized vector-space combat with metaphysical sci-fi framing
+- Planned **Constellation Defense** multiplayer mode: callsign invites, P2P/WebRTC gameplay traffic, host-authoritative shared Sol defense, team/individual debriefs, and oscilloscope-native lobby/audio treatment. See `docs/MULTIPLAYER_SYSTEM.md`.
+
+
+## Multiplayer Design: Constellation Defense
+
+The multiplayer roadmap is documented in [`docs/MULTIPLAYER_SYSTEM.md`](docs/MULTIPLAYER_SYSTEM.md). The intended model is hybrid: the central Flask server handles identity, callsigns, rooms, invites, WebRTC signaling, configuration hashes, and leaderboards, while gameplay packets use peer-to-peer WebRTC DataChannels whenever possible. LAN play should get the lowest-latency direct route; remote play should attempt direct P2P before any relay fallback.
+
+Multiplayer must preserve the retro oscilloscope aesthetic. Rooms are defense channels, callsign invites are signal vectors, joins are signal locks, and remote pilots are dim phosphor traces rather than modern avatar markers. Gameplay HUD widgets should remain hidden until an active run begins so the front/title screen stays sparse.
+
+Current multiplayer status: UI/audio/remote-trace scaffolding, a lightweight Flask room/invite coordination layer, and identity-checked WebRTC signal-lock scaffolding now exist. Accepted callsigns can negotiate a P2P DataChannel and exchange heartbeats. Live remote pilot movement, host-authoritative world sync, combat scoring, relay fallback, and ranked verification are still future passes. ICE servers are empty by default for privacy/LAN testing; configure `MVF_MULTIPLAYER_ICE_SERVERS_JSON` for remote STUN/TURN routing.
 
 ## Tech Stack
 
