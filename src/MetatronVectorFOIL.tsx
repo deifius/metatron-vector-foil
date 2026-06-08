@@ -301,6 +301,7 @@ type DebriefSnapshot = {
   bestShotDistance: number;
   peakPseudoG: number;
   furthestRadius: number;
+  multiplayer?: MultiplayerDebriefSummary;
 };
 type DebriefUIState = {
   phase: DebriefPhase;
@@ -328,6 +329,27 @@ type MultiplayerRoomPhase = "closed" | "lobby" | "countdown" | "playing" | "debr
 type MultiplayerRoomSource = "LOCAL" | "SERVER";
 type MultiplayerPilotStatus = "HOST LOCKED" | "AWAITING CARRIER" | "VECTOR SENT" | "SIGNAL ACQUIRED" | "PHOSPHOR LOCK" | "TRACE PREVIEW" | "TRACE DECLINED" | "TRACE LOST";
 type MultiplayerPilot = { callsign: string; role: "HOST" | "ALLY" | "SLOT"; status: MultiplayerPilotStatus; signalAgeMs: number };
+type MultiplayerPilotContribution = {
+  callsign: string;
+  score: number;
+  hits: number;
+  kills: number;
+  assists: number;
+  awakenings: number;
+  damage: number;
+  status?: MultiplayerPilotTraceStatus;
+};
+type MultiplayerDebriefSummary = {
+  active: boolean;
+  label: string;
+  verification: "P2P / UNVERIFIED" | "SOLO / VERIFIED";
+  roomCode: string;
+  hostCallsign: string | null;
+  teamScore: number;
+  wave: number;
+  solIntegrityPct: number;
+  pilots: MultiplayerPilotContribution[];
+};
 type MultiplayerPilotTraceStatus = "ACTIVE" | "PAUSED" | "LOST" | "DEBRIEF";
 type MultiplayerPilotTraceMessage = {
   type: "pilot_trace";
@@ -404,7 +426,7 @@ type MultiplayerWorldSnapshotMessage = {
   enemies: MultiplayerWorldEnemyTrace[];
   spheres: MultiplayerWorldSphereTrace[];
   teamScore?: number;
-  pilotScores?: { callsign: string; score: number }[];
+  pilotScores?: MultiplayerPilotContribution[];
 };
 type MultiplayerDataMessage = MultiplayerCarrierHeartbeatMessage | MultiplayerPilotTraceMessage | MultiplayerPilotInputMessage | MultiplayerWorldSnapshotMessage;
 type MultiplayerPilotTracePoint = { x: number; y: number; vx: number; vy: number; angle: number; sentAt: number; receivedAtMs: number };
@@ -423,6 +445,7 @@ type MultiplayerRemotePilotInputState = MultiplayerPilotTraceState & {
   fire: boolean;
   lastFireAtMs: number;
 };
+type MultiplayerEnemyDamageRecord = { hits: number; damage: number; score: number; lastAtMs: number };
 type MultiplayerPilotTraceSample = { pos: V2; vel: V2; angle: number; shieldPct: number; fuelPct: number; score: number; status: MultiplayerPilotTraceStatus; ageMs: number };
 type MultiplayerHostWorldSnapshot = MultiplayerWorldSnapshotMessage & { receivedAtMs: number };
 type MultiplayerCarrierStatus = "idle" | "searching" | "locked" | "lost" | "error";
@@ -1621,10 +1644,19 @@ export default function MetatronVectorFOIL() {
         })
       : [];
     const pilotScores = Array.isArray(message.pilotScores)
-      ? message.pilotScores.slice(0, T.MULTIPLAYER_MAX_PILOTS).flatMap((entry): { callsign: string; score: number }[] => {
+      ? message.pilotScores.slice(0, T.MULTIPLAYER_MAX_PILOTS).flatMap((entry): MultiplayerPilotContribution[] => {
           const callsign = normalizeCallsignInput(String(entry?.callsign ?? ""));
-          const pilotScore = Math.max(0, Math.round(Number(entry?.score) || 0));
-          return callsign ? [{ callsign, score: pilotScore }] : [];
+          if (!callsign) return [];
+          return [{
+            callsign,
+            score: Math.max(0, Math.round(Number(entry?.score) || 0)),
+            hits: Math.max(0, Math.round(Number(entry?.hits) || 0)),
+            kills: Math.max(0, Math.round(Number(entry?.kills) || 0)),
+            assists: Math.max(0, Math.round(Number(entry?.assists) || 0)),
+            awakenings: Math.max(0, Math.round(Number(entry?.awakenings) || 0)),
+            damage: Math.max(0, Math.round(Number(entry?.damage) || 0)),
+            status: ["ACTIVE", "PAUSED", "LOST", "DEBRIEF"].includes(String(entry?.status)) ? entry.status as MultiplayerPilotTraceStatus : undefined,
+          }];
         })
       : [];
     const snapshot: MultiplayerHostWorldSnapshot = {
@@ -2520,7 +2552,7 @@ export default function MetatronVectorFOIL() {
       return lines[indexByKey[causeKey]] ?? DEFAULT_DEATH_CAUSE_LINES[indexByKey[causeKey]];
     };
 
-    const getDebriefRowTotal = (snapshot: DebriefSnapshot | null) => (snapshot ? 8 : 0);
+    const getDebriefRowTotal = (snapshot: DebriefSnapshot | null) => (snapshot ? (snapshot.multiplayer?.active ? 10 : 8) : 0);
 
     let debriefPhase: DebriefPhase = "inactive";
     let debriefPhaseElapsedMs = 0;
@@ -2583,6 +2615,8 @@ export default function MetatronVectorFOIL() {
       currentBurstId = 0;
       burstStats.clear();
       multiplayerPilotScores.clear();
+      multiplayerPilotContributions.clear();
+      multiplayerEnemyDamage.clear();
       if (playerIdentityRef.current.callsign) multiplayerPilotScores.set(playerIdentityRef.current.callsign, 0);
       allSpheresLitAwarded = false;
       runAwakenedCount = 0;
@@ -2846,21 +2880,41 @@ export default function MetatronVectorFOIL() {
       return true;
     };
 
-    const buildDebriefSnapshot = (causeKey: DeathCauseKey): DebriefSnapshot => ({
-      causeKey,
-      causeLabel: deathCauseLabelFor(causeKey),
-      score: Math.round(score),
-      wave: getLevel(levelIdxRef.current).wave,
-      survivalTimeSec: runClockMs / 1000,
-      bestChain: bestChainMultiplier,
-      citations: citationCount,
-      spheresAwakened: runAwakenedCount,
-      totalSpheresLit: metaNodes.filter((node) => node.kind !== "center" && node.awakened).length,
-      topCitation: topCitationId ? (getCommendation(topCitationId)?.label ?? String(topCitationId).toUpperCase()) : "NONE LOGGED",
-      bestShotDistance,
-      peakPseudoG,
-      furthestRadius,
-    });
+    const buildDebriefSnapshot = (causeKey: DeathCauseKey): DebriefSnapshot => {
+      const room = multiplayerRoomRef.current;
+      const carrier = multiplayerCarrierRef.current;
+      const isUnverifiedP2PRun = room.source === "SERVER" && room.phase !== "closed" && carrier.status === "locked";
+      const hostSnapshot = multiplayerWorldSnapshotRef.current;
+      const pilotContributions = isUnverifiedP2PRun
+        ? (room.hostCallsign === playerIdentityRef.current.callsign ? getMultiplayerPilotContributions() : (hostSnapshot?.pilotScores ?? getMultiplayerPilotContributions()))
+        : [];
+      return {
+        causeKey,
+        causeLabel: deathCauseLabelFor(causeKey),
+        score: Math.round(score),
+        wave: getLevel(levelIdxRef.current).wave,
+        survivalTimeSec: runClockMs / 1000,
+        bestChain: bestChainMultiplier,
+        citations: citationCount,
+        spheresAwakened: runAwakenedCount,
+        totalSpheresLit: metaNodes.filter((node) => node.kind !== "center" && node.awakened).length,
+        topCitation: topCitationId ? (getCommendation(topCitationId)?.label ?? String(topCitationId).toUpperCase()) : "NONE LOGGED",
+        bestShotDistance,
+        peakPseudoG,
+        furthestRadius,
+        multiplayer: isUnverifiedP2PRun ? {
+          active: true,
+          label: "CONSTELLATION DEFENSE DEBRIEF",
+          verification: "P2P / UNVERIFIED",
+          roomCode: room.roomCode,
+          hostCallsign: room.hostCallsign,
+          teamScore: Math.round(hostSnapshot?.teamScore ?? score),
+          wave: Math.max(1, Math.round(hostSnapshot?.wave ?? getLevel(levelIdxRef.current).wave)),
+          solIntegrityPct: clamp(Number(hostSnapshot?.solIntegrityPct ?? (causeKey === "sol" ? 0 : 100)), 0, 100),
+          pilots: pilotContributions,
+        } : undefined,
+      };
+    };
 
     const enterDebrief = (causeKey: DeathCauseKey) => {
       debriefSnapshot = buildDebriefSnapshot(causeKey);
@@ -2951,6 +3005,8 @@ export default function MetatronVectorFOIL() {
     let currentBurstId = 0;
     const burstStats = new Map<number, BurstStats>();
     const multiplayerPilotScores = new Map<string, number>();
+    const multiplayerPilotContributions = new Map<string, MultiplayerPilotContribution>();
+    const multiplayerEnemyDamage = new Map<string, Map<string, MultiplayerEnemyDamageRecord>>();
     let waveDamageTaken = 0;
     let allSpheresLitAwarded = false;
     let slingshotArmed = false;
@@ -3082,7 +3138,7 @@ export default function MetatronVectorFOIL() {
         enemies: hostEnemies,
         spheres,
         teamScore: Math.round(score),
-        pilotScores: Array.from(multiplayerPilotScores.entries()).map(([callsign, pilotScore]) => ({ callsign, score: Math.round(pilotScore) })),
+        pilotScores: getMultiplayerPilotContributions(),
       });
     };
 
@@ -3202,11 +3258,94 @@ export default function MetatronVectorFOIL() {
       return awarded;
     };
 
+    const ensureMultiplayerPilotContribution = (callsign: string | undefined) => {
+      const clean = normalizeCallsignInput(String(callsign ?? ""));
+      if (!clean) return null;
+      let record = multiplayerPilotContributions.get(clean);
+      if (!record) {
+        record = { callsign: clean, score: 0, hits: 0, kills: 0, assists: 0, awakenings: 0, damage: 0, status: "ACTIVE" };
+        multiplayerPilotContributions.set(clean, record);
+      }
+      return record;
+    };
+
     const addMultiplayerPilotScore = (callsign: string | undefined, points: number) => {
       if (!callsign || points <= 0) return;
       const clean = normalizeCallsignInput(callsign);
       if (!clean) return;
-      multiplayerPilotScores.set(clean, (multiplayerPilotScores.get(clean) ?? 0) + Math.round(points));
+      const rounded = Math.round(points);
+      multiplayerPilotScores.set(clean, (multiplayerPilotScores.get(clean) ?? 0) + rounded);
+      const record = ensureMultiplayerPilotContribution(clean);
+      if (record) record.score += rounded;
+    };
+
+    const markMultiplayerPilotStatus = (callsign: string | undefined, status: MultiplayerPilotTraceStatus) => {
+      const record = ensureMultiplayerPilotContribution(callsign);
+      if (record) record.status = status;
+    };
+
+    const addMultiplayerHitCredit = (callsign: string | undefined, enemyId: string, points: number) => {
+      const clean = normalizeCallsignInput(String(callsign ?? ""));
+      if (!clean) return;
+      const record = ensureMultiplayerPilotContribution(clean);
+      if (record) {
+        record.hits += 1;
+        record.damage += 1;
+      }
+      let enemyLedger = multiplayerEnemyDamage.get(enemyId);
+      if (!enemyLedger) {
+        enemyLedger = new Map<string, MultiplayerEnemyDamageRecord>();
+        multiplayerEnemyDamage.set(enemyId, enemyLedger);
+      }
+      const prior = enemyLedger.get(clean) ?? { hits: 0, damage: 0, score: 0, lastAtMs: 0 };
+      prior.hits += 1;
+      prior.damage += 1;
+      prior.score += Math.max(0, Math.round(points));
+      prior.lastAtMs = runClockMs;
+      enemyLedger.set(clean, prior);
+    };
+
+    const closeMultiplayerEnemyCredit = (enemyId: string, killerCallsign: string | undefined) => {
+      const cleanKiller = normalizeCallsignInput(String(killerCallsign ?? ""));
+      const enemyLedger = multiplayerEnemyDamage.get(enemyId);
+      if (cleanKiller) {
+        const killer = ensureMultiplayerPilotContribution(cleanKiller);
+        if (killer) killer.kills += 1;
+      }
+      if (enemyLedger) {
+        for (const [callsign, record] of enemyLedger.entries()) {
+          if (callsign === cleanKiller) continue;
+          if (runClockMs - record.lastAtMs > 12000) continue;
+          const assistant = ensureMultiplayerPilotContribution(callsign);
+          if (assistant) {
+            assistant.assists += 1;
+            const assistCredit = Math.max(25, Math.round(record.score * 0.35));
+            assistant.score += assistCredit;
+            multiplayerPilotScores.set(callsign, (multiplayerPilotScores.get(callsign) ?? 0) + assistCredit);
+          }
+        }
+      }
+      multiplayerEnemyDamage.delete(enemyId);
+    };
+
+    const getMultiplayerPilotContributions = (): MultiplayerPilotContribution[] => {
+      const room = multiplayerRoomRef.current;
+      const seen = new Set<string>();
+      const ordered: MultiplayerPilotContribution[] = [];
+      const push = (callsign: string | null | undefined, fallbackStatus?: MultiplayerPilotTraceStatus) => {
+        const clean = normalizeCallsignInput(String(callsign ?? ""));
+        if (!clean || seen.has(clean)) return;
+        const record = ensureMultiplayerPilotContribution(clean);
+        if (!record) return;
+        if (fallbackStatus && !record.status) record.status = fallbackStatus;
+        ordered.push({ ...record, score: Math.round(record.score) });
+        seen.add(clean);
+      };
+      push(playerIdentityRef.current.callsign, modeRef.current === "debrief" ? "DEBRIEF" : "ACTIVE");
+      for (const pilot of room.pilots) push(pilot.callsign, pilot.status === "TRACE LOST" ? "LOST" : undefined);
+      for (const trace of Object.values(remotePilotTracesRef.current)) push(trace.callsign, trace.status);
+      for (const input of Object.values(remotePilotInputsRef.current)) push(input.callsign, input.status);
+      return ordered.slice(0, T.MULTIPLAYER_MAX_PILOTS).sort((a, b) => b.score - a.score || b.kills - a.kills || b.assists - a.assists || a.callsign.localeCompare(b.callsign));
     };
 
     const awardCitation = (id: CommendationDefinition["id"], category: CitationCategory) => {
@@ -3905,6 +4044,8 @@ export default function MetatronVectorFOIL() {
           const chargeResult = chargeMetaNodeAt(impact.point, overchargeSphere);
           if (chargeResult.newlyAwakened) {
             runAwakenedCount += 1;
+            const ownerContribution = ensureMultiplayerPilotContribution(b.ownerCallsign);
+            if (ownerContribution) ownerContribution.awakenings += 1;
             audioRef.current.sphereActivate();
             awardCitation("nodeAwakened", "geometry");
           }
@@ -3912,13 +4053,17 @@ export default function MetatronVectorFOIL() {
             allSpheresLitAwarded = true;
             awardCitation("allSpheresLit", "geometry");
           }
-          awardEnemyShellHit(e.kind, e.pos, 0, b.ownerCallsign);
+          const shellScore = awardEnemyShellHit(e.kind, e.pos, 0, b.ownerCallsign);
+          addMultiplayerHitCredit(b.ownerCallsign, e.id, shellScore);
           const outward = e.pos.copy();
           applyEnemyImpulse(e, outward, T.ENEMY_HIT_DEFLECT_IMPULSE, T.ENEMY_HIT_DEFLECT_TANGENTIAL);
           audioRef.current.hit();
           b.life = -1;
           resolveBurst(b.burstId, true);
-          if (!downgradeEnemy(e)) enemies.splice(ei, 1);
+          if (!downgradeEnemy(e)) {
+            closeMultiplayerEnemyCredit(e.id, b.ownerCallsign);
+            enemies.splice(ei, 1);
+          }
           hit = true;
           break;
         }
@@ -5186,15 +5331,20 @@ function DebriefOverlay({
   const holdTitle = ui.phase === "game_over_hold" || ui.phase === "plotting" || ui.phase === "ready";
   const rows = [
     { label: "Cause of Loss", value: snapshot.causeLabel },
-    { label: "Final Score", value: snapshot.score.toLocaleString() },
-    { label: "Wave Reached", value: String(snapshot.wave) },
+    { label: snapshot.multiplayer?.active ? "Team Score" : "Final Score", value: (snapshot.multiplayer?.teamScore ?? snapshot.score).toLocaleString() },
+    { label: snapshot.multiplayer?.active ? "Team Wave" : "Wave Reached", value: String(snapshot.multiplayer?.wave ?? snapshot.wave) },
     { label: "Survival Time", value: formatDurationClock(snapshot.survivalTimeSec) },
     { label: "Best Flight Chain", value: `${snapshot.bestChain.toFixed(2)}x` },
     { label: "Top Citation", value: snapshot.topCitation },
     { label: "Spheres Awakened", value: `${snapshot.spheresAwakened} // TREE LIT ${snapshot.totalSpheresLit}/12` },
     { label: "Flight Trace", value: `${snapshot.bestShotDistance.toFixed(0)}M SHOT // ${snapshot.peakPseudoG.toFixed(1)}G PEAK // ${snapshot.furthestRadius.toFixed(0)}R OUT` },
+    ...(snapshot.multiplayer?.active ? [
+      { label: "Defense Channel", value: `${snapshot.multiplayer.roomCode} // ${snapshot.multiplayer.verification}` },
+      { label: "Sol Integrity", value: `${Math.round(snapshot.multiplayer.solIntegrityPct)}% // HOST ${snapshot.multiplayer.hostCallsign ?? "---"}` },
+    ] : []),
   ];
   const visibleRows = rows.slice(0, ui.visibleRows);
+  const visiblePilotTable = !!snapshot.multiplayer?.active && ui.visibleRows >= 10 && snapshot.multiplayer.pilots.length > 0;
   const promptVisible = ui.phase === "ready";
   return (
     <div
@@ -5219,8 +5369,9 @@ function DebriefOverlay({
       )}
 
       {(ui.phase === "plotting" || ui.phase === "ready") && (
-        <div style={{ width: "min(760px, 72vw)", display: "grid", gap: 14 }}>
+        <div style={{ width: "min(820px, 76vw)", display: "grid", gap: 14 }}>
           {visibleRows.map((row) => <PlotField key={row.label} label={row.label} value={row.value} />)}
+          {visiblePilotTable && snapshot.multiplayer && <MultiplayerDebriefTable pilots={snapshot.multiplayer.pilots} />}
         </div>
       )}
 
@@ -5230,6 +5381,43 @@ function DebriefOverlay({
           <div style={{ fontSize: 16, letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(176,255,218,0.86)", textShadow: "0 0 14px rgba(145,255,212,0.18)" }}>{footer}</div>
         </div>
       )}
+    </div>
+  );
+}
+
+function MultiplayerDebriefTable({ pilots }: { pilots: MultiplayerPilotContribution[] }) {
+  const rows = pilots.slice(0, T.MULTIPLAYER_MAX_PILOTS);
+  if (rows.length === 0) return null;
+  return (
+    <div style={{
+      border: "1px solid rgba(176,255,218,0.16)",
+      background: "linear-gradient(180deg, rgba(2,13,15,0.42), rgba(0,0,0,0.22))",
+      boxShadow: "inset 0 0 22px rgba(98,220,180,0.045)",
+      padding: "10px 12px",
+      display: "grid",
+      gap: 7,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+        <div style={{ fontSize: 9, letterSpacing: "0.28em", textTransform: "uppercase", color: "rgba(176,255,218,0.76)" }}>Pilot Contribution Lattice</div>
+        <div style={{ fontSize: 9, letterSpacing: "0.16em", textTransform: "uppercase", color: "rgba(243,214,152,0.58)" }}>Unverified P2P trace</div>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "5ch 1fr 6ch 5ch 5ch 5ch 5ch", gap: 8, fontSize: 9, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(150,205,255,0.50)", borderBottom: "1px solid rgba(150,205,255,0.10)", paddingBottom: 4 }}>
+        <span>Call</span><span>Signal</span><span>Score</span><span>Hits</span><span>Kills</span><span>Asst</span><span>Node</span>
+      </div>
+      {rows.map((pilot) => {
+        const status = pilot.status === "LOST" ? "TRACE LOST" : pilot.status === "PAUSED" ? "PAUSED" : pilot.status === "DEBRIEF" ? "DEBRIEF" : "LIVE";
+        return (
+          <div key={pilot.callsign} style={{ display: "grid", gridTemplateColumns: "5ch 1fr 6ch 5ch 5ch 5ch 5ch", gap: 8, alignItems: "baseline", fontSize: 10, letterSpacing: "0.10em", textTransform: "uppercase", color: "rgba(218,244,255,0.80)" }}>
+            <span style={{ color: "rgba(176,255,218,0.88)" }}>{pilot.callsign}</span>
+            <span style={{ color: pilot.status === "LOST" ? "rgba(255,165,176,0.66)" : "rgba(190,224,248,0.62)" }}>{status}</span>
+            <span>{Math.round(pilot.score).toLocaleString()}</span>
+            <span>{pilot.hits}</span>
+            <span>{pilot.kills}</span>
+            <span>{pilot.assists}</span>
+            <span>{pilot.awakenings}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }

@@ -371,7 +371,7 @@ When samples are missing, procedural fallbacks should continue to work.
 
 ## Current Development Priority
 
-The active multiplayer track is **Constellation Defense**. The current code includes the retro lobby/front-page shell, server-backed room/invite/status scaffolding, WebRTC DataChannel signal lock, live remote pilot traces, client-to-host `pilot_input` telemetry, and host-authored `world_snapshot` telemetry. The host is the first shared-defense authority: peer input can spawn allied fire in the host simulation, host snapshots carry shared enemy/sphere/Sol/team-score summaries, and clients suppress local enemy simulation while rendering/adopting fresh host scope telemetry. Keep all additions retro-oscilloscope in language and presentation.
+The active multiplayer track is **Constellation Defense**. The current code includes the retro lobby/front-page shell, server-backed room/invite/status scaffolding, WebRTC DataChannel signal lock, live remote pilot traces, client-to-host `pilot_input` telemetry, host-authored `world_snapshot` telemetry, and unverified P2P contribution debriefs. The host is the first shared-defense authority: peer input can spawn allied fire in the host simulation, host snapshots carry shared enemy/sphere/Sol/team-score summaries, host-side ledgers credit hits/kills/assists/awakenings from actual impacts, and clients suppress local enemy simulation while rendering/adopting fresh host scope telemetry. Keep all additions retro-oscilloscope in language and presentation.
 
 Near-term multiplayer goals:
 
