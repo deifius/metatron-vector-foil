@@ -2,7 +2,7 @@
 
 ## Status
 
-This document describes the intended multiplayer addition for Metatron Vector FOIL. The current implementation is now an early P2P scaffold: oscilloscope-style lobby/front-screen components, audio hook constants, remote pilot rendering, HUD/title cleanup, ephemeral Flask room/invite/status/signaling coordination, WebRTC DataChannel signal lock, live pilot traces, and host-authored world snapshots. It is not yet a complete shared combat simulation.
+This document describes the intended multiplayer addition for Metatron Vector FOIL. The current implementation is now an early unranked P2P shared-defense prototype: oscilloscope-style lobby/front-screen components, audio hook constants, remote pilot rendering, HUD/title cleanup, ephemeral Flask room/invite/status/signaling coordination, WebRTC DataChannel signal lock, live pilot traces, client-to-host pilot input, host-authored world snapshots, and initial host-owned allied fire/combat authority. It is playable as a first shared Sol-defense slice, but it is not ranked, server-verified, relay-hardened, or host-migration-safe.
 
 ## High Concept
 
@@ -320,7 +320,7 @@ Current limitation: this phase uses in-memory Flask process state. That is appro
 - Show carrier states using scope language: searching, phosphor lock, trace lost.
 - Play signal lock/lost audio.
 
-Current limitation: this establishes a P2P carrier lock, heartbeat, live `pilot_trace` telemetry, and a first `world_snapshot` stream from host to peer. Remote allied corsairs render from real peer position, velocity, heading, shield, fuel, score, and status packets. Host snapshots currently carry wave, score, Sol-integrity summary, enemy contacts, bullet/shard counts, and sphere state summaries; clients render them as host scope contacts without yet mutating local physics. Shots, kills, scoring authority, shared game-over, and client input submission are still future passes. ICE servers are intentionally empty by default for privacy/LAN testing; remote P2P can be enabled by setting `MVF_MULTIPLAYER_ICE_SERVERS_JSON` to a JSON array of STUN/TURN server objects.
+Current limitation: this now establishes a P2P carrier lock, heartbeat, live `pilot_trace` telemetry, client-to-host `pilot_input`, and a host `world_snapshot` stream. Remote allied corsairs render from real peer position, velocity, heading, shield, fuel, score, and status packets. The host can rate-limit authorized peer fire into real host bullets, apply those bullets to host enemies, steer hostiles toward the nearest pilot trace, and broadcast shared wave, score, Sol-integrity, enemy-contact, bullet/shard, pilot-score, and sphere-state telemetry. Clients with fresh host snapshots suppress local enemy simulation and adopt the host scope for shared Sol defense. This is still an unranked two-peer prototype: server verification, relay fallback, multi-peer fanout, host migration, strong correction, and full per-pilot scoring are future passes. ICE servers are intentionally empty by default for privacy/LAN testing; remote P2P can be enabled by setting `MVF_MULTIPLAYER_ICE_SERVERS_JSON` to a JSON array of STUN/TURN server objects.
 
 ### Phase 4 — Host-authoritative gameplay sync
 
@@ -364,13 +364,19 @@ Implemented so far:
 - identity-checked signaling mailbox for offer/answer/ICE envelopes;
 - WebRTC DataChannel negotiation between accepted callsigns;
 - DataChannel heartbeat and carrier status display;
-- signal lock/lost audio events.
+- signal lock/lost audio events;
+- live remote pilot motion sync;
+- client-to-host `pilot_input` packets;
+- host-spawned allied fire from authorized peer input;
+- host-authored enemy/sphere/Sol/team-score snapshots;
+- client adoption of fresh host scope telemetry for shared defense.
 
 Not implemented yet:
 
-- live remote pilot motion sync;
-- host-authoritative shared Sol/enemy simulation;
-- combat/scoring sync;
+- robust prediction/correction and reconciliation;
+- multi-peer fanout beyond the first accepted carrier target;
+- complete per-pilot scoring/debrief persistence;
 - relay fallback;
+- host migration/reconnect recovery;
 - Redis/durable signaling for multi-worker production deployments;
 - ranked/server-verified multiplayer.
