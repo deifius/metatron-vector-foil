@@ -163,6 +163,7 @@ setup_logging()
 # gameplay should move over WebRTC DataChannels once the peers have carrier lock.
 MULTIPLAYER_ROOM_VISIBILITIES = {"PUBLIC", "UNLISTED", "PRIVATE"}
 MULTIPLAYER_CONFIG_POLICIES = {"HOST LOCKED", "PERSONAL SHIPS", "OPEN LAB"}
+MULTIPLAYER_ROOM_STATUSES = {"LOBBY", "COUNTDOWN", "PLAYING", "DEBRIEF"}
 MULTIPLAYER_INVITE_DECISIONS = {"accept", "decline"}
 _multiplayer_lock = threading.Lock()
 _multiplayer_rooms: dict[str, dict[str, Any]] = {}
@@ -664,6 +665,13 @@ def normalize_config_policy(raw: Any) -> str:
     return value
 
 
+def normalize_room_status(raw: Any) -> str:
+    value = str(raw or "LOBBY").strip().upper().replace("_", " ")
+    if value not in MULTIPLAYER_ROOM_STATUSES:
+        abort(400, "invalid_room_status")
+    return value
+
+
 def multiplayer_room_code() -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(secrets.choice(alphabet) for _ in range(4))
@@ -1144,6 +1152,30 @@ def multiplayer_close_room(room_id: str):
         _multiplayer_rooms.pop(room_id, None)
     log_event("multiplayer.room_closed", "info", player=player, details={"room_id": room_id}, persist=True)
     return jsonify({"ok": True})
+
+
+@app.post("/api/multiplayer/rooms/<room_id>/status")
+@require_csrf
+def multiplayer_room_status(room_id: str):
+    player = require_callsign_player()
+    data = json_body()
+    status = normalize_room_status(data.get("status", "LOBBY"))
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    with _multiplayer_lock:
+        cleanup_multiplayer_state(now)
+        room = _multiplayer_rooms.get(room_id)
+        if not room:
+            abort(404, "room_not_found")
+        if room.get("hostCallsign") != player["callsign"]:
+            abort(403, "host_required_to_set_room_status")
+        room["status"] = status
+        room["lastSignal"] = f"HOST SCOPE {status} // {player['callsign']}"
+        room["updatedAt"] = stamp
+        room["updatedAtEpoch"] = now
+        public_room = multiplayer_public_room(room)
+    log_event("multiplayer.room_status", "info", player=player, details={"room_id": room_id, "status": status}, persist=False)
+    return jsonify({"ok": True, "room": public_room})
 
 
 @app.post("/api/multiplayer/rooms/<room_id>/invite")

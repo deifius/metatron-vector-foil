@@ -2,7 +2,7 @@
 
 ## Status
 
-This document describes the intended multiplayer addition for Metatron Vector FOIL. The current implementation is still a scaffold: oscilloscope-style lobby/front-screen components, audio hook constants, remote pilot rendering preparation, HUD/title cleanup, and an ephemeral Flask room/invite coordination layer. It is not yet a complete P2P network implementation.
+This document describes the intended multiplayer addition for Metatron Vector FOIL. The current implementation is now an early P2P scaffold: oscilloscope-style lobby/front-screen components, audio hook constants, remote pilot rendering, HUD/title cleanup, ephemeral Flask room/invite/status/signaling coordination, WebRTC DataChannel signal lock, live pilot traces, and host-authored world snapshots. It is not yet a complete shared combat simulation.
 
 ## High Concept
 
@@ -320,7 +320,7 @@ Current limitation: this phase uses in-memory Flask process state. That is appro
 - Show carrier states using scope language: searching, phosphor lock, trace lost.
 - Play signal lock/lost audio.
 
-Current limitation: this establishes a P2P carrier lock, heartbeat, and live `pilot_trace` telemetry only. Remote allied corsairs can now render from real peer position, velocity, heading, shield, fuel, score, and status packets. It does not yet sync enemy state, Sol integrity, shots, host-authoritative scoring, or shared game-over state. ICE servers are intentionally empty by default for privacy/LAN testing; remote P2P can be enabled by setting `MVF_MULTIPLAYER_ICE_SERVERS_JSON` to a JSON array of STUN/TURN server objects.
+Current limitation: this establishes a P2P carrier lock, heartbeat, live `pilot_trace` telemetry, and a first `world_snapshot` stream from host to peer. Remote allied corsairs render from real peer position, velocity, heading, shield, fuel, score, and status packets. Host snapshots currently carry wave, score, Sol-integrity summary, enemy contacts, bullet/shard counts, and sphere state summaries; clients render them as host scope contacts without yet mutating local physics. Shots, kills, scoring authority, shared game-over, and client input submission are still future passes. ICE servers are intentionally empty by default for privacy/LAN testing; remote P2P can be enabled by setting `MVF_MULTIPLAYER_ICE_SERVERS_JSON` to a JSON array of STUN/TURN server objects.
 
 ### Phase 4 — Host-authoritative gameplay sync
 

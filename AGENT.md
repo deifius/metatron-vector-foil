@@ -371,7 +371,7 @@ When samples are missing, procedural fallbacks should continue to work.
 
 ## Current Development Priority
 
-The active multiplayer track is **Constellation Defense**. The current code includes the retro lobby/front-page shell, server-backed room/invite scaffolding, and WebRTC DataChannel signal-lock scaffolding. The next multiplayer pass should synchronize live remote pilot traces over the locked DataChannel while preserving the oscilloscope aesthetic.
+The active multiplayer track is **Constellation Defense**. The current code includes the retro lobby/front-page shell, server-backed room/invite/status scaffolding, WebRTC DataChannel signal lock, live remote pilot traces, and host-authored `world_snapshot` telemetry. Host snapshots are rendered as scope contacts and summary telemetry only; they must not be treated as local physics truth until input validation, correction, and scoring authority are deliberately implemented.
 
 Near-term multiplayer goals:
 
@@ -379,7 +379,7 @@ Near-term multiplayer goals:
 - Maintain identity authority on the Flask server; do not trust peer-provided callsigns.
 - Keep early P2P results unranked/unverified.
 - Use WebRTC DataChannel for gameplay packets after PHOSPHOR LOCK.
-- Synchronize live remote pilot traces before attempting host-authoritative enemy/Sol sync.
+- Promote host snapshots into true shared enemy/Sol/sphere simulation only after prediction/correction rules are in place.
 - Keep gameplay HUD widgets hidden from the front/title screen.
 
 Metatron cube tuning remains important; preserve the existing recoupled visible/gameplay sphere behavior unless explicitly asked to change it.
