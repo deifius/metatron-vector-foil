@@ -190,7 +190,7 @@ function makePolyhedron(kind: SolidKind, r: number): PolyMesh {
 // ===================== GAME TYPES =====================
 type Bullet = { pos: V2; prevPos: V2; vel: V2; life: number; mass: number; origin: V2; firedAtMs: number; burstId: number; ownerCallsign?: string; allied?: boolean };
 type FuelBit = { pos: V2; vel: V2; life: number; hue: number; };
-type Shard = { pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
+type Shard = { id: string; pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
 type OortCluster = {
   orbitRadius: number;
   orbitPhase: number;
@@ -322,6 +322,8 @@ function scoreAlertSeverity(tier: 1 | 2 | 3): HUDState["alert"]["severity"] {
 
 // ===================== WEB AUDIO (DRONES + SFX) =====================
 type GameMode = "menu" | "playing" | "paused" | "transition" | "debrief";
+type StartPanelId = "identity" | "multiplayer" | "flight";
+type StartPanelFocus = StartPanelId | null;
 type MultiplayerRoomVisibility = "PUBLIC" | "UNLISTED" | "PRIVATE";
 type MultiplayerConfigPolicy = "HOST LOCKED" | "PERSONAL SHIPS" | "OPEN LAB";
 type MultiplayerRoute = "NO CARRIER" | "LOCAL SCAFFOLD" | "SIGNAL SERVER" | "LOCAL PHOSPHOR LOCK" | "DIRECT DARK FOREST LINK" | "RELAYED THROUGH METATRON NODE";
@@ -351,6 +353,8 @@ type MultiplayerDebriefSummary = {
   pilots: MultiplayerPilotContribution[];
 };
 type MultiplayerPilotTraceStatus = "ACTIVE" | "PAUSED" | "LOST" | "DEBRIEF";
+type MultiplayerPilotLifeState = "alive" | "destroyedAwaitingWaveClear";
+type MultiplayerGameOverReason = "allShipsDestroyed" | "solCollapse";
 type MultiplayerPilotTraceMessage = {
   type: "pilot_trace";
   seq: number;
@@ -404,9 +408,40 @@ type MultiplayerWorldEnemyTrace = {
   y: number;
   vx: number;
   vy: number;
+  ax: number;
+  ay: number;
+  az: number;
   r: number;
   hue: number;
   morphing: boolean;
+  morph: number;
+  nextKind: SolidKind | null;
+};
+type MultiplayerWorldShardTrace = {
+  id: string;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;
+  life0: number;
+  hue: number;
+  size: number;
+  ang: number;
+  spin: number;
+};
+type MultiplayerWorldPilotState = {
+  callsign: string;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  angle: number;
+  shieldPct: number;
+  fuelPct: number;
+  hitsTaken: number;
+  lifeState: MultiplayerPilotLifeState;
+  deathCause: DeathCauseKey | null;
 };
 type MultiplayerWorldSphereTrace = { index: number; awakened: boolean; overcharged: boolean; charge: number };
 type MultiplayerWorldSnapshotMessage = {
@@ -426,7 +461,10 @@ type MultiplayerWorldSnapshotMessage = {
   shardCount: number;
   bulletCount: number;
   enemies: MultiplayerWorldEnemyTrace[];
+  shards: MultiplayerWorldShardTrace[];
   spheres: MultiplayerWorldSphereTrace[];
+  pilotStates?: MultiplayerWorldPilotState[];
+  gameOverReason?: MultiplayerGameOverReason | null;
   teamScore?: number;
   pilotScores?: MultiplayerPilotContribution[];
 };
@@ -451,7 +489,7 @@ type MultiplayerEnemyDamageRecord = { hits: number; damage: number; score: numbe
 type MultiplayerPilotTraceSample = { pos: V2; vel: V2; angle: number; shieldPct: number; fuelPct: number; score: number; status: MultiplayerPilotTraceStatus; ageMs: number };
 type MultiplayerHostWorldSnapshot = MultiplayerWorldSnapshotMessage & {
   receivedAtMs: number;
-  previous?: { receivedAtMs: number; enemies: MultiplayerWorldEnemyTrace[]; spheres: MultiplayerWorldSphereTrace[] };
+  previous?: { receivedAtMs: number; enemies: MultiplayerWorldEnemyTrace[]; shards: MultiplayerWorldShardTrace[]; spheres: MultiplayerWorldSphereTrace[] };
 };
 type MultiplayerCarrierStatus = "idle" | "searching" | "locked" | "lost" | "error";
 type MultiplayerCarrierRole = "none" | "host" | "client";
@@ -1034,9 +1072,9 @@ class AudioEngine {
     this.oortDustGain.gain.setTargetAtTime(a * T.AUDIO_OORT_DUST_GAIN, t, 0.12);
   }
 
-  blip(freq: number, dur = 0.06, gain = 0.18) {
+  blip(freq: number, dur = 0.06, gain = 0.18, delay = 0) {
     if (!this.ctx || !this.sfxBus) return;
-    const t0 = this.ctx.currentTime;
+    const t0 = this.ctx.currentTime + Math.max(0, delay);
     const osc = this.ctx.createOscillator();
     osc.type = "triangle";
     osc.frequency.value = freq;
@@ -1108,8 +1146,11 @@ class AudioEngine {
   }
   roomInviteReceived() {
     if (this.playSample("roomInviteReceived", T.AUDIO_ROOM_INVITE_RECEIVED_GAIN, rand(0.96, 1.04))) return;
-    this.blip(660, 0.055, 0.075);
-    this.blip(660, 0.075, 0.06);
+    // Fallback: a short original two-tone communicator-style chirp with a faint static tail.
+    this.blip(880, 0.045, 0.082, 0.00);
+    this.blip(1320, 0.055, 0.072, 0.055);
+    this.blip(1760, 0.032, 0.038, 0.118);
+    this.noiseBurst(0.045, 0.026, 1800);
   }
   roomJoin() {
     if (this.playSample("roomJoin", T.AUDIO_ROOM_JOIN_GAIN, rand(0.98, 1.02))) return;
@@ -1342,6 +1383,7 @@ export default function MetatronVectorFOIL() {
   const [menuHintTick, setMenuHintTick] = useState(0);
   const [attractIdx, setAttractIdx] = useState(0);
   const [attractPhaseTick, setAttractPhaseTick] = useState(0);
+  const [startPanelFocus, setStartPanelFocus] = useState<StartPanelFocus>(null);
 
   const modeRef = useRef(mode);
   const levelIdxRef = useRef(levelIdx);
@@ -1357,6 +1399,7 @@ export default function MetatronVectorFOIL() {
   const carrierRoleRef = useRef<MultiplayerCarrierRole>("none");
   const signalPollSeqRef = useRef(0);
   const heartbeatTimerRef = useRef<number | null>(null);
+  const multiplayerInviteIdsRef = useRef<Set<string>>(new Set());
   const heartbeatSeqRef = useRef(0);
   const heartbeatSentAtRef = useRef<Record<number, number>>({});
   const lastCarrierPacketAtRef = useRef<number | null>(null);
@@ -1423,12 +1466,18 @@ export default function MetatronVectorFOIL() {
   const refreshMultiplayerInvites = async () => {
     const identity = playerIdentityRef.current;
     if (!identity.authenticated || !identity.callsign) {
+      multiplayerInviteIdsRef.current = new Set();
       setMultiplayerInvites([]);
       return;
     }
     try {
       const payload = await readJson<MultiplayerInvitesResponse>("/api/multiplayer/invites");
-      setMultiplayerInvites(payload.invites ?? []);
+      const nextInvites = payload.invites ?? [];
+      const priorIds = multiplayerInviteIdsRef.current;
+      const hasNewPendingInvite = nextInvites.some((pending) => pending.status === "PENDING" && !priorIds.has(pending.inviteId));
+      multiplayerInviteIdsRef.current = new Set(nextInvites.map((pending) => pending.inviteId));
+      setMultiplayerInvites(nextInvites);
+      if (hasNewPendingInvite) audioRef.current.roomInviteReceived();
     } catch (err) {
       void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
         endpoint: "/api/multiplayer/invites",
@@ -1661,6 +1710,14 @@ export default function MetatronVectorFOIL() {
         lastFireAtMs: prior?.lastFireAtMs ?? -Infinity,
       },
     };
+    const life = ensureRemotePilotLife(message.fromCallsign);
+    if (status === "LOST") {
+      life.lifeState = "destroyedAwaitingWaveClear";
+      life.deathCause = life.deathCause ?? "enemy";
+      life.respawnPose = null;
+    } else if (life.lifeState === "alive") {
+      life.respawnPose = null;
+    }
     markCarrierPilot(message.fromCallsign, status === "LOST" ? "TRACE LOST" : "PHOSPHOR LOCK", `INPUT TRACE // ${message.fromCallsign}`, "LOCAL PHOSPHOR LOCK");
   };
 
@@ -1677,16 +1734,41 @@ export default function MetatronVectorFOIL() {
     const enemies = Array.isArray(message.enemies)
       ? message.enemies.slice(0, T.MULTIPLAYER_WORLD_MAX_ENEMIES).flatMap((enemy): MultiplayerWorldEnemyTrace[] => {
           const x = Number(enemy.x), y = Number(enemy.y), vx = Number(enemy.vx), vy = Number(enemy.vy);
-          const r = Number(enemy.r), hue = Number(enemy.hue);
+          const ax = Number(enemy.ax), ay = Number(enemy.ay), az = Number(enemy.az);
+          const r = Number(enemy.r), hue = Number(enemy.hue), morph = Number(enemy.morph);
           const kind = enemy.kind as SolidKind;
+          const nextKind = enemy.nextKind === "tetra" || enemy.nextKind === "cube" || enemy.nextKind === "octa" || enemy.nextKind === "dodeca" || enemy.nextKind === "icosa" ? enemy.nextKind : null;
           if (![x, y, vx, vy, r, hue].every(Number.isFinite)) return [];
           return [{
             id: String(enemy.id || `host-${nextSeq}`),
             kind,
             x, y, vx, vy,
+            ax: Number.isFinite(ax) ? ax : 0,
+            ay: Number.isFinite(ay) ? ay : 0,
+            az: Number.isFinite(az) ? az : 0,
             r: clamp(r, 2, 96),
             hue: clamp(hue, 0, 360),
             morphing: !!enemy.morphing,
+            morph: Number.isFinite(morph) ? clamp(morph, 0, 1) : 0,
+            nextKind,
+          }];
+        })
+      : [];
+    const shards = Array.isArray(message.shards)
+      ? message.shards.slice(0, T.MULTIPLAYER_WORLD_MAX_SHARDS).flatMap((shard): MultiplayerWorldShardTrace[] => {
+          const x = Number(shard.x), y = Number(shard.y), vx = Number(shard.vx), vy = Number(shard.vy);
+          const life = Number(shard.life), life0 = Number(shard.life0), hue = Number(shard.hue), size = Number(shard.size);
+          const ang = Number(shard.ang), spin = Number(shard.spin);
+          if (![x, y, vx, vy, life, life0, hue, size].every(Number.isFinite)) return [];
+          return [{
+            id: String(shard.id || `host-shard-${nextSeq}`),
+            x, y, vx, vy,
+            life: clamp(life, 0, 30),
+            life0: Math.max(0.01, clamp(life0, 0.01, 30)),
+            hue: clamp(hue, 0, 360),
+            size: clamp(size, 0.5, 12),
+            ang: Number.isFinite(ang) ? ang : 0,
+            spin: Number.isFinite(spin) ? spin : 0,
           }];
         })
       : [];
@@ -1696,6 +1778,25 @@ export default function MetatronVectorFOIL() {
           const charge = Number(sphere.charge);
           if (!Number.isFinite(index) || index < 0 || index > 12) return [];
           return [{ index, awakened: !!sphere.awakened, overcharged: !!sphere.overcharged, charge: Number.isFinite(charge) ? clamp(charge, 0, T.META_NODE_MAX_CHARGE_SEC) : 0 }];
+        })
+      : [];
+    const pilotStates = Array.isArray(message.pilotStates)
+      ? message.pilotStates.slice(0, T.MULTIPLAYER_MAX_PILOTS).flatMap((entry): MultiplayerWorldPilotState[] => {
+          const callsign = normalizeCallsignInput(String(entry?.callsign ?? ""));
+          const x = Number(entry?.x), y = Number(entry?.y), vx = Number(entry?.vx), vy = Number(entry?.vy), angle = Number(entry?.angle);
+          if (!callsign || ![x, y, vx, vy, angle].every(Number.isFinite)) return [];
+          const lifeState: MultiplayerPilotLifeState = entry?.lifeState === "destroyedAwaitingWaveClear" ? "destroyedAwaitingWaveClear" : "alive";
+          const rawCause = String(entry?.deathCause ?? "");
+          const deathCause = ["shrapnel", "enemy", "well", "sol", "fuel", "collapse", "oort"].includes(rawCause) ? rawCause as DeathCauseKey : null;
+          return [{
+            callsign,
+            x, y, vx, vy, angle,
+            shieldPct: clamp(Number(entry?.shieldPct), 0, 100),
+            fuelPct: clamp(Number(entry?.fuelPct), 0, 100),
+            hitsTaken: Math.max(0, Number(entry?.hitsTaken) || 0),
+            lifeState,
+            deathCause,
+          }];
         })
       : [];
     const pilotScores = Array.isArray(message.pilotScores)
@@ -1728,14 +1829,17 @@ export default function MetatronVectorFOIL() {
       score: Math.max(0, Math.round(Number(message.score) || 0)),
       runClockMs: Math.max(0, Math.round(Number(message.runClockMs) || 0)),
       enemyCount: Math.max(0, Math.round(Number(message.enemyCount) || enemies.length)),
-      shardCount: Math.max(0, Math.round(Number(message.shardCount) || 0)),
+      shardCount: Math.max(0, Math.round(Number(message.shardCount) || shards.length)),
       bulletCount: Math.max(0, Math.round(Number(message.bulletCount) || 0)),
       enemies,
+      shards,
       spheres,
+      pilotStates,
+      gameOverReason: message.gameOverReason === "allShipsDestroyed" || message.gameOverReason === "solCollapse" ? message.gameOverReason : null,
       teamScore: Math.max(0, Math.round(Number(message.teamScore ?? message.score) || 0)),
       pilotScores,
       receivedAtMs: performance.now(),
-      previous: prior ? { receivedAtMs: prior.receivedAtMs, enemies: prior.enemies, spheres: prior.spheres } : undefined,
+      previous: prior ? { receivedAtMs: prior.receivedAtMs, enemies: prior.enemies, shards: prior.shards, spheres: prior.spheres } : undefined,
     };
     multiplayerWorldSnapshotRef.current = snapshot;
     setMultiplayerWorldSnapshot(snapshot);
@@ -2526,6 +2630,7 @@ export default function MetatronVectorFOIL() {
     const bullets: Bullet[] = [];
     const enemies: Enemy[] = [];
     let nextEnemyId = 1;
+    let nextShardId = 1;
     const shards: Shard[] = [];
     const fuelBits: FuelBit[] = [];
     const trail: V2[] = [];
@@ -2707,6 +2812,7 @@ export default function MetatronVectorFOIL() {
       player.hitInvuln = 0;
       gunCD = 0;
       nextEnemyId = 1;
+      nextShardId = 1;
       metaAx = 0; metaAy = 0; metaAz = 0; metaPulseClock = 0;
       score = 0;
       chainMultiplier = 1;
@@ -2723,6 +2829,10 @@ export default function MetatronVectorFOIL() {
       multiplayerPilotScores.clear();
       multiplayerPilotContributions.clear();
       multiplayerEnemyDamage.clear();
+      remotePilotLives.clear();
+      localPilotLifeState = "alive";
+      localDeathCause = null;
+      multiplayerGameOverReason = null;
       if (playerIdentityRef.current.callsign) multiplayerPilotScores.set(playerIdentityRef.current.callsign, 0);
       allSpheresLitAwarded = false;
       runAwakenedCount = 0;
@@ -2965,6 +3075,7 @@ export default function MetatronVectorFOIL() {
         const v = dj.copy().mul(sp).add(e.vel.copy().mul(T.SHRAPNEL_PARENT_VEL));
         const life0 = rand(T.SHRAPNEL_LIFE_MIN, T.SHRAPNEL_LIFE_MAX);
         shards.push({
+          id: `shard-${nextShardId++}`,
           pos: origin.copy().add(dj.copy().mul(rand(0.2, 2.4))),
           vel: v,
           life: life0,
@@ -3053,6 +3164,19 @@ export default function MetatronVectorFOIL() {
     };
 
     const killPlayer = (causeKey: DeathCauseKey = "enemy") => {
+      if (sharedDefenseCarrierLocked()) {
+        localPilotLifeState = "destroyedAwaitingWaveClear";
+        localDeathCause = causeKey;
+        player.thrust = 0;
+        player.thrustGlow = 0;
+        player.brakeAnim = 0;
+        audioRef.current.shipDestroyed();
+        if (isHostAuthoritativeDefense() && allSharedPilotsDestroyed()) {
+          multiplayerGameOverReason = "allShipsDestroyed";
+          loseRun("ship", causeKey);
+        }
+        return;
+      }
       loseRun("ship", causeKey);
     };
 
@@ -3062,7 +3186,7 @@ export default function MetatronVectorFOIL() {
       damage = 1,
       knockback = T.SHIP_HIT_KNOCKBACK,
     ) => {
-      if (player.hitInvuln > 0) return false;
+      if (localPilotLifeState !== "alive" || player.hitInvuln > 0) return false;
       const appliedDamage = Math.max(0, damage);
       player.hitsTaken += appliedDamage;
       player.hitInvuln = T.SHIP_HIT_IFRAME_SEC;
@@ -3113,6 +3237,10 @@ export default function MetatronVectorFOIL() {
     const multiplayerPilotScores = new Map<string, number>();
     const multiplayerPilotContributions = new Map<string, MultiplayerPilotContribution>();
     const multiplayerEnemyDamage = new Map<string, Map<string, MultiplayerEnemyDamageRecord>>();
+    const remotePilotLives = new Map<string, { hitsTaken: number; hitInvuln: number; lifeState: MultiplayerPilotLifeState; deathCause: DeathCauseKey | null; respawnPose: { x: number; y: number; vx: number; vy: number; angle: number } | null }>();
+    let localPilotLifeState: MultiplayerPilotLifeState = "alive";
+    let localDeathCause: DeathCauseKey | null = null;
+    let multiplayerGameOverReason: MultiplayerGameOverReason | null = null;
     let waveDamageTaken = 0;
     let allSpheresLitAwarded = false;
     let slingshotArmed = false;
@@ -3129,6 +3257,181 @@ export default function MetatronVectorFOIL() {
     let waveFlags: WaveCitationFlags = { oortReach: false, farOortReach: false, returnToTheBurn: false, periapsisKiss: false };
     let lastPilotTraceAtMs = 0;
     let lastWorldSnapshotAtMs = 0;
+
+    const sharedDefenseCarrierLocked = () => {
+      const room = multiplayerRoomRef.current;
+      const callsign = playerIdentityRef.current.callsign;
+      const carrier = multiplayerCarrierRef.current;
+      return !!callsign && room.source === "SERVER" && room.phase !== "closed" && carrier.status === "locked";
+    };
+
+    const getRoomPilotCallsigns = () => {
+      const seen = new Set<string>();
+      const out: string[] = [];
+      const push = (value: string | null | undefined) => {
+        const clean = normalizeCallsignInput(String(value ?? ""));
+        if (!clean || seen.has(clean)) return;
+        seen.add(clean);
+        out.push(clean);
+      };
+      push(playerIdentityRef.current.callsign);
+      for (const pilot of multiplayerRoomRef.current.pilots) {
+        if (pilot.role !== "SLOT") push(pilot.callsign);
+      }
+      for (const input of Object.values(remotePilotInputsRef.current)) push(input.callsign);
+      return out.slice(0, T.MULTIPLAYER_MAX_PILOTS);
+    };
+
+    const ensureRemotePilotLife = (callsign: string) => {
+      const clean = normalizeCallsignInput(callsign);
+      let state = remotePilotLives.get(clean);
+      if (!state) {
+        state = { hitsTaken: 0, hitInvuln: 0, lifeState: "alive", deathCause: null, respawnPose: null };
+        remotePilotLives.set(clean, state);
+      }
+      return state;
+    };
+
+    const isPilotAliveByCallsign = (callsign: string | null | undefined) => {
+      const clean = normalizeCallsignInput(String(callsign ?? ""));
+      if (!clean) return false;
+      if (clean === normalizeCallsignInput(String(playerIdentityRef.current.callsign ?? ""))) return localPilotLifeState === "alive";
+      return ensureRemotePilotLife(clean).lifeState === "alive";
+    };
+
+    const anyOtherPilotAlive = (callsign: string | null | undefined) => {
+      const clean = normalizeCallsignInput(String(callsign ?? ""));
+      return getRoomPilotCallsigns().some((pilotCallsign) => pilotCallsign !== clean && isPilotAliveByCallsign(pilotCallsign));
+    };
+
+    const allSharedPilotsDestroyed = () => {
+      const pilots = getRoomPilotCallsigns();
+      return pilots.length > 0 && pilots.every((pilotCallsign) => !isPilotAliveByCallsign(pilotCallsign));
+    };
+
+    const buildMultiplayerPilotStates = (): MultiplayerWorldPilotState[] => {
+      const localCallsign = normalizeCallsignInput(String(playerIdentityRef.current.callsign ?? ""));
+      const states: MultiplayerWorldPilotState[] = [];
+      const pushState = (state: MultiplayerWorldPilotState) => {
+        if (!state.callsign || states.some((entry) => entry.callsign === state.callsign)) return;
+        states.push(state);
+      };
+      if (localCallsign) {
+        const shieldPct = clamp(((T.SHIP_RESILIENCE - player.hitsTaken) / Math.max(1, T.SHIP_RESILIENCE)) * 100, 0, 100);
+        pushState({
+          callsign: localCallsign,
+          x: Number(player.pos.x.toFixed(2)),
+          y: Number(player.pos.y.toFixed(2)),
+          vx: Number(player.vel.x.toFixed(2)),
+          vy: Number(player.vel.y.toFixed(2)),
+          angle: Number(player.angle.toFixed(5)),
+          shieldPct: Number(shieldPct.toFixed(1)),
+          fuelPct: Number(clamp((player.fuel / T.FUEL_MAX) * 100, 0, 100).toFixed(1)),
+          hitsTaken: Number(player.hitsTaken.toFixed(2)),
+          lifeState: localPilotLifeState,
+          deathCause: localDeathCause,
+        });
+      }
+      for (const callsign of getRoomPilotCallsigns()) {
+        if (!callsign || callsign === localCallsign) continue;
+        const input = remotePilotInputsRef.current[callsign] ?? remotePilotTracesRef.current[callsign];
+        const life = ensureRemotePilotLife(callsign);
+        const pose = life.respawnPose ?? input;
+        const shieldPct = clamp(((T.SHIP_RESILIENCE - life.hitsTaken) / Math.max(1, T.SHIP_RESILIENCE)) * 100, 0, 100);
+        pushState({
+          callsign,
+          x: Number((pose?.x ?? 0).toFixed(2)),
+          y: Number((pose?.y ?? 0).toFixed(2)),
+          vx: Number((pose?.vx ?? 0).toFixed(2)),
+          vy: Number((pose?.vy ?? 0).toFixed(2)),
+          angle: Number((pose?.angle ?? 0).toFixed(5)),
+          shieldPct: Number(shieldPct.toFixed(1)),
+          fuelPct: Number(clamp(input?.fuelPct ?? 100, 0, 100).toFixed(1)),
+          hitsTaken: Number(life.hitsTaken.toFixed(2)),
+          lifeState: life.lifeState,
+          deathCause: life.deathCause,
+        });
+      }
+      return states.slice(0, T.MULTIPLAYER_MAX_PILOTS);
+    };
+
+    const applyRemotePilotHit = (
+      input: MultiplayerRemotePilotInputState | MultiplayerPilotTraceState,
+      sourcePos?: V2,
+      causeKey: DeathCauseKey = "enemy",
+      damage = 1,
+    ) => {
+      const callsign = normalizeCallsignInput(input.callsign);
+      if (!callsign) return false;
+      const life = ensureRemotePilotLife(callsign);
+      if (life.lifeState !== "alive" || life.hitInvuln > 0) return false;
+      const appliedDamage = Math.max(0, damage);
+      life.hitsTaken += appliedDamage;
+      life.hitInvuln = T.SHIP_HIT_IFRAME_SEC;
+      waveDamageTaken += appliedDamage;
+      const contribution = ensureMultiplayerPilotContribution(callsign);
+      if (contribution) contribution.status = "ACTIVE";
+      if (sourcePos && "vx" in input && "vy" in input) {
+        // Remote knockback is expressed in the next authoritative snapshot; the guest remains locally responsive.
+      }
+      if (causeKey === "oort") audioRef.current.oortStrike();
+      else audioRef.current.hit();
+      if (life.hitsTaken >= T.SHIP_RESILIENCE) {
+        life.lifeState = "destroyedAwaitingWaveClear";
+        life.deathCause = causeKey;
+        if (contribution) contribution.status = "LOST";
+        audioRef.current.shipDestroyed();
+        if (isHostAuthoritativeDefense() && allSharedPilotsDestroyed()) {
+          multiplayerGameOverReason = "allShipsDestroyed";
+          loseRun("ship", causeKey);
+        }
+      }
+      return true;
+    };
+
+    const respawnPilotAtWaveClear = (callsign: string, slotIndex: number, totalSlots: number) => {
+      const clean = normalizeCallsignInput(callsign);
+      if (!clean) return;
+      const a = (slotIndex / Math.max(1, totalSlots)) * TAU;
+      const radius = metaRadius * (1.0 + 0.08 * Math.sin(slotIndex * 1.7));
+      const pos = new V2(Math.cos(a) * radius, Math.sin(a) * radius);
+      const gm = slidersRef.current.gravity;
+      const orbitalSpeed = Math.sqrt(gm / Math.max(1, radius)) * T.ORBIT_GAIN;
+      const vel = new V2(-Math.sin(a), Math.cos(a)).mul(orbitalSpeed);
+      const angle = Math.atan2(vel.y, vel.x);
+      const localCallsign = normalizeCallsignInput(String(playerIdentityRef.current.callsign ?? ""));
+      if (clean === localCallsign) {
+        player.pos = pos;
+        player.vel = vel;
+        player.angle = angle;
+        player.angularVel = 0;
+        player.thrust = 0;
+        player.brakeAnim = 0;
+        player.thrustGlow = 0;
+        player.fuel = Math.max(player.fuel, T.FUEL_MAX * 0.75);
+        player.hitsTaken = 0;
+        player.hitInvuln = T.SHIP_HIT_IFRAME_SEC * 1.5;
+        player.stuckTime = 0;
+        localPilotLifeState = "alive";
+        localDeathCause = null;
+      } else {
+        const life = ensureRemotePilotLife(clean);
+        life.hitsTaken = 0;
+        life.hitInvuln = T.SHIP_HIT_IFRAME_SEC * 1.5;
+        life.lifeState = "alive";
+        life.deathCause = null;
+        life.respawnPose = { x: pos.x, y: pos.y, vx: vel.x, vy: vel.y, angle };
+        const contribution = ensureMultiplayerPilotContribution(clean);
+        if (contribution) contribution.status = "ACTIVE";
+      }
+    };
+
+    const respawnDestroyedPilotsForNextWave = () => {
+      const pilots = getRoomPilotCallsigns();
+      pilots.forEach((callsign, index) => {
+        if (!isPilotAliveByCallsign(callsign)) respawnPilotAtWaveClear(callsign, index, pilots.length);
+      });
+    };
 
     const getLocalPilotInputSnapshot = () => {
       const turnLeft = keys.has("a") || keys.has("A") || keys.has("ArrowLeft");
@@ -3155,7 +3458,7 @@ export default function MetatronVectorFOIL() {
       const fuelPct = clamp((player.fuel / T.FUEL_MAX) * 100, 0, 100);
       const status: MultiplayerPilotTraceStatus = modeRef.current === "debrief"
         ? "DEBRIEF"
-        : (modeRef.current === "paused" ? "PAUSED" : "ACTIVE");
+        : (localPilotLifeState !== "alive" ? "LOST" : (modeRef.current === "paused" ? "PAUSED" : "ACTIVE"));
       sendCarrierMessage({
         type: "pilot_trace",
         seq: ++pilotTraceSeqRef.current,
@@ -3189,7 +3492,7 @@ export default function MetatronVectorFOIL() {
           angle: Number(player.angle.toFixed(5)),
           turn: input.turn,
           thrust: input.thrust,
-          fire: input.fire,
+          fire: localPilotLifeState === "alive" && input.fire,
           shieldPct: Number(shieldPct.toFixed(1)),
           fuelPct: Number(fuelPct.toFixed(1)),
           score: Math.round(score),
@@ -3215,9 +3518,27 @@ export default function MetatronVectorFOIL() {
         y: Number(enemy.pos.y.toFixed(2)),
         vx: Number(enemy.vel.x.toFixed(2)),
         vy: Number(enemy.vel.y.toFixed(2)),
+        ax: Number(enemy.ax.toFixed(4)),
+        ay: Number(enemy.ay.toFixed(4)),
+        az: Number(enemy.az.toFixed(4)),
         r: Number(enemy.r.toFixed(2)),
         hue: Number(enemy.hue.toFixed(1)),
         morphing: enemy.morphing,
+        morph: Number(enemy.morph.toFixed(3)),
+        nextKind: enemy.nextKind,
+      }));
+      const hostShards = shards.slice(0, T.MULTIPLAYER_WORLD_MAX_SHARDS).map((shard) => ({
+        id: shard.id,
+        x: Number(shard.pos.x.toFixed(2)),
+        y: Number(shard.pos.y.toFixed(2)),
+        vx: Number(shard.vel.x.toFixed(2)),
+        vy: Number(shard.vel.y.toFixed(2)),
+        life: Number(shard.life.toFixed(3)),
+        life0: Number(shard.life0.toFixed(3)),
+        hue: Number(shard.hue.toFixed(1)),
+        size: Number(shard.size.toFixed(2)),
+        ang: Number(shard.ang.toFixed(4)),
+        spin: Number(shard.spin.toFixed(4)),
       }));
       const spheres = metaNodes.map((node) => ({
         index: node.index,
@@ -3242,7 +3563,10 @@ export default function MetatronVectorFOIL() {
         shardCount: shards.length,
         bulletCount: bullets.length,
         enemies: hostEnemies,
+        shards: hostShards,
         spheres,
+        pilotStates: buildMultiplayerPilotStates(),
+        gameOverReason: multiplayerGameOverReason,
         teamScore: Math.round(score),
         pilotScores: getMultiplayerPilotContributions(),
       });
@@ -3284,6 +3608,28 @@ export default function MetatronVectorFOIL() {
         node.overcharged = !!sphere.overcharged;
         node.charge = clamp(Number(sphere.charge) || 0, 0, T.META_NODE_MAX_CHARGE_SEC);
         if (wasDark && node.awakened) node.activatedAt = metaPulseClock;
+      }
+      const localCallsign = normalizeCallsignInput(String(playerIdentityRef.current.callsign ?? ""));
+      const localState = snapshot.pilotStates?.find((entry) => entry.callsign === localCallsign);
+      if (localState) {
+        const wasDestroyed = localPilotLifeState !== "alive";
+        localPilotLifeState = localState.lifeState;
+        localDeathCause = localState.deathCause;
+        player.hitsTaken = clamp(localState.hitsTaken, 0, T.SHIP_RESILIENCE);
+        if (localState.lifeState !== "alive") {
+          player.thrust = 0;
+          player.thrustGlow = 0;
+          player.brakeAnim = 0;
+        }
+        if (wasDestroyed && localState.lifeState === "alive") {
+          player.pos = new V2(localState.x, localState.y);
+          player.vel = new V2(localState.vx, localState.vy);
+          player.angle = localState.angle;
+          player.angularVel = 0;
+          player.hitInvuln = Math.max(player.hitInvuln, T.SHIP_HIT_IFRAME_SEC * 1.5);
+          player.fuel = Math.max(player.fuel, T.FUEL_MAX * 0.75);
+          audioRef.current.signalLock();
+        }
       }
     };
 
@@ -3687,7 +4033,7 @@ export default function MetatronVectorFOIL() {
       if (!T.OORT_CONSTELLATIONS_ENABLED) return false;
       const timeSec = metaPulseClock;
       if (applyOortAmbientAbrasion(dt, timeSec)) return true;
-      if (player.hitInvuln > 0) return false;
+      if (localPilotLifeState !== "alive" || player.hitInvuln > 0) return false;
 
       const speed = player.vel.len();
       const lineHitR = T.SHIP_HIT_RADIUS + T.OORT_LINE_HIT_RADIUS;
@@ -3849,8 +4195,8 @@ export default function MetatronVectorFOIL() {
       const sharedClientActive = !!sharedClientSnapshot;
       if (sharedClientSnapshot) {
         applyHostSnapshotToClientWorld(sharedClientSnapshot);
-        if (sharedClientSnapshot.mode === "debrief" || sharedClientSnapshot.solIntegrityPct <= 0) {
-          loseRun("sol", "collapse");
+        if (sharedClientSnapshot.gameOverReason) {
+          loseRun(sharedClientSnapshot.gameOverReason === "solCollapse" ? "sol" : "ship", sharedClientSnapshot.gameOverReason === "solCollapse" ? "collapse" : "enemy");
           return;
         }
       }
@@ -3862,10 +4208,17 @@ export default function MetatronVectorFOIL() {
       }
 
       player.hitInvuln = Math.max(0, player.hitInvuln - dt);
+      for (const life of remotePilotLives.values()) life.hitInvuln = Math.max(0, life.hitInvuln - dt);
+      const localPilotAlive = localPilotLifeState === "alive";
+      if (isHostAuthoritativeDefense() && allSharedPilotsDestroyed()) {
+        multiplayerGameOverReason = "allShipsDestroyed";
+        loseRun("ship", localDeathCause ?? "enemy");
+        return;
+      }
 
       // ---- ship input (A/D + W/S) ----
-      const turnLeft = keys.has("a") || keys.has("A") || keys.has("ArrowLeft");
-      const turnRight = keys.has("d") || keys.has("D") || keys.has("ArrowRight");
+      const turnLeft = localPilotAlive && (keys.has("a") || keys.has("A") || keys.has("ArrowLeft"));
+      const turnRight = localPilotAlive && (keys.has("d") || keys.has("D") || keys.has("ArrowRight"));
       const turnInput = (turnRight ? 1 : 0) - (turnLeft ? 1 : 0);
       if (T.SHIP_ROTATIONAL_INERTIA_ENABLED) {
         player.angularVel = clamp(
@@ -3883,7 +4236,7 @@ export default function MetatronVectorFOIL() {
         if (turnRight) player.angle += T.ROT_SPEED * dt;
       }
 
-      const want = (keys.has("w") || keys.has("W") || keys.has("ArrowUp")) ? 1 : ((keys.has("s") || keys.has("S") || keys.has("ArrowDown")) ? -1 : 0);
+      const want = localPilotAlive ? ((keys.has("w") || keys.has("W") || keys.has("ArrowUp")) ? 1 : ((keys.has("s") || keys.has("S") || keys.has("ArrowDown")) ? -1 : 0)) : 0;
       player.thrust = lerp(player.thrust, want, want !== 0 ? 0.16 : 0.10);
 
       // fuel burn/regen
@@ -3949,11 +4302,11 @@ export default function MetatronVectorFOIL() {
       const playerPrevPos = player.pos.copy();
       player.pos.add(player.vel.copy().mul(dt));
       const solCrashR = Math.max(1, T.STAR_COLLISION_RADIUS + T.SHIP_HIT_RADIUS * 0.25);
-      if (pointSegmentDistanceSq(new V2(0, 0), playerPrevPos, player.pos) <= solCrashR * solCrashR) {
+      if (localPilotAlive && pointSegmentDistanceSq(new V2(0, 0), playerPrevPos, player.pos) <= solCrashR * solCrashR) {
         loseRun("ship", "sol");
         return;
       }
-      if (applyOortPlayerHazards(dt, playerPrevPos)) return;
+      if (localPilotAlive && applyOortPlayerHazards(dt, playerPrevPos)) return;
 
       const accel = player.vel.copy().sub(velBefore).mul(1 / Math.max(dt, 1e-6));
       const speedNow = player.vel.len();
@@ -4012,7 +4365,7 @@ export default function MetatronVectorFOIL() {
 
       // ---- gun ----
       gunCD -= dt;
-      if ((keys.has(" ") || keys.has("Space")) && gunCD <= 0) {
+      if (localPilotAlive && (keys.has(" ") || keys.has("Space")) && gunCD <= 0) {
         const burstId = beginShotBurstIfNeeded();
         const stats = burstStats.get(burstId);
         if (stats) {
@@ -4061,7 +4414,7 @@ export default function MetatronVectorFOIL() {
 
         let targetPos = player.pos;
         let toShip = targetPos.copy().sub(e.pos);
-        let shipDist = Math.max(1, toShip.len());
+        let shipDist = localPilotLifeState === "alive" ? Math.max(1, toShip.len()) : Infinity;
         if (isHostAuthoritativeDefense()) {
           const nowMs = performance.now();
           for (const input of Object.values(remotePilotInputsRef.current)) {
@@ -4115,13 +4468,26 @@ export default function MetatronVectorFOIL() {
 
         const toPlayer = player.pos.copy().sub(e.pos);
         const enemyHitR = Math.max(8, e.r * T.ENEMY_HIT_RADIUS_MULT);
-        if (toPlayer.len() <= T.SHIP_HIT_RADIUS + enemyHitR) {
+        if (localPilotAlive && toPlayer.len() <= T.SHIP_HIT_RADIUS + enemyHitR) {
           if (applyShipHit(e.pos.copy(), "enemy")) return;
+        }
+        if (isHostAuthoritativeDefense()) {
+          const nowMs = performance.now();
+          for (const input of Object.values(remotePilotInputsRef.current)) {
+            if (input.status !== "ACTIVE" || nowMs - input.receivedAtMs > T.MULTIPLAYER_TRACE_STALE_MS) continue;
+            if (!isPilotAliveByCallsign(input.callsign)) continue;
+            const remotePos = new V2(input.x, input.y);
+            if (remotePos.copy().sub(e.pos).len() <= T.SHIP_HIT_RADIUS + enemyHitR) {
+              applyRemotePilotHit(input, e.pos.copy(), "enemy");
+              if (modeRef.current === "debrief") return;
+            }
+          }
         }
 
         const starLossR = T.STAR_RADIUS + e.r * 0.4;
         if (e.pos.len() <= starLossR) {
-          loseRun("sol");
+          multiplayerGameOverReason = sharedDefenseCarrierLocked() ? "solCollapse" : multiplayerGameOverReason;
+          loseRun("sol", sharedDefenseCarrierLocked() ? "collapse" : "sol");
           return;
         }
 
@@ -4188,10 +4554,29 @@ export default function MetatronVectorFOIL() {
         s.ang += s.spin * dt;
         s.life -= dt;
 
-        if (s.pos.copy().sub(player.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD) {
+        if (localPilotAlive && s.pos.copy().sub(player.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD) {
           if (applyShipHit(s.pos.copy(), "shrapnel")) return;
           shards.splice(i, 1);
           continue;
+        }
+        if (isHostAuthoritativeDefense()) {
+          const nowMs = performance.now();
+          let hitRemote = false;
+          for (const input of Object.values(remotePilotInputsRef.current)) {
+            if (input.status !== "ACTIVE" || nowMs - input.receivedAtMs > T.MULTIPLAYER_TRACE_STALE_MS) continue;
+            if (!isPilotAliveByCallsign(input.callsign)) continue;
+            const remotePos = new V2(input.x, input.y);
+            if (remotePos.copy().sub(s.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD) {
+              applyRemotePilotHit(input, s.pos.copy(), "shrapnel");
+              hitRemote = true;
+              break;
+            }
+          }
+          if (modeRef.current === "debrief") return;
+          if (hitRemote) {
+            shards.splice(i, 1);
+            continue;
+          }
         }
 
         let shardConsumed = false;
@@ -4248,6 +4633,11 @@ export default function MetatronVectorFOIL() {
       syncMetaNodeWorldPositions();
 
       if (!sharedClientActive && waveActive && enemies.length === 0 && shards.length === 0) {
+        if (isHostAuthoritativeDefense() && allSharedPilotsDestroyed()) {
+          multiplayerGameOverReason = "allShipsDestroyed";
+          loseRun("ship", "enemy");
+          return;
+        }
         const waveNumber = getLevel(levelIdxRef.current).wave;
         awardPoints(scoreForWaveClear(waveNumber), "wave", {
           showAlert: true,
@@ -4265,6 +4655,7 @@ export default function MetatronVectorFOIL() {
             duration: 1.8,
           });
         }
+        if (isHostAuthoritativeDefense()) respawnDestroyedPilotsForNextWave();
         audioRef.current.levelUp();
         queueWaveBanner(levelIdxRef.current + 1);
       }
@@ -4419,6 +4810,7 @@ export default function MetatronVectorFOIL() {
           snapshot: debriefSnapshot,
         },
         multiplayer: multiplayerRoomRef.current,
+        localCallsign: playerIdentityRef.current.callsign,
         remotePilotTraces: remotePilotTracesRef.current,
         multiplayerHostWorld: multiplayerWorldSnapshotRef.current,
       });
@@ -4466,6 +4858,30 @@ export default function MetatronVectorFOIL() {
     : playerIdentity.authenticated
       ? "CALLSIGN OPEN // PUBLIC BOARD STANDBY"
       : "ANONYMOUS FLIGHT // LOCAL SCORE ONLY";
+  const primaryMultiplayerInvite = multiplayerInvites.find((pending) => pending.status === "PENDING") ?? multiplayerInvites[0] ?? null;
+  const effectiveStartPanelFocus: StartPanelFocus = primaryMultiplayerInvite ? "multiplayer" : startPanelFocus;
+  const startPanelFocusEngaged = effectiveStartPanelFocus !== null;
+  const identityPanelExpanded = !startPanelFocusEngaged || effectiveStartPanelFocus === "identity";
+  const multiplayerPanelExpanded = !startPanelFocusEngaged || effectiveStartPanelFocus === "multiplayer";
+  const flightPanelExpanded = !startPanelFocusEngaged || effectiveStartPanelFocus === "flight";
+  const startPanelColumns = effectiveStartPanelFocus === "identity"
+    ? "minmax(300px, 1.65fr) minmax(150px, 0.68fr) minmax(150px, 0.68fr)"
+    : effectiveStartPanelFocus === "multiplayer"
+      ? "minmax(150px, 0.68fr) minmax(320px, 1.75fr) minmax(150px, 0.68fr)"
+      : effectiveStartPanelFocus === "flight"
+        ? "minmax(150px, 0.68fr) minmax(150px, 0.68fr) minmax(300px, 1.65fr)"
+        : "minmax(250px, 1fr) minmax(250px, 1fr) minmax(250px, 1fr)";
+  const identityPanelSummary = playerIdentity.callsign
+    ? `PILOT ${playerIdentity.callsign} // ${leaderboard.length} BOARD ECHOES`
+    : playerIdentity.authenticated
+      ? "CALLSIGN OPEN // CLAIM TRACE"
+      : "ANONYMOUS // LOCAL SCORE";
+  const multiplayerPanelSummary = primaryMultiplayerInvite
+    ? `INBOUND // ${primaryMultiplayerInvite.fromCallsign} // ${primaryMultiplayerInvite.roomCode}`
+    : multiplayerRoom.phase !== "closed"
+      ? `ROOM ${multiplayerRoom.roomCode} // ${carrierQualityLabel(multiplayerCarrier)}`
+      : "P2P CARRIER COLD // NO PEER";
+  const flightPanelSummary = `${menuFlightHint.slice(0, 34)}${menuFlightHint.length > 34 ? "..." : ""}`;
 
   return (
     <div
@@ -4503,7 +4919,7 @@ export default function MetatronVectorFOIL() {
           style={{
             position: "absolute",
             inset: 0,
-            padding: "clamp(14px, 2.5vw, 26px)",
+            padding: "clamp(10px, 2.0vw, 22px)",
             color: "rgba(210,238,255,0.92)",
             fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
             background: "radial-gradient(circle at 50% 45%, rgba(28,72,104,0.12), rgba(0,0,0,0.34) 44%, rgba(0,0,0,0.62) 100%)",
@@ -4592,6 +5008,22 @@ export default function MetatronVectorFOIL() {
               62% { opacity: 0.20; }
               100% { opacity: 0; transform: rotate(360deg); }
             }
+            @keyframes mvfPanelGleam {
+              0% { transform: translateX(-135%) skewX(-16deg); opacity: 0; }
+              20% { opacity: 0.98; }
+              64% { opacity: 0.34; }
+              100% { transform: translateX(138%) skewX(-16deg); opacity: 0; }
+            }
+            @keyframes mvfPanelStarshine {
+              0%, 100% { opacity: 0.26; filter: brightness(1); }
+              46% { opacity: 0.86; filter: brightness(1.55); }
+              51% { opacity: 0.18; filter: brightness(0.82); }
+              56% { opacity: 0.72; filter: brightness(1.28); }
+            }
+            @keyframes mvfInviteCommsPulse {
+              0%, 100% { opacity: 0.78; transform: scale(1); box-shadow: inset 0 0 30px rgba(243,214,152,0.09), 0 0 22px rgba(243,214,152,0.09); }
+              48% { opacity: 1; transform: scale(1.01); box-shadow: inset 0 0 44px rgba(243,214,152,0.16), 0 0 38px rgba(243,214,152,0.17); }
+            }
           `}</style>
           <div
             aria-hidden
@@ -4635,14 +5067,14 @@ export default function MetatronVectorFOIL() {
             }}
           />
 
-          <div style={{ position: "relative", zIndex: 2, display: "grid", gridTemplateRows: "auto minmax(0, 1fr) auto", height: "100%", gap: "clamp(10px, 2vh, 18px)" }}>
+          <div style={{ position: "relative", zIndex: 2, display: "grid", gridTemplateRows: "auto minmax(0, 1fr) auto", height: "100%", gap: "clamp(8px, 1.45vh, 14px)" }}>
             <div style={{ display: "grid", justifyItems: "center", gap: 7, textAlign: "center" }}>
               <div style={{ fontSize: 10, letterSpacing: "0.42em", textTransform: "uppercase", color: "rgba(144,198,245,0.68)", animation: "mvfTraceFlicker 3.4s linear infinite" }}>
                 Live vector scope // attract mode
               </div>
               <div
                 style={{
-                  fontSize: "clamp(28px, 5.6vw, 52px)",
+                  fontSize: "clamp(25px, 4.8vw, 44px)",
                   letterSpacing: "0.20em",
                   textTransform: "uppercase",
                   color: "rgba(218,244,255,0.96)",
@@ -4657,7 +5089,7 @@ export default function MetatronVectorFOIL() {
                 Defend Sol // Awaken the Tree // Surf the gravity well
               </div>
               <div style={{ marginTop: 4, display: "grid", justifyItems: "center", gap: 6 }}>
-                <div style={{ fontSize: "clamp(16px, 2.8vw, 24px)", letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(176,255,218,0.98)", textShadow: "0 0 16px rgba(176,255,218,0.22), 0 0 48px rgba(176,255,218,0.10)", animation: "mvfLaunchPhosphor 5.6s ease-in-out infinite", transformOrigin: "50% 50%" }}>
+                <div style={{ fontSize: "clamp(14px, 2.35vw, 21px)", letterSpacing: "0.22em", textTransform: "uppercase", color: "rgba(176,255,218,0.98)", textShadow: "0 0 16px rgba(176,255,218,0.22), 0 0 48px rgba(176,255,218,0.10)", animation: "mvfLaunchPhosphor 5.6s ease-in-out infinite", transformOrigin: "50% 50%" }}>
                   Press Enter to Launch
                 </div>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center", alignItems: "center", fontSize: 11, letterSpacing: "0.10em", color: "rgba(202,230,248,0.78)" }}>
@@ -4670,108 +5102,144 @@ export default function MetatronVectorFOIL() {
               </div>
             </div>
 
-            <div style={{ display: "grid", placeItems: "center", minHeight: 0 }}>
-              <div style={{ width: "min(1100px, 96vw)", display: "grid", gridTemplateColumns: "minmax(278px, 382px) minmax(252px, 316px) minmax(278px, 382px)", gap: "clamp(12px, 1.8vw, 18px)", alignItems: "end" }}>
-                <VectorFrame title="PILOT // IDENTITY TRACE">
-                  <div style={{ display: "grid", gap: 10 }}>
-                    <div style={{ fontSize: 15, lineHeight: 1.3, letterSpacing: "0.13em", textTransform: "uppercase", color: "rgba(176,255,218,0.86)", textShadow: "0 0 12px rgba(145,255,212,0.12)" }}>
-                      {publicBoardStatus}
+            <div style={{ display: "grid", placeItems: "end center", minHeight: 0, overflow: "hidden" }}>
+              <div
+                style={{
+                  width: "min(1180px, 96vw)",
+                  height: "clamp(270px, 52dvh, 500px)",
+                  minHeight: 0,
+                  display: "grid",
+                  gridTemplateColumns: startPanelColumns,
+                  gap: "clamp(9px, 1.35vw, 16px)",
+                  alignItems: "stretch",
+                  transition: "grid-template-columns 360ms cubic-bezier(.2,.82,.18,1), gap 260ms ease",
+                }}
+              >
+                <StartFocusPanel
+                  panel="identity"
+                  title="PILOT // IDENTITY TRACE"
+                  summary={identityPanelSummary}
+                  focus={effectiveStartPanelFocus}
+                  onFocusChange={setStartPanelFocus}
+                >
+                  <div style={{ display: "grid", gap: identityPanelExpanded ? 10 : 8 }}>
+                    <div style={{ display: "grid", gap: 8 }}>
+                      <div style={{ fontSize: identityPanelExpanded ? 15 : 13, lineHeight: 1.3, letterSpacing: "0.13em", textTransform: "uppercase", color: "rgba(176,255,218,0.86)", textShadow: "0 0 12px rgba(145,255,212,0.12)" }}>
+                        {publicBoardStatus}
+                      </div>
+                      <div style={{ fontSize: identityPanelExpanded ? 11 : 10, lineHeight: 1.55, letterSpacing: "0.08em", color: "rgba(188,220,244,0.72)" }}>
+                        Fly now. Sign in only when you want a three-character callsign engraved on the public honor board.
+                      </div>
                     </div>
-                    <div style={{ fontSize: 11, lineHeight: 1.55, letterSpacing: "0.08em", color: "rgba(188,220,244,0.72)" }}>
-                      Fly now. Sign in only when you want a three-character callsign engraved on the public honor board.
-                    </div>
-                  </div>
 
-                  <CallsignConsole
-                    value={callsignInput}
-                    current={playerIdentity.callsign}
-                    authenticated={playerIdentity.authenticated}
-                    authProvider={playerIdentity.authProvider}
-                    canChoose={playerIdentity.canChooseCallsign}
-                    googleAuthEnabled={googleAuthEnabled}
-                    devAuthEnabled={devAuthEnabled}
-                    devHandle={devHandle}
-                    message={callsignMessage}
-                    onChange={setCallsignInput}
-                    onSubmit={submitCallsign}
-                    onGoogleLogin={googleLogin}
-                    onDevHandleChange={setDevHandle}
-                    onDevLogin={devLogin}
-                    onLogout={logoutPlayer}
-                  />
-
-                  <LeaderboardConsole entries={leaderboard} status={scoreSubmitStatus} compact />
-                </VectorFrame>
-
-                <div style={{ alignSelf: "stretch", minHeight: 220, display: "grid", gap: 12, placeItems: "center" }}>
-                  <div aria-hidden style={{ pointerEvents: "none" }}>
-                    <GhostMetatronCube glow={featuredGlow} opacity={featuredOpacity} headline={featuredHeadline} subline={featuredSubline} />
-                  </div>
-                  <MultiplayerConsole
-                    room={multiplayerRoom}
-                    carrier={multiplayerCarrier}
-                    invite={multiplayerInvite}
-                    invites={multiplayerInvites}
-                    onInviteChange={setMultiplayerInvite}
-                    onOpen={openMultiplayerChannel}
-                    onInvite={sendMultiplayerInvite}
-                    onClose={closeMultiplayerChannel}
-                    onAcceptInvite={(pending) => respondToMultiplayerInvite(pending, "accept")}
-                    onDeclineInvite={(pending) => respondToMultiplayerInvite(pending, "decline")}
-                  />
-                </div>
-
-                <VectorFrame title="FLIGHT SCHOOL // ORBITAL TRACE">
-                  <div
-                    style={{
-                      position: "relative",
-                      overflow: "hidden",
-                      minHeight: 162,
-                      padding: "13px 14px 15px",
-                      border: "1px solid rgba(150,205,255,0.14)",
-                      background: "linear-gradient(180deg, rgba(6,18,28,0.58), rgba(0,0,0,0.18))",
-                      boxShadow: "inset 0 0 34px rgba(110,190,255,0.055), 0 0 18px rgba(110,190,255,0.035)",
-                      opacity: menuHintOpacity,
-                      transition: "opacity 80ms linear",
-                    }}
-                  >
-                    <div
-                      aria-hidden
-                      style={{
-                        position: "absolute",
-                        left: 0,
-                        right: 0,
-                        bottom: 0,
-                        height: 2,
-                        background: "linear-gradient(90deg, transparent, rgba(176,255,218,0.72), transparent)",
-                        animation: "mvfHintSignal 2.25s linear infinite",
-                      }}
+                    <CallsignConsole
+                      value={callsignInput}
+                      current={playerIdentity.callsign}
+                      authenticated={playerIdentity.authenticated}
+                      authProvider={playerIdentity.authProvider}
+                      canChoose={playerIdentity.canChooseCallsign}
+                      googleAuthEnabled={googleAuthEnabled}
+                      devAuthEnabled={devAuthEnabled}
+                      devHandle={devHandle}
+                      message={callsignMessage}
+                      onChange={setCallsignInput}
+                      onSubmit={submitCallsign}
+                      onGoogleLogin={googleLogin}
+                      onDevHandleChange={setDevHandle}
+                      onDevLogin={devLogin}
+                      onLogout={logoutPlayer}
                     />
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "baseline", marginBottom: 12 }}>
-                      <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.62)" }}>
-                        Guidance teletype
-                      </div>
-                      <div style={{ fontSize: 10, letterSpacing: "0.16em", textTransform: "uppercase", color: menuHintBlinking ? "rgba(243,214,152,0.84)" : "rgba(176,255,218,0.58)" }}>
-                        {menuHintBlinking ? "Cycling trace" : menuHintCounter}
-                      </div>
-                    </div>
-                    <div style={{ minHeight: 70, display: "flex", alignItems: "center" }}>
-                      <div style={{ fontSize: "clamp(22px, 2.75vw, 31px)", lineHeight: 1.18, letterSpacing: "0.025em", color: "rgba(255,226,158,0.98)", textShadow: "0 0 14px rgba(243,214,152,0.19), 0 0 30px rgba(243,214,152,0.06)" }}>
-                        {typedMenuFlightHint}
-                        {menuHintTypingHeadline && menuHintCursorOn ? <span style={{ color: "rgba(176,255,218,0.92)", animation: "mvfHintCursor 640ms steps(1, end) infinite" }}>▌</span> : null}
-                      </div>
-                    </div>
-                    <div style={{ minHeight: 42, marginTop: 12, paddingTop: 11, borderTop: "1px solid rgba(150,205,255,0.11)", fontSize: "clamp(12px, 1.2vw, 14px)", lineHeight: 1.55, color: "rgba(213,235,249,0.82)", letterSpacing: "0.075em" }}>
-                      {typedMenuFlightDetail}
-                      {menuHintTypingDetail && menuHintCursorOn ? <span style={{ color: "rgba(176,255,218,0.76)", animation: "mvfHintCursor 640ms steps(1, end) infinite" }}>▌</span> : null}
-                    </div>
-                  </div>
 
-                  <div style={{ marginTop: 15, display: "grid", gridTemplateColumns: "1fr", gap: 8 }}>
-                    <VectorTelemetry label="Tree Status" value="DORMANT // AWAKEN WHAT YOU TOUCH" />
-                    <VectorTelemetry label="Scope Signal" value={featuredSubline} />
+                    <LeaderboardConsole entries={leaderboard} status={scoreSubmitStatus} compact />
                   </div>
-                </VectorFrame>
+                </StartFocusPanel>
+
+                <StartFocusPanel
+                  panel="multiplayer"
+                  title="CONSTELLATION DEFENSE // P2P CARRIER"
+                  summary={multiplayerPanelSummary}
+                  focus={effectiveStartPanelFocus}
+                  onFocusChange={setStartPanelFocus}
+                  urgent={Boolean(primaryMultiplayerInvite)}
+                >
+                  <div style={{ display: "grid", gap: multiplayerPanelExpanded ? 10 : 8, alignContent: "start" }}>
+                    <div aria-hidden style={{ pointerEvents: "none", display: "grid", placeItems: "center", maxHeight: multiplayerPanelExpanded ? 164 : 84, overflow: "hidden", opacity: primaryMultiplayerInvite ? 0.42 : 1, transition: "max-height 320ms ease, opacity 220ms ease" }}>
+                      <GhostMetatronCube glow={featuredGlow} opacity={featuredOpacity} headline={featuredHeadline} subline={featuredSubline} compact={!multiplayerPanelExpanded || Boolean(primaryMultiplayerInvite)} />
+                    </div>
+                    <MultiplayerConsole
+                      room={multiplayerRoom}
+                      carrier={multiplayerCarrier}
+                      invite={multiplayerInvite}
+                      invites={multiplayerInvites}
+                      onInviteChange={setMultiplayerInvite}
+                      onOpen={openMultiplayerChannel}
+                      onInvite={sendMultiplayerInvite}
+                      onClose={closeMultiplayerChannel}
+                      onAcceptInvite={(pending) => respondToMultiplayerInvite(pending, "accept")}
+                      onDeclineInvite={(pending) => respondToMultiplayerInvite(pending, "decline")}
+                    />
+                  </div>
+                </StartFocusPanel>
+
+                <StartFocusPanel
+                  panel="flight"
+                  title="FLIGHT SCHOOL // ORBITAL TRACE"
+                  summary={flightPanelSummary}
+                  focus={effectiveStartPanelFocus}
+                  onFocusChange={setStartPanelFocus}
+                >
+                  <div style={{ display: "grid", gap: 12 }}>
+                    <div
+                      style={{
+                        position: "relative",
+                        overflow: "hidden",
+                        minHeight: flightPanelExpanded ? 162 : 132,
+                        padding: "13px 14px 15px",
+                        border: "1px solid rgba(150,205,255,0.14)",
+                        background: "linear-gradient(180deg, rgba(6,18,28,0.58), rgba(0,0,0,0.18))",
+                        boxShadow: "inset 0 0 34px rgba(110,190,255,0.055), 0 0 18px rgba(110,190,255,0.035)",
+                        opacity: menuHintOpacity,
+                        transition: "opacity 80ms linear, min-height 260ms ease",
+                      }}
+                    >
+                      <div
+                        aria-hidden
+                        style={{
+                          position: "absolute",
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          height: 2,
+                          background: "linear-gradient(90deg, transparent, rgba(176,255,218,0.72), transparent)",
+                          animation: "mvfHintSignal 2.25s linear infinite",
+                        }}
+                      />
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "baseline", marginBottom: 12 }}>
+                        <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.62)" }}>
+                          Guidance teletype
+                        </div>
+                        <div style={{ fontSize: 10, letterSpacing: "0.16em", textTransform: "uppercase", color: menuHintBlinking ? "rgba(243,214,152,0.84)" : "rgba(176,255,218,0.58)" }}>
+                          {menuHintBlinking ? "Cycling trace" : menuHintCounter}
+                        </div>
+                      </div>
+                      <div style={{ minHeight: 70, display: "flex", alignItems: "center" }}>
+                        <div style={{ fontSize: flightPanelExpanded ? "clamp(22px, 2.75vw, 31px)" : "clamp(18px, 2.15vw, 24px)", lineHeight: 1.18, letterSpacing: "0.025em", color: "rgba(255,226,158,0.98)", textShadow: "0 0 14px rgba(243,214,152,0.19), 0 0 30px rgba(243,214,152,0.06)" }}>
+                          {typedMenuFlightHint}
+                          {menuHintTypingHeadline && menuHintCursorOn ? <span style={{ color: "rgba(176,255,218,0.92)", animation: "mvfHintCursor 640ms steps(1, end) infinite" }}>▌</span> : null}
+                        </div>
+                      </div>
+                      <div style={{ minHeight: 42, marginTop: 12, paddingTop: 11, borderTop: "1px solid rgba(150,205,255,0.11)", fontSize: flightPanelExpanded ? "clamp(12px, 1.2vw, 14px)" : 11, lineHeight: 1.55, color: "rgba(213,235,249,0.82)", letterSpacing: "0.075em" }}>
+                        {typedMenuFlightDetail}
+                        {menuHintTypingDetail && menuHintCursorOn ? <span style={{ color: "rgba(176,255,218,0.76)", animation: "mvfHintCursor 640ms steps(1, end) infinite" }}>▌</span> : null}
+                      </div>
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8 }}>
+                      <VectorTelemetry label="Tree Status" value="DORMANT // AWAKEN WHAT YOU TOUCH" />
+                      <VectorTelemetry label="Scope Signal" value={featuredSubline} />
+                    </div>
+                  </div>
+                </StartFocusPanel>
               </div>
             </div>
 
@@ -4864,7 +5332,7 @@ export default function MetatronVectorFOIL() {
 }
 
 // ===================== UI COMPONENTS =====================
-function GhostMetatronCube({ glow, opacity, headline, subline }: { glow: number; opacity: number; headline: string; subline: string }) {
+function GhostMetatronCube({ glow, opacity, headline, subline, compact = false }: { glow: number; opacity: number; headline: string; subline: string; compact?: boolean }) {
   const outer = [
     [0, -110],
     [95, -55],
@@ -4910,11 +5378,11 @@ function GhostMetatronCube({ glow, opacity, headline, subline }: { glow: number;
     <div
       style={{
         position: "relative",
-        width: "min(29vw, 290px)",
-        minWidth: 110,
+        width: compact ? "min(15vw, 150px)" : "min(25vw, 240px)",
+        minWidth: compact ? 92 : 110,
         aspectRatio: "1 / 1",
         opacity: 0.54 + opacity * 0.34,
-        transform: "translateY(clamp(-82px, -8.8vh, -54px))",
+        transform: compact ? "translateY(0)" : "translateY(clamp(-42px, -5.2vh, -24px))",
         filter: `drop-shadow(0 0 ${18 + glow * 18}px rgba(140,210,255,0.14)) drop-shadow(0 0 ${42 + glow * 28}px rgba(176,255,218,0.08))`,
       }}
     >
@@ -5002,6 +5470,116 @@ function GhostMetatronCube({ glow, opacity, headline, subline }: { glow: number;
   );
 }
 
+
+function StartFocusPanel({
+  panel,
+  title,
+  summary,
+  focus,
+  onFocusChange,
+  urgent = false,
+  children,
+}: {
+  panel: StartPanelId;
+  title: string;
+  summary: string;
+  focus: StartPanelFocus;
+  onFocusChange: (panel: StartPanelFocus) => void;
+  urgent?: boolean;
+  children: React.ReactNode;
+}) {
+  const focusEngaged = focus !== null;
+  const focused = focus === panel;
+  const active = !focusEngaged || focused;
+  const compressed = focusEngaged && !focused;
+  const accent = panel === "identity"
+    ? "rgba(150,205,255,0.76)"
+    : panel === "multiplayer"
+      ? "rgba(176,255,218,0.82)"
+      : "rgba(243,214,152,0.78)";
+  const gleamKey = focused || urgent ? `${panel}-gleam-on` : `${panel}-gleam-off`;
+
+  return (
+    <section
+      tabIndex={0}
+      onMouseEnter={() => onFocusChange(panel)}
+      onMouseLeave={() => onFocusChange(null)}
+      onFocus={() => onFocusChange(panel)}
+      onBlur={(event) => {
+        const nextTarget = event.relatedTarget;
+        if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) onFocusChange(null);
+      }}
+      style={{
+        position: "relative",
+        minWidth: 0,
+        minHeight: 0,
+        height: "100%",
+        display: "grid",
+        gridTemplateRows: "auto minmax(0, 1fr)",
+        border: urgent
+          ? "1px solid rgba(243,214,152,0.36)"
+          : focused
+            ? "1px solid rgba(220,246,255,0.34)"
+            : "1px solid rgba(150,205,255,0.18)",
+        boxShadow: urgent
+          ? "inset 0 0 42px rgba(243,214,152,0.105), 0 0 34px rgba(243,214,152,0.13), 0 0 64px rgba(176,255,218,0.05)"
+          : focused
+            ? "inset 0 0 44px rgba(130,205,255,0.10), 0 0 34px rgba(170,230,255,0.12), 0 0 68px rgba(176,255,218,0.045)"
+            : "inset 0 0 34px rgba(100,170,230,0.055), 0 0 20px rgba(100,170,230,0.045)",
+        background: urgent
+          ? "linear-gradient(180deg, rgba(30,20,7,0.70), rgba(4,15,18,0.38))"
+          : focused
+            ? "linear-gradient(180deg, rgba(10,26,39,0.70), rgba(3,11,17,0.34))"
+            : "linear-gradient(180deg, rgba(5,13,22,0.52), rgba(2,7,12,0.28))",
+        padding: compressed ? "12px 12px 13px" : "14px 16px 16px",
+        overflow: "hidden",
+        opacity: compressed ? 0.74 : 1,
+        transform: compressed ? "scale(0.986)" : "scale(1)",
+        filter: focused || urgent ? "brightness(1.14) saturate(1.08)" : "brightness(1)",
+        transition: "padding 260ms ease, opacity 240ms ease, transform 320ms cubic-bezier(.2,.82,.18,1), filter 260ms ease, border-color 260ms ease, box-shadow 320ms ease, background 320ms ease",
+        outline: "none",
+      }}
+    >
+      <div aria-hidden style={{ position: "absolute", inset: 8, border: "1px solid rgba(150,205,255,0.065)", pointerEvents: "none" }} />
+      <div aria-hidden style={{ position: "absolute", inset: 0, opacity: focused || urgent ? 0.20 : 0.13, pointerEvents: "none", backgroundImage: "linear-gradient(rgba(150,205,255,0.17) 1px, transparent 1px), linear-gradient(90deg, rgba(150,205,255,0.12) 1px, transparent 1px)", backgroundSize: "22px 22px", transition: "opacity 220ms ease" }} />
+      <div aria-hidden style={{ position: "absolute", left: 0, top: 0, width: 34, height: 34, borderLeft: `1px solid ${accent}`, borderTop: `1px solid ${accent}`, opacity: focused || urgent ? 0.72 : 0.38 }} />
+      <div aria-hidden style={{ position: "absolute", right: 0, bottom: 0, width: 34, height: 34, borderRight: "1px solid rgba(243,214,152,0.26)", borderBottom: "1px solid rgba(243,214,152,0.26)", opacity: focused || urgent ? 0.70 : 0.42 }} />
+      <div
+        key={gleamKey}
+        aria-hidden
+        style={{
+          position: "absolute",
+          inset: "-10% -28%",
+          pointerEvents: "none",
+          opacity: focused || urgent ? 1 : 0,
+          background: "linear-gradient(105deg, transparent 0%, transparent 35%, rgba(255,248,210,0.02) 39%, rgba(255,248,210,0.22) 46%, rgba(176,255,218,0.12) 51%, transparent 59%, transparent 100%)",
+          mixBlendMode: "screen",
+          animation: focused || urgent ? "mvfPanelGleam 920ms cubic-bezier(.2,.82,.18,1) 1" : "none",
+        }}
+      />
+      {(focused || urgent) && (
+        <div aria-hidden style={{ position: "absolute", right: "8%", top: "11%", width: 8, height: 8, borderRadius: 999, background: "rgba(255,244,206,0.72)", boxShadow: "0 0 10px rgba(255,244,206,0.70), 0 0 26px rgba(176,255,218,0.24)", animation: "mvfPanelStarshine 1.35s ease-out 1", pointerEvents: "none" }} />
+      )}
+
+      <div style={{ position: "relative", zIndex: 1, display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10, marginBottom: compressed ? 10 : 12 }}>
+        <div style={{ minWidth: 0, fontSize: compressed ? 9 : 10, letterSpacing: compressed ? "0.20em" : "0.28em", textTransform: "uppercase", color: focused || urgent ? accent : "rgba(150,205,255,0.68)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{title}</div>
+        <div style={{ flex: "0 0 auto", fontSize: 8, letterSpacing: "0.16em", textTransform: "uppercase", color: urgent ? "rgba(243,214,152,0.82)" : focused ? "rgba(176,255,218,0.58)" : "rgba(150,205,255,0.42)" }}>{urgent ? "INBOUND" : focused ? "FOCUS" : "TRACE"}</div>
+      </div>
+
+      <div style={{ position: "relative", zIndex: 1, minHeight: 0, overflowY: compressed ? "hidden" : "auto", overflowX: "hidden", paddingRight: compressed ? 0 : 4 }}>
+        {compressed ? (
+          <div style={{ height: "100%", minHeight: 110, display: "grid", alignContent: "center", gap: 9 }}>
+            <div style={{ fontSize: urgent ? 17 : 14, lineHeight: 1.26, letterSpacing: "0.11em", textTransform: "uppercase", color: urgent ? "rgba(255,226,158,0.96)" : "rgba(214,242,255,0.86)", textShadow: urgent ? "0 0 18px rgba(243,214,152,0.22)" : "0 0 14px rgba(150,205,255,0.12)" }}>{summary}</div>
+            <div style={{ height: 1, background: "linear-gradient(90deg, transparent, rgba(150,205,255,0.28), transparent)" }} />
+            <div style={{ fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: "rgba(150,205,255,0.54)" }}>Hover to expand console</div>
+          </div>
+        ) : children}
+      </div>
+    </section>
+  );
+}
+
+
 function VectorFrame({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div style={{
@@ -5074,12 +5652,13 @@ function MultiplayerConsole({
 }) {
   const open = room.phase !== "closed";
   const inviteReady = /^[A-Za-z0-9]{3}$/.test(invite);
+  const pendingInvite = invites.find((entry) => entry.status === "PENDING") ?? invites[0] ?? null;
   const pilotRows = open && room.pilots.length > 0 ? room.pilots : [
     { callsign: "___", role: "SLOT" as const, status: "AWAITING CARRIER" as const, signalAgeMs: 0 },
   ];
   return (
     <div style={{
-      width: "min(300px, 100%)",
+      width: "100%",
       display: "grid",
       gap: 8,
       padding: 10,
@@ -5092,7 +5671,16 @@ function MultiplayerConsole({
         <div style={{ fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: open ? "rgba(176,255,218,0.84)" : "rgba(150,205,255,0.48)" }}>{open ? room.roomCode : "COLD"}</div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 5 }}>
+      {pendingInvite && (
+        <IncomingInviteSignal
+          pending={pendingInvite}
+          pendingCount={invites.length}
+          onAccept={onAcceptInvite}
+          onDecline={onDeclineInvite}
+        />
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 5, opacity: pendingInvite ? 0.72 : 1 }}>
         <VectorTelemetry label="Signal Route" value={room.route} />
         <VectorTelemetry label="Config" value={open ? `${room.visibility} // ${room.configPolicy}` : "P2P SCAFFOLD // UNRANKED"} />
         <VectorTelemetry label="Source" value={open ? `${room.source} // ${room.hostCallsign ?? "NO HOST"}` : "LOCAL // COLD"} />
@@ -5114,7 +5702,7 @@ function MultiplayerConsole({
         {open ? `${room.lastSignal} // ${carrier.lastMessage}` : "Open a local defense-channel shell. WebRTC signal lock arms after a callsign invite is accepted."}
       </div>
 
-      {invites.length > 0 && (
+      {invites.length > 0 && !pendingInvite && (
         <div style={{ display: "grid", gap: 6, padding: "7px 0", borderTop: "1px solid rgba(243,214,152,0.14)", borderBottom: "1px solid rgba(243,214,152,0.10)" }}>
           <div style={{ fontSize: 9, letterSpacing: "0.20em", textTransform: "uppercase", color: "rgba(243,214,152,0.72)" }}>Inbound callsign vectors</div>
           {invites.slice(0, 3).map((pending) => (
@@ -5160,6 +5748,52 @@ function MultiplayerConsole({
     </div>
   );
 }
+
+
+function IncomingInviteSignal({
+  pending,
+  pendingCount,
+  onAccept,
+  onDecline,
+}: {
+  pending: MultiplayerInvite;
+  pendingCount: number;
+  onAccept: (invite: MultiplayerInvite) => void | Promise<void>;
+  onDecline: (invite: MultiplayerInvite) => void | Promise<void>;
+}) {
+  return (
+    <div
+      style={{
+        position: "relative",
+        overflow: "hidden",
+        display: "grid",
+        gap: 9,
+        padding: "12px 12px 13px",
+        border: "1px solid rgba(243,214,152,0.28)",
+        background: "radial-gradient(circle at 16% 18%, rgba(255,226,158,0.12), transparent 34%), linear-gradient(180deg, rgba(30,20,7,0.58), rgba(2,12,15,0.42))",
+        animation: "mvfInviteCommsPulse 1.45s ease-in-out infinite",
+      }}
+    >
+      <div aria-hidden style={{ position: "absolute", inset: 0, opacity: 0.16, backgroundImage: "linear-gradient(rgba(243,214,152,0.18) 1px, transparent 1px), linear-gradient(90deg, rgba(176,255,218,0.12) 1px, transparent 1px)", backgroundSize: "18px 18px", pointerEvents: "none" }} />
+      <div aria-hidden style={{ position: "absolute", left: 0, right: 0, top: 0, height: 2, background: "linear-gradient(90deg, transparent, rgba(255,226,158,0.92), rgba(176,255,218,0.42), transparent)", animation: "mvfHintSignal 1.55s linear infinite", pointerEvents: "none" }} />
+      <div style={{ position: "relative", zIndex: 1, display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+        <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(255,226,158,0.90)" }}>Incoming Callsign Vector</div>
+        <div style={{ fontSize: 9, letterSpacing: "0.16em", textTransform: "uppercase", color: "rgba(176,255,218,0.72)" }}>{pendingCount > 1 ? `${pendingCount} signals` : pending.roomCode}</div>
+      </div>
+      <div style={{ position: "relative", zIndex: 1, fontSize: "clamp(18px, 2.1vw, 28px)", lineHeight: 1.12, letterSpacing: "0.13em", textTransform: "uppercase", color: "rgba(255,235,184,0.98)", textShadow: "0 0 14px rgba(243,214,152,0.26), 0 0 34px rgba(243,214,152,0.09)" }}>
+        {pending.fromCallsign} requests constellation lock
+      </div>
+      <div style={{ position: "relative", zIndex: 1, fontSize: 11, lineHeight: 1.42, letterSpacing: "0.10em", textTransform: "uppercase", color: "rgba(214,242,255,0.76)" }}>
+        Accept to join room {pending.roomCode}. Decline to let the signal fade.
+      </div>
+      <div style={{ position: "relative", zIndex: 1, display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button type="button" onClick={() => onAccept(pending)} style={{ ...btnStyle, padding: "8px 10px", fontSize: 11, letterSpacing: "0.10em", textTransform: "uppercase", borderColor: "rgba(176,255,218,0.34)", color: "rgba(212,255,230,0.94)", boxShadow: "0 0 18px rgba(176,255,218,0.08)" }}>Accept Signal</button>
+        <button type="button" onClick={() => onDecline(pending)} style={{ ...btnStyle, padding: "8px 10px", fontSize: 11, letterSpacing: "0.10em", textTransform: "uppercase", borderColor: "rgba(243,214,152,0.20)", color: "rgba(244,230,198,0.86)" }}>Decline Trace</button>
+      </div>
+    </div>
+  );
+}
+
 
 function MultiplayerRosterOverlay({ room, carrier, hostWorld, debrief = false }: { room: MultiplayerRoomState; carrier: MultiplayerCarrierState; hostWorld?: MultiplayerHostWorldSnapshot | null; debrief?: boolean }) {
   if (room.phase === "closed" || room.pilots.length === 0) return null;
@@ -5733,72 +6367,139 @@ function hostWorldEnemySample(snapshot: MultiplayerHostWorldSnapshot, enemy: Mul
   const previous = snapshot.previous?.enemies.find((prior) => prior.id === enemy.id);
   let x = enemy.x;
   let y = enemy.y;
+  let ax = enemy.ax;
+  let ay = enemy.ay;
+  let az = enemy.az;
+  let morph = enemy.morph;
   if (previous) {
     const jump = Math.hypot(previous.x - enemy.x, previous.y - enemy.y);
     if (jump <= T.MULTIPLAYER_WORLD_SNAP_DISTANCE) {
       const t = clamp(ageMs / Math.max(1, T.MULTIPLAYER_WORLD_INTERP_MS), 0, 1);
       x = lerp(previous.x, enemy.x, t);
       y = lerp(previous.y, enemy.y, t);
+      ax = lerpAngle(previous.ax, enemy.ax, t);
+      ay = lerpAngle(previous.ay, enemy.ay, t);
+      az = lerpAngle(previous.az, enemy.az, t);
+      morph = lerp(previous.morph, enemy.morph, t);
     }
   }
   const extrapolateSec = clamp((ageMs - T.MULTIPLAYER_WORLD_INTERP_MS) / 1000, 0, T.MULTIPLAYER_TRACE_MAX_EXTRAPOLATE_SEC);
   x += enemy.vx * extrapolateSec;
   y += enemy.vy * extrapolateSec;
-  return new V2(x, y);
+  return { pos: new V2(x, y), ax, ay, az, morph };
+}
+
+function hostWorldShardSample(snapshot: MultiplayerHostWorldSnapshot, shard: MultiplayerWorldShardTrace, nowMs: number) {
+  const ageMs = Math.max(0, nowMs - snapshot.receivedAtMs);
+  const previous = snapshot.previous?.shards.find((prior) => prior.id === shard.id);
+  let x = shard.x;
+  let y = shard.y;
+  let ang = shard.ang;
+  if (previous) {
+    const jump = Math.hypot(previous.x - shard.x, previous.y - shard.y);
+    if (jump <= T.MULTIPLAYER_WORLD_SNAP_DISTANCE) {
+      const t = clamp(ageMs / Math.max(1, T.MULTIPLAYER_WORLD_INTERP_MS), 0, 1);
+      x = lerp(previous.x, shard.x, t);
+      y = lerp(previous.y, shard.y, t);
+      ang = lerpAngle(previous.ang, shard.ang, t);
+    }
+  }
+  const extrapolateSec = clamp((ageMs - T.MULTIPLAYER_WORLD_INTERP_MS) / 1000, 0, T.MULTIPLAYER_TRACE_MAX_EXTRAPOLATE_SEC);
+  x += shard.vx * extrapolateSec;
+  y += shard.vy * extrapolateSec;
+  ang += shard.spin * extrapolateSec;
+  return { pos: new V2(x, y), ang };
 }
 
 function drawHostWorldSnapshot(ctx: CanvasRenderingContext2D, snapshot: MultiplayerHostWorldSnapshot, cameraZoom: number, nowMs: number) {
   const ageMs = Math.max(0, nowMs - snapshot.receivedAtMs);
   const fresh = ageMs <= T.MULTIPLAYER_WORLD_STALE_MS;
   const pulse = 0.5 + 0.5 * Math.sin(nowMs / 140);
-  const alpha = fresh ? 0.62 : 0.24;
+  const alpha = fresh ? 0.82 : 0.28;
   ctx.save();
   ctx.globalAlpha *= alpha;
   ctx.lineCap = "round";
 
-  for (const enemy of snapshot.enemies) {
-    const pos = hostWorldEnemySample(snapshot, enemy, nowMs);
-    const vel = new V2(enemy.vx, enemy.vy);
-    const speedTail = vel.len() > 0.01 ? vel.copy().norm().mul(-18 / cameraZoom) : new V2(-10 / cameraZoom, 0);
-    const r = Math.max(5 / cameraZoom, enemy.r * 0.34);
-
-    ctx.strokeStyle = `hsla(${Math.round(enemy.hue)},90%,74%,${fresh ? 0.34 : 0.18})`;
-    ctx.lineWidth = 0.9 / cameraZoom;
+  for (const shard of snapshot.shards) {
+    const sample = hostWorldShardSample(snapshot, shard, nowMs);
+    const lifeAlpha = clamp(shard.life / Math.max(0.01, shard.life0), 0, 1);
+    ctx.strokeStyle = `hsla(${Math.round(shard.hue)},90%,75%,${fresh ? 0.18 + 0.56 * lifeAlpha : 0.12})`;
+    ctx.lineWidth = Math.max(0.8, shard.size) / cameraZoom;
+    const tail = new V2(shard.vx, shard.vy).mul(-0.015);
     ctx.beginPath();
-    ctx.moveTo(pos.x + speedTail.x, pos.y + speedTail.y);
-    ctx.lineTo(pos.x, pos.y);
+    ctx.moveTo(sample.pos.x, sample.pos.y);
+    ctx.lineTo(sample.pos.x + tail.x, sample.pos.y + tail.y);
     ctx.stroke();
-
-    ctx.strokeStyle = `hsla(${Math.round(enemy.hue)},90%,78%,${fresh ? 0.52 : 0.22})`;
-    ctx.lineWidth = (enemy.morphing ? 1.35 : 1.0) / cameraZoom;
+    ctx.save();
+    ctx.translate(sample.pos.x, sample.pos.y);
+    ctx.rotate(sample.ang);
+    const sz = shard.size / cameraZoom;
     ctx.beginPath();
-    ctx.moveTo(pos.x, pos.y - r);
-    ctx.lineTo(pos.x + r, pos.y);
-    ctx.lineTo(pos.x, pos.y + r);
-    ctx.lineTo(pos.x - r, pos.y);
+    ctx.moveTo(sz, 0);
+    ctx.lineTo(-0.6 * sz, 0.6 * sz);
+    ctx.lineTo(-0.6 * sz, -0.6 * sz);
     ctx.closePath();
     ctx.stroke();
+    ctx.restore();
+  }
 
-    ctx.strokeStyle = `rgba(176,255,218,${fresh ? 0.18 + pulse * 0.10 : 0.08})`;
-    ctx.lineWidth = 0.65 / cameraZoom;
+  for (const enemy of snapshot.enemies) {
+    const sample = hostWorldEnemySample(snapshot, enemy, nowMs);
+    const vel = new V2(enemy.vx, enemy.vy);
+    const speedTail = vel.len() > 0.01 ? vel.copy().norm().mul(-18 / cameraZoom) : new V2(-10 / cameraZoom, 0);
+    const mesh = makePolyhedron(enemy.kind, enemy.r);
+    const squash = Math.sin(Math.PI * clamp(sample.morph, 0, 1));
+    const yScale = enemy.morphing ? (1 - 0.34 * squash) : 1;
+    const zScale = enemy.morphing ? Math.max(0.08, 1 - 0.92 * squash) : 1;
+    const proj: { x: number; y: number }[] = [];
+    for (const v0 of mesh.verts) {
+      let v = v0;
+      v = rotX(v, sample.ax); v = rotY(v, sample.ay); v = rotZ(v, sample.az);
+      v = new V3(v.x, v.y * yScale, v.z * zScale);
+      const projected = project(v, 1, 4);
+      proj.push({ x: sample.pos.x + projected.x, y: sample.pos.y + projected.y });
+    }
+
+    ctx.strokeStyle = `hsla(${Math.round(enemy.hue)},90%,74%,${fresh ? 0.24 : 0.12})`;
+    ctx.lineWidth = 0.8 / cameraZoom;
     ctx.beginPath();
-    ctx.moveTo(pos.x - r * 1.55, pos.y);
-    ctx.lineTo(pos.x - r * 0.55, pos.y);
-    ctx.moveTo(pos.x + r * 0.55, pos.y);
-    ctx.lineTo(pos.x + r * 1.55, pos.y);
-    ctx.moveTo(pos.x, pos.y - r * 1.55);
-    ctx.lineTo(pos.x, pos.y - r * 0.55);
-    ctx.moveTo(pos.x, pos.y + r * 0.55);
-    ctx.lineTo(pos.x, pos.y + r * 1.55);
+    ctx.moveTo(sample.pos.x + speedTail.x, sample.pos.y + speedTail.y);
+    ctx.lineTo(sample.pos.x, sample.pos.y);
+    ctx.stroke();
+
+    ctx.strokeStyle = `hsla(${Math.round(enemy.hue)},90%,78%,${fresh ? 0.72 : 0.26})`;
+    ctx.lineWidth = (enemy.morphing ? 1.35 : 1.0) / cameraZoom;
+    ctx.beginPath();
+    for (const [i, j] of mesh.edges) {
+      const a = proj[i], b = proj[j];
+      if (!a || !b) continue;
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+    }
+    ctx.stroke();
+
+    const r = Math.max(5 / cameraZoom, enemy.r * 0.62);
+    ctx.strokeStyle = `rgba(176,255,218,${fresh ? 0.08 + pulse * 0.06 : 0.05})`;
+    ctx.lineWidth = 0.55 / cameraZoom;
+    ctx.beginPath();
+    ctx.moveTo(sample.pos.x - r * 1.55, sample.pos.y);
+    ctx.lineTo(sample.pos.x - r * 0.85, sample.pos.y);
+    ctx.moveTo(sample.pos.x + r * 0.85, sample.pos.y);
+    ctx.lineTo(sample.pos.x + r * 1.55, sample.pos.y);
+    ctx.moveTo(sample.pos.x, sample.pos.y - r * 1.55);
+    ctx.lineTo(sample.pos.x, sample.pos.y - r * 0.85);
+    ctx.moveTo(sample.pos.x, sample.pos.y + r * 0.85);
+    ctx.lineTo(sample.pos.x, sample.pos.y + r * 1.55);
     ctx.stroke();
   }
 
   if (snapshot.enemies.length > 0) {
-    const label = fresh ? `HOST SCOPE W${snapshot.wave} // ${snapshot.enemyCount} FOILS` : "HOST SCOPE STALE";
+    const label = fresh ? `HOST SCOPE W${snapshot.wave} // ${snapshot.enemyCount} FOILS // ${snapshot.shardCount} SHRAPNEL` : "HOST SCOPE STALE";
     const first = snapshot.enemies[0];
+    const sample = hostWorldEnemySample(snapshot, first, nowMs);
     ctx.font = `${Math.max(7, 8 / cameraZoom)}px ui-monospace, Menlo, monospace`;
     ctx.fillStyle = fresh ? "rgba(176,255,218,0.42)" : "rgba(255,165,176,0.35)";
-    ctx.fillText(label, first.x + 18 / cameraZoom, first.y + 18 / cameraZoom);
+    ctx.fillText(label, sample.pos.x + 18 / cameraZoom, sample.pos.y + 18 / cameraZoom);
   }
 
   ctx.restore();
@@ -5825,6 +6526,7 @@ function render(
     waveBannerText: string;
     debrief: { phase: DebriefPhase; phaseElapsedMs: number; snapshot: DebriefSnapshot | null };
     multiplayer: MultiplayerRoomState;
+    localCallsign: string | null;
     remotePilotTraces: Record<string, MultiplayerPilotTraceState>;
     multiplayerHostWorld: MultiplayerHostWorldSnapshot | null;
   }
@@ -6160,7 +6862,7 @@ function render(
 
   // allied multiplayer traces: prefer live P2P telemetry, fall back to a dim local scaffold preview.
   const alliedPilots = S.multiplayer.phase !== "closed"
-    ? S.multiplayer.pilots.filter((pilot) => pilot.role === "ALLY")
+    ? S.multiplayer.pilots.filter((pilot) => pilot.role !== "SLOT" && pilot.callsign !== S.localCallsign)
     : [];
   if (alliedPilots.length > 0 && S.mode !== "debrief") {
     const nowMs = performance.now();
