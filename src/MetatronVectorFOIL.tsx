@@ -4859,7 +4859,7 @@ export default function MetatronVectorFOIL() {
       ? "CALLSIGN OPEN // PUBLIC BOARD STANDBY"
       : "ANONYMOUS FLIGHT // LOCAL SCORE ONLY";
   const primaryMultiplayerInvite = multiplayerInvites.find((pending) => pending.status === "PENDING") ?? multiplayerInvites[0] ?? null;
-  const effectiveStartPanelFocus: StartPanelFocus = primaryMultiplayerInvite ? "multiplayer" : startPanelFocus;
+  const effectiveStartPanelFocus: StartPanelFocus = primaryMultiplayerInvite ? "multiplayer" : (startPanelFocus ?? "flight");
   const startPanelFocusEngaged = effectiveStartPanelFocus !== null;
   const identityPanelExpanded = !startPanelFocusEngaged || effectiveStartPanelFocus === "identity";
   const multiplayerPanelExpanded = !startPanelFocusEngaged || effectiveStartPanelFocus === "multiplayer";
@@ -5024,6 +5024,15 @@ export default function MetatronVectorFOIL() {
               0%, 100% { opacity: 0.78; transform: scale(1); box-shadow: inset 0 0 30px rgba(243,214,152,0.09), 0 0 22px rgba(243,214,152,0.09); }
               48% { opacity: 1; transform: scale(1.01); box-shadow: inset 0 0 44px rgba(243,214,152,0.16), 0 0 38px rgba(243,214,152,0.17); }
             }
+            .mvfStartPanelScroll {
+              scrollbar-width: none;
+              -ms-overflow-style: none;
+            }
+            .mvfStartPanelScroll::-webkit-scrollbar {
+              width: 0;
+              height: 0;
+              display: none;
+            }
           `}</style>
           <div
             aria-hidden
@@ -5102,17 +5111,17 @@ export default function MetatronVectorFOIL() {
               </div>
             </div>
 
-            <div style={{ display: "grid", placeItems: "end center", minHeight: 0, overflow: "hidden" }}>
+            <div style={{ display: "grid", placeItems: "start center", minHeight: 0, overflow: "hidden", paddingTop: "clamp(4px, 1vh, 12px)" }}>
               <div
                 style={{
                   width: "min(1180px, 96vw)",
-                  height: "clamp(270px, 52dvh, 500px)",
+                  height: "clamp(340px, 61dvh, 590px)",
                   minHeight: 0,
                   display: "grid",
                   gridTemplateColumns: startPanelColumns,
                   gap: "clamp(9px, 1.35vw, 16px)",
                   alignItems: "stretch",
-                  transition: "grid-template-columns 360ms cubic-bezier(.2,.82,.18,1), gap 260ms ease",
+                  transition: "grid-template-columns 360ms cubic-bezier(.2,.82,.18,1), gap 260ms ease, height 260ms ease",
                 }}
               >
                 <StartFocusPanel
@@ -5566,7 +5575,7 @@ function StartFocusPanel({
         <div style={{ flex: "0 0 auto", fontSize: 8, letterSpacing: "0.16em", textTransform: "uppercase", color: urgent ? "rgba(243,214,152,0.82)" : focused ? "rgba(176,255,218,0.58)" : "rgba(150,205,255,0.42)" }}>{urgent ? "INBOUND" : focused ? "FOCUS" : "TRACE"}</div>
       </div>
 
-      <div style={{ position: "relative", zIndex: 1, minHeight: 0, overflowY: compressed ? "hidden" : "auto", overflowX: "hidden", paddingRight: compressed ? 0 : 4 }}>
+      <div className="mvfStartPanelScroll" style={{ position: "relative", zIndex: 1, minHeight: 0, overflowY: compressed ? "hidden" : "auto", overflowX: "hidden", paddingRight: compressed ? 0 : 2 }}>
         {compressed ? (
           <div style={{ height: "100%", minHeight: 110, display: "grid", alignContent: "center", gap: 9 }}>
             <div style={{ fontSize: urgent ? 17 : 14, lineHeight: 1.26, letterSpacing: "0.11em", textTransform: "uppercase", color: urgent ? "rgba(255,226,158,0.96)" : "rgba(214,242,255,0.86)", textShadow: urgent ? "0 0 18px rgba(243,214,152,0.22)" : "0 0 14px rgba(150,205,255,0.12)" }}>{summary}</div>
