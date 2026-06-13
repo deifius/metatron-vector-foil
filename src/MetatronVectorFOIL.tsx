@@ -1590,8 +1590,11 @@ export default function MetatronVectorFOIL() {
         bumpDroppedCarrierPacket("OUTBOUND TRACE TOO LARGE");
         return false;
       }
-      if (channel.bufferedAmount > 65536) {
-        bumpDroppedCarrierPacket("P2P BUFFER SATURATED");
+      const bufferLimit = message.type === "world_snapshot"
+        ? T.MULTIPLAYER_CARRIER_BUFFER_SOFT_BYTES
+        : T.MULTIPLAYER_CARRIER_BUFFER_HARD_BYTES;
+      if (channel.bufferedAmount > bufferLimit) {
+        bumpDroppedCarrierPacket(message.type === "world_snapshot" ? "HOST SNAPSHOT THROTTLED" : "P2P BUFFER SATURATED");
         return false;
       }
       channel.send(encoded);
@@ -1730,6 +1733,7 @@ export default function MetatronVectorFOIL() {
     if (!Number.isFinite(nextSeq) || nextSeq < 0) return;
     const prior = multiplayerWorldSnapshotRef.current;
     if (prior && nextSeq <= prior.seq) return;
+    const receivedAtMs = performance.now();
 
     const enemies = Array.isArray(message.enemies)
       ? message.enemies.slice(0, T.MULTIPLAYER_WORLD_MAX_ENEMIES).flatMap((enemy): MultiplayerWorldEnemyTrace[] => {
@@ -1838,9 +1842,38 @@ export default function MetatronVectorFOIL() {
       gameOverReason: message.gameOverReason === "allShipsDestroyed" || message.gameOverReason === "solCollapse" ? message.gameOverReason : null,
       teamScore: Math.max(0, Math.round(Number(message.teamScore ?? message.score) || 0)),
       pilotScores,
-      receivedAtMs: performance.now(),
+      receivedAtMs,
       previous: prior ? { receivedAtMs: prior.receivedAtMs, enemies: prior.enemies, shards: prior.shards, spheres: prior.spheres } : undefined,
     };
+    const localCallsign = normalizeCallsignInput(String(playerIdentityRef.current.callsign ?? ""));
+    if (pilotStates.length > 0) {
+      const nextRemoteTraces = { ...remotePilotTracesRef.current };
+      for (const pilotState of pilotStates) {
+        if (!pilotState.callsign || pilotState.callsign === localCallsign) continue;
+        const priorTrace = nextRemoteTraces[pilotState.callsign];
+        const pilotScore = pilotScores.find((entry) => entry.callsign === pilotState.callsign)?.score ?? 0;
+        const status: MultiplayerPilotTraceStatus = pilotState.lifeState !== "alive"
+          ? "LOST"
+          : (snapshot.mode === "debrief" ? "DEBRIEF" : (snapshot.mode === "paused" ? "PAUSED" : "ACTIVE"));
+        nextRemoteTraces[pilotState.callsign] = {
+          callsign: pilotState.callsign,
+          seq: nextSeq,
+          x: pilotState.x,
+          y: pilotState.y,
+          vx: pilotState.vx,
+          vy: pilotState.vy,
+          angle: pilotState.angle,
+          sentAt: snapshot.sentAt,
+          receivedAtMs,
+          shieldPct: pilotState.shieldPct,
+          fuelPct: pilotState.fuelPct,
+          score: Math.max(0, Math.round(pilotScore)),
+          status,
+          previous: previousTraceIfSmooth(priorTrace, pilotState.x, pilotState.y),
+        };
+      }
+      remotePilotTracesRef.current = nextRemoteTraces;
+    }
     multiplayerWorldSnapshotRef.current = snapshot;
     setMultiplayerWorldSnapshot(snapshot);
     updateCarrier({ status: "locked", lastMessage: `HOST SNAPSHOT #${nextSeq} // WAVE ${snapshot.wave}` });
@@ -3459,24 +3492,27 @@ export default function MetatronVectorFOIL() {
       const status: MultiplayerPilotTraceStatus = modeRef.current === "debrief"
         ? "DEBRIEF"
         : (localPilotLifeState !== "alive" ? "LOST" : (modeRef.current === "paused" ? "PAUSED" : "ACTIVE"));
-      sendCarrierMessage({
-        type: "pilot_trace",
-        seq: ++pilotTraceSeqRef.current,
-        roomId: room.roomId,
-        fromCallsign: callsign,
-        toCallsign: carrier.targetCallsign,
-        sentAt: Date.now(),
-        x: Number(player.pos.x.toFixed(3)),
-        y: Number(player.pos.y.toFixed(3)),
-        vx: Number(player.vel.x.toFixed(3)),
-        vy: Number(player.vel.y.toFixed(3)),
-        angle: Number(player.angle.toFixed(5)),
-        shieldPct: Number(shieldPct.toFixed(1)),
-        fuelPct: Number(fuelPct.toFixed(1)),
-        score: Math.round(score),
-        status,
-      });
-      if (room.source === "SERVER" && room.hostCallsign && room.hostCallsign !== callsign) {
+      const isServerGuest = room.source === "SERVER" && !!room.hostCallsign && room.hostCallsign !== callsign;
+      if (!isServerGuest) {
+        sendCarrierMessage({
+          type: "pilot_trace",
+          seq: ++pilotTraceSeqRef.current,
+          roomId: room.roomId,
+          fromCallsign: callsign,
+          toCallsign: carrier.targetCallsign,
+          sentAt: Date.now(),
+          x: Number(player.pos.x.toFixed(3)),
+          y: Number(player.pos.y.toFixed(3)),
+          vx: Number(player.vel.x.toFixed(3)),
+          vy: Number(player.vel.y.toFixed(3)),
+          angle: Number(player.angle.toFixed(5)),
+          shieldPct: Number(shieldPct.toFixed(1)),
+          fuelPct: Number(fuelPct.toFixed(1)),
+          score: Math.round(score),
+          status,
+        });
+      }
+      if (isServerGuest) {
         const input = getLocalPilotInputSnapshot();
         sendCarrierMessage({
           type: "pilot_input",
@@ -3527,7 +3563,11 @@ export default function MetatronVectorFOIL() {
         morph: Number(enemy.morph.toFixed(3)),
         nextKind: enemy.nextKind,
       }));
-      const hostShards = shards.slice(0, T.MULTIPLAYER_WORLD_MAX_SHARDS).map((shard) => ({
+      const shardSnapshotCap = channel.bufferedAmount > T.MULTIPLAYER_CARRIER_BUFFER_SOFT_BYTES
+        ? T.MULTIPLAYER_WORLD_DEGRADED_MAX_SHARDS
+        : T.MULTIPLAYER_WORLD_MAX_SHARDS;
+      const shardSnapshotSource = shards.length > shardSnapshotCap ? shards.slice(shards.length - shardSnapshotCap) : shards;
+      const hostShards = shardSnapshotSource.map((shard) => ({
         id: shard.id,
         x: Number(shard.pos.x.toFixed(2)),
         y: Number(shard.pos.y.toFixed(2)),
