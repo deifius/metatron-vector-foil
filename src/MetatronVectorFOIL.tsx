@@ -5,6 +5,16 @@ import { HUDState } from "./ui/hud/hudTypes";
 import { loadJson, loadTextLines } from "./data/textLoader";
 import { scoreForCitation, scoreForEnemy, scoreForPerfectWave, scoreForWaveClear } from "./config/scoring";
 import { getGamepadControlsHint, readGamepadShipInput } from "./config/gamepadControls";
+import {
+  debugLog,
+  debugWarn,
+  exportDebugBundle,
+  getFlightRecorderSessionId,
+  installFlightRecorderErrorCapture,
+  setFlightRecorderContext,
+} from "./config/debugFlightRecorder";
+import { createEmptyPlayerRegistry, LOCAL_SOLO_PLAYER_ID, markPlayerDestroyed, markPlayerRespawned } from "./config/playerSlots";
+import { MULTIPLAYER_NET_CONFIG } from "./config/multiplayerNetConfig";
 import { SCORE_THRESHOLDS } from "./config/thresholds";
 import type { CitationCategory, CommendationDefinition } from "./types/scoring";
 import {
@@ -1028,6 +1038,24 @@ export default function MetatronVectorFOIL() {
   const keysRef = useRef(new Set<string>());
   const resetToMenuRef = useRef<(() => void) | null>(null);
 
+  useEffect(() => {
+    installFlightRecorderErrorCapture();
+    debugLog("lifecycle", "component-mounted", {
+      sessionId: getFlightRecorderSessionId(),
+      maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers,
+      snapshotHz: MULTIPLAYER_NET_CONFIG.snapshotHz,
+    });
+    return () => debugLog("lifecycle", "component-unmounted");
+  }, []);
+
+  useEffect(() => {
+    setFlightRecorderContext({
+      role: "solo",
+      playerId: LOCAL_SOLO_PLAYER_ID,
+      callsign: playerIdentity.callsign ?? null,
+    });
+  }, [playerIdentity.callsign]);
+
   // Keep slider values available inside the loop without rerenders
   const slidersRef = useRef(sliders);
   useEffect(() => {
@@ -1051,6 +1079,10 @@ export default function MetatronVectorFOIL() {
       setLeaderboard(board.entries ?? []);
     } catch (err) {
       setLeaderboard([]);
+      debugWarn("network", "leaderboard-refresh-failed", {
+        endpoint: "/api/leaderboard",
+        message: err instanceof Error ? err.message : "unknown",
+      });
       void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
         endpoint: "/api/leaderboard",
         message: err instanceof Error ? err.message : "unknown",
@@ -1070,12 +1102,17 @@ export default function MetatronVectorFOIL() {
       setCallsignMessage(callsignStatusMessage(status.player ?? DEFAULT_PLAYER));
       if (!clientStartupLoggedRef.current) {
         clientStartupLoggedRef.current = true;
+        debugLog("lifecycle", "client-startup", {
+          authProvider: status.player?.authProvider ?? "none",
+          hasCallsign: Boolean(status.player?.callsign),
+        });
         void logClientEvent(status.csrfToken, "client.startup", "info", {
           authProvider: status.player?.authProvider ?? "none",
           hasCallsign: Boolean(status.player?.callsign),
         });
       }
-    } catch {
+    } catch (err) {
+      debugWarn("network", "security-status-unavailable", { message: err instanceof Error ? err.message : "unknown" });
       setCallsignMessage("Identity bus unavailable; local flight still works.");
     }
   };
@@ -1117,6 +1154,11 @@ export default function MetatronVectorFOIL() {
       })
       .catch((err) => {
         setScoreSubmitStatus("error");
+        debugWarn("network", "score-submission-failed", {
+          message: err instanceof Error ? err.message : "unknown",
+          score: snapshot.score,
+          wave: snapshot.wave,
+        });
         void logClientEvent(token, "client.score_submission_error", "warning", {
           message: err instanceof Error ? err.message : "unknown",
           score: snapshot.score,
@@ -1358,6 +1400,17 @@ export default function MetatronVectorFOIL() {
     const keys = keysRef.current;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === " ") e.preventDefault();
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        const filename = exportDebugBundle({
+          trigger: "hotkey",
+          mode: modeRef.current,
+          levelIdx: levelIdxRef.current,
+          toggles: togglesRef.current,
+        });
+        debugLog("lifecycle", "debug-export-complete", { trigger: "hotkey", filename });
+        return;
+      }
       // Audio unlock on first interaction
       audioRef.current.init();
 
@@ -1434,6 +1487,11 @@ export default function MetatronVectorFOIL() {
     };
 
     let shipBrakeInput = 0;
+    const playerSlots = createEmptyPlayerRegistry(playerIdentityRef.current.callsign);
+    debugLog("player", "player-registry-initialized", {
+      players: playerSlots.map((slot) => ({ id: slot.id, slot: slot.slot, role: slot.role, lifeState: slot.lifeState })),
+      maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers,
+    });
 
     const bullets: Bullet[] = [];
     const enemies: Enemy[] = [];
@@ -1597,6 +1655,7 @@ export default function MetatronVectorFOIL() {
     };
 
     const resetRun = (toMenu = false) => {
+      debugLog("lifecycle", "run-reset", { toMenu, previousMode: modeRef.current, wave: getLevel(levelIdxRef.current).wave });
       bullets.length = 0; enemies.length = 0; shards.length = 0; fuelBits.length = 0; trail.length = 0;
       for (const c of oortClusters) {
         c.brokenUntil = 0;
@@ -1619,6 +1678,8 @@ export default function MetatronVectorFOIL() {
       player.stuckTime = 0;
       player.hitsTaken = 0;
       player.hitInvuln = 0;
+      markPlayerRespawned(playerSlots[0]);
+      debugLog("player", "player-respawned", { playerId: playerSlots[0]?.id, slot: playerSlots[0]?.slot, reason: "run-reset" });
       gunCD = 0;
       nextEnemyId = 1;
       metaAx = 0; metaAy = 0; metaAz = 0; metaPulseClock = 0;
@@ -1707,7 +1768,17 @@ export default function MetatronVectorFOIL() {
       const muzzle = V2.fromAngle(player.angle, 18);
       const pos = player.pos.copy().add(muzzle);
       const vel = V2.fromAngle(player.angle, T.BULLET_SPEED).add(player.vel.copy());
-      return { pos, prevPos: pos.copy(), vel, life: T.BULLET_LIFE, mass: T.BULLET_MASS, origin: pos.copy(), firedAtMs: runClockMs, burstId };
+      const bullet = { pos, prevPos: pos.copy(), vel, life: T.BULLET_LIFE, mass: T.BULLET_MASS, origin: pos.copy(), firedAtMs: runClockMs, burstId };
+      debugLog("projectile", "projectile-created", {
+        ownerId: playerSlots[0]?.id,
+        burstId,
+        x: pos.x,
+        y: pos.y,
+        vx: vel.x,
+        vy: vel.y,
+        mass: T.BULLET_MASS,
+      });
+      return bullet;
     };
 
     const spawnEnemy = (kind: SolidKind, waveIdx: number, index: number, total: number) => {
@@ -1743,6 +1814,7 @@ export default function MetatronVectorFOIL() {
       const lvl = getLevel(waveIdx);
       enemies.length = 0;
       resetWaveFlags();
+      debugLog("wave", "wave-started", { waveIdx, wave: lvl.wave, enemyKind: lvl.enemyKind, enemyCount: lvl.enemyCount });
       for (let i = 0; i < lvl.enemyCount; i++) {
         enemies.push(spawnEnemy(lvl.enemyKind, waveIdx, i, lvl.enemyCount));
       }
@@ -1866,6 +1938,13 @@ export default function MetatronVectorFOIL() {
 
       const kindFactor: Record<SolidKind, number> = { tetra: 0.6, cube: 0.78, octa: 0.88, dodeca: 1.0, icosa: 1.12 };
       const N = Math.max(3, ((rand(T.SHRAPNEL_COUNT_MIN, T.SHRAPNEL_COUNT_MAX + 1) * kindFactor[e.kind]) | 0));
+      debugLog("shrapnel", "shrapnel-spawned", {
+        sourceEnemyId: e.id,
+        sourceKind: e.kind,
+        count: N,
+        x: origin.x,
+        y: origin.y,
+      });
       for (let k = 0; k < N; k++) {
         const jitter = rand(-Math.PI / 6, Math.PI / 6);
         const dj = dir.copy().rot(jitter).norm();
@@ -1912,6 +1991,12 @@ export default function MetatronVectorFOIL() {
 
     const enterDebrief = (causeKey: DeathCauseKey) => {
       debriefSnapshot = buildDebriefSnapshot(causeKey);
+      debugLog("lifecycle", "debrief-entered", {
+        causeKey,
+        score: debriefSnapshot.score,
+        wave: debriefSnapshot.wave,
+        survivalTimeSec: debriefSnapshot.survivalTimeSec,
+      });
       submitScoreRef.current(debriefSnapshot);
       debriefVisibleRows = 0;
       debriefPublishAccumulator = 0;
@@ -1933,6 +2018,14 @@ export default function MetatronVectorFOIL() {
     };
 
     const loseRun = (reason: "ship" | "sol" = "ship", causeKey: DeathCauseKey = reason === "sol" ? "sol" : "enemy") => {
+      debugWarn(reason === "sol" ? "wave" : "player", reason === "sol" ? "sol-destroyed" : "player-destroyed", {
+        reason,
+        causeKey,
+        playerId: playerSlots[0]?.id,
+        wave: getLevel(levelIdxRef.current).wave,
+        hitsTaken: player.hitsTaken,
+      });
+      if (reason === "ship") markPlayerDestroyed(playerSlots[0]);
       if (reason === "sol") audioRef.current.solDestroyed();
       else audioRef.current.shipDestroyed();
       enterDebrief(causeKey);
@@ -1953,6 +2046,15 @@ export default function MetatronVectorFOIL() {
       player.hitsTaken += appliedDamage;
       player.hitInvuln = T.SHIP_HIT_IFRAME_SEC;
       waveDamageTaken += appliedDamage;
+      debugWarn("collision", "player-hit", {
+        playerId: playerSlots[0]?.id,
+        causeKey,
+        damage: appliedDamage,
+        hitsTaken: player.hitsTaken,
+        resilience: T.SHIP_RESILIENCE,
+        x: player.pos.x,
+        y: player.pos.y,
+      });
       chainMultiplier = Math.max(1, chainMultiplier - SCORE_THRESHOLDS.chainDamagePenalty);
 
       if (sourcePos) {
@@ -2875,6 +2977,12 @@ export default function MetatronVectorFOIL() {
             duration: 1.8,
           });
         }
+        debugLog("wave", "wave-cleared", {
+          wave: waveNumber,
+          score: Math.round(score),
+          perfect: waveDamageTaken <= 0,
+          awakenedNodes: getAwakenedMetaNodeCount(),
+        });
         audioRef.current.levelUp();
         queueWaveBanner(levelIdxRef.current + 1);
       }
@@ -3419,10 +3527,23 @@ export default function MetatronVectorFOIL() {
           </div>
 
           <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
-            <button onClick={() => setMode("playing")} style={btnStyle}>Resume</button>
+            <button onClick={() => { modeRef.current = "playing"; debugLog("lifecycle", "resume-from-pause"); setMode("playing"); }} style={btnStyle}>Resume</button>
             <button onClick={() => {
               resetToMenuRef.current?.();
             }} style={btnStyle}>Back to title</button>
+            <button onClick={() => {
+              const filename = exportDebugBundle({
+                trigger: "pause-menu",
+                mode,
+                levelIdx,
+                toggles,
+                sliders,
+              });
+              debugLog("lifecycle", "debug-export-complete", { trigger: "pause-menu", filename });
+            }} style={btnStyle}>Export flight recorder</button>
+          </div>
+          <div style={{ marginTop: 8, fontSize: 11, opacity: 0.72, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+            Debug export hotkey: Ctrl/⌘ + Shift + L
           </div>
         </Overlay>
       )}
