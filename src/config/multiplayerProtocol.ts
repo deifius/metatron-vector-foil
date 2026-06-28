@@ -1,7 +1,9 @@
 import type { PlayerId, PlayerSlotIndex } from "./playerSlots";
 import type { SolidKind } from "./gameConstants";
 
-export const MULTIPLAYER_PROTOCOL_VERSION = 1 as const;
+export const MULTIPLAYER_PROTOCOL_VERSION = 2 as const;
+
+export type MultiplayerAuthorityRole = "host" | "guest" | "solo";
 
 export type NetInputMessage = {
   type: "player-input";
@@ -42,6 +44,7 @@ export type NetProjectileState = {
   vy: number;
   ageMs: number;
   kind: "blaster";
+  hostTick?: number;
 };
 
 export type NetShrapnelState = {
@@ -53,6 +56,8 @@ export type NetShrapnelState = {
   vy: number;
   lifeMs: number;
   size: number;
+  hostTick?: number;
+  hue?: number;
 };
 
 export type NetEnemyState = {
@@ -78,6 +83,7 @@ export type NetWorldSnapshot = {
   wave: number;
   score: number;
   solIntegrity: number;
+  authorityRole?: MultiplayerAuthorityRole;
   ackInputSeqByPlayer: Record<PlayerId, number>;
 };
 
@@ -93,7 +99,11 @@ export type NetWorldEvent = {
     | "projectile-fired"
     | "sphere-awakened"
     | "wave-cleared"
-    | "sol-damaged";
+    | "sol-damaged"
+    | "player-hit"
+    | "projectile-destroyed"
+    | "shrapnel-destroyed"
+    | "host-authority-heartbeat";
   playerId?: PlayerId;
   entityId?: string;
   data?: Record<string, unknown>;
@@ -108,4 +118,32 @@ export function isStaleSnapshot(snapshot: NetWorldSnapshot, lastSnapshotTick: nu
 
 export function isStaleInput(input: NetInputMessage, lastInputSeq: number) {
   return input.seq <= lastInputSeq;
+}
+
+export type PeerLifecycleMessage = {
+  type: "peer-lifecycle";
+  protocolVersion: typeof MULTIPLAYER_PROTOCOL_VERSION;
+  event: "join-request" | "join-accepted" | "join-denied" | "peer-left" | "host-migrated";
+  playerId?: PlayerId;
+  slot?: PlayerSlotIndex;
+  reason?: string;
+  serverTimeMs: number;
+};
+
+export type MultiplayerMessage = ClientToHostMessage | HostToClientMessage | PeerLifecycleMessage;
+
+export function isProtocolObject(value: unknown): value is { type: string; protocolVersion?: number } {
+  return !!value && typeof value === "object" && typeof (value as { type?: unknown }).type === "string";
+}
+
+export function hasExpectedProtocolVersion(value: unknown): value is { protocolVersion: typeof MULTIPLAYER_PROTOCOL_VERSION } {
+  return isProtocolObject(value) && (value as { protocolVersion?: unknown }).protocolVersion === MULTIPLAYER_PROTOCOL_VERSION;
+}
+
+export function isWorldSnapshotMessage(value: unknown): value is NetWorldSnapshot {
+  return hasExpectedProtocolVersion(value) && (value as { type?: unknown }).type === "world-snapshot";
+}
+
+export function isPlayerInputMessage(value: unknown): value is NetInputMessage {
+  return hasExpectedProtocolVersion(value) && (value as { type?: unknown }).type === "player-input";
 }

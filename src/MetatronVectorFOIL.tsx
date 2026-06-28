@@ -13,8 +13,32 @@ import {
   installFlightRecorderErrorCapture,
   setFlightRecorderContext,
 } from "./config/debugFlightRecorder";
-import { createEmptyPlayerRegistry, LOCAL_SOLO_PLAYER_ID, markPlayerDestroyed, markPlayerRespawned } from "./config/playerSlots";
+import {
+  createEmptyPlayerRegistry,
+  LOCAL_SOLO_PLAYER_ID,
+  markPlayerDestroyed,
+  markPlayerRespawned,
+  playerSlotSummary,
+  respawnPendingPlayers,
+  shouldEndRunForPlayerLoss,
+} from "./config/playerSlots";
+import type { PlayerId } from "./config/playerSlots";
 import { MULTIPLAYER_NET_CONFIG } from "./config/multiplayerNetConfig";
+import {
+  ackInputSeqByPlayer,
+  advanceAuthorityTick,
+  createAuthorityClock,
+  createEntityIdCounters,
+  logSnapshotHeartbeat,
+  makeAuthorityEntityId,
+  nextInputSequence,
+  resetAuthorityClock,
+  resetEntityIdCounters,
+  shouldLogSnapshotHeartbeat,
+  shouldPublishSnapshot,
+} from "./config/multiplayerAuthority";
+import { MULTIPLAYER_PROTOCOL_VERSION } from "./config/multiplayerProtocol";
+import type { NetInputMessage, NetWorldSnapshot } from "./config/multiplayerProtocol";
 import { SCORE_THRESHOLDS } from "./config/thresholds";
 import type { CitationCategory, CommendationDefinition } from "./types/scoring";
 import {
@@ -199,9 +223,9 @@ function makePolyhedron(kind: SolidKind, r: number): PolyMesh {
 
 
 // ===================== GAME TYPES =====================
-type Bullet = { pos: V2; prevPos: V2; vel: V2; life: number; mass: number; origin: V2; firedAtMs: number; burstId: number };
+type Bullet = { id: string; ownerId: PlayerId; hostTick: number; pos: V2; prevPos: V2; vel: V2; life: number; mass: number; origin: V2; firedAtMs: number; burstId: number };
 type FuelBit = { pos: V2; vel: V2; life: number; hue: number; };
-type Shard = { pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
+type Shard = { id: string; sourceEnemyId?: string; hostTick: number; pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
 type OortCluster = {
   orbitRadius: number;
   orbitPhase: number;
@@ -1493,6 +1517,10 @@ export default function MetatronVectorFOIL() {
       maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers,
     });
 
+    const authorityClock = createAuthorityClock("solo-authority");
+    const entityIdCounters = createEntityIdCounters();
+    let lastLocalInputSeq = 0;
+
     const bullets: Bullet[] = [];
     const enemies: Enemy[] = [];
     let nextEnemyId = 1;
@@ -1657,6 +1685,9 @@ export default function MetatronVectorFOIL() {
     const resetRun = (toMenu = false) => {
       debugLog("lifecycle", "run-reset", { toMenu, previousMode: modeRef.current, wave: getLevel(levelIdxRef.current).wave });
       bullets.length = 0; enemies.length = 0; shards.length = 0; fuelBits.length = 0; trail.length = 0;
+      resetAuthorityClock(authorityClock, "solo-authority");
+      resetEntityIdCounters(entityIdCounters);
+      lastLocalInputSeq = 0;
       for (const c of oortClusters) {
         c.brokenUntil = 0;
         c.pulseUntil = 0;
@@ -1679,7 +1710,7 @@ export default function MetatronVectorFOIL() {
       player.hitsTaken = 0;
       player.hitInvuln = 0;
       markPlayerRespawned(playerSlots[0]);
-      debugLog("player", "player-respawned", { playerId: playerSlots[0]?.id, slot: playerSlots[0]?.slot, reason: "run-reset" });
+      debugLog("player", "player-respawned", { playerId: playerSlots[0]?.id, slot: playerSlots[0]?.slot, reason: "run-reset", authorityTick: authorityClock.tick });
       gunCD = 0;
       nextEnemyId = 1;
       metaAx = 0; metaAy = 0; metaAz = 0; metaPulseClock = 0;
@@ -1721,6 +1752,39 @@ export default function MetatronVectorFOIL() {
       setMode(nextMode);
     };
     resetToMenuRef.current = () => resetRun(true);
+
+    const respawnPendingPlayersAtWaveBoundary = () => {
+      const pending = respawnPendingPlayers(playerSlots);
+      if (pending.length <= 0) return;
+      const localPlayerId = playerSlots[0]?.id;
+      for (const slot of pending) {
+        markPlayerRespawned(slot);
+        debugLog("player", "player-respawned", {
+          playerId: slot.id,
+          slot: slot.slot,
+          reason: "wave-boundary",
+          authorityTick: authorityClock.tick,
+        });
+      }
+      if (localPlayerId && pending.some((slot) => slot.id === localPlayerId)) {
+        const gm = slidersRef.current.gravity;
+        const v0 = Math.sqrt(gm / metaRadius) * T.ORBIT_GAIN;
+        player.pos = new V2(metaRadius, 0);
+        player.vel = new V2(0, v0);
+        player.angle = Math.atan2(player.vel.y, player.vel.x);
+        player.angularVel = 0;
+        player.thrust = 0;
+        shipBrakeInput = 0;
+        player.brakeAnim = 0;
+        player.thrustGlow = 0;
+        player.inActivatedSphere = false;
+        player.fuel = T.FUEL_MAX;
+        player.stuckTime = 0;
+        player.hitsTaken = 0;
+        player.hitInvuln = T.SHIP_HIT_IFRAME_SEC * 2;
+        trail.length = 0;
+      }
+    };
 
     // helpers
     const gravityAt = (p: V2, gm: number) => {
@@ -1764,14 +1828,29 @@ export default function MetatronVectorFOIL() {
       return out.mul(k * press).add(tang.mul(k * tangAmt));
     };
 
-    const makeBullet = (burstId: number) => {
+    const makeBullet = (burstId: number, ownerId: PlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID) => {
       const muzzle = V2.fromAngle(player.angle, 18);
       const pos = player.pos.copy().add(muzzle);
       const vel = V2.fromAngle(player.angle, T.BULLET_SPEED).add(player.vel.copy());
-      const bullet = { pos, prevPos: pos.copy(), vel, life: T.BULLET_LIFE, mass: T.BULLET_MASS, origin: pos.copy(), firedAtMs: runClockMs, burstId };
-      debugLog("projectile", "projectile-created", {
-        ownerId: playerSlots[0]?.id,
+      const id = makeAuthorityEntityId("projectile", entityIdCounters, authorityClock.tick, ownerId);
+      const bullet = {
+        id,
+        ownerId,
+        hostTick: authorityClock.tick,
+        pos,
+        prevPos: pos.copy(),
+        vel,
+        life: T.BULLET_LIFE,
+        mass: T.BULLET_MASS,
+        origin: pos.copy(),
+        firedAtMs: runClockMs,
         burstId,
+      };
+      debugLog("projectile", "projectile-created", {
+        id,
+        ownerId,
+        burstId,
+        authorityTick: authorityClock.tick,
         x: pos.x,
         y: pos.y,
         vx: vel.x,
@@ -1938,10 +2017,13 @@ export default function MetatronVectorFOIL() {
 
       const kindFactor: Record<SolidKind, number> = { tetra: 0.6, cube: 0.78, octa: 0.88, dodeca: 1.0, icosa: 1.12 };
       const N = Math.max(3, ((rand(T.SHRAPNEL_COUNT_MIN, T.SHRAPNEL_COUNT_MAX + 1) * kindFactor[e.kind]) | 0));
+      const firstShardId = makeAuthorityEntityId("shrapnel", entityIdCounters, authorityClock.tick, e.id);
       debugLog("shrapnel", "shrapnel-spawned", {
         sourceEnemyId: e.id,
         sourceKind: e.kind,
         count: N,
+        firstShardId,
+        authorityTick: authorityClock.tick,
         x: origin.x,
         y: origin.y,
       });
@@ -1951,7 +2033,11 @@ export default function MetatronVectorFOIL() {
         const sp = rand(T.SHRAPNEL_SPEED_MIN, T.SHRAPNEL_SPEED_MAX);
         const v = dj.copy().mul(sp).add(e.vel.copy().mul(T.SHRAPNEL_PARENT_VEL));
         const life0 = rand(T.SHRAPNEL_LIFE_MIN, T.SHRAPNEL_LIFE_MAX);
+        const id = k === 0 ? firstShardId : makeAuthorityEntityId("shrapnel", entityIdCounters, authorityClock.tick, e.id);
         shards.push({
+          id,
+          sourceEnemyId: e.id,
+          hostTick: authorityClock.tick,
           pos: origin.copy().add(dj.copy().mul(rand(0.2, 2.4))),
           vel: v,
           life: life0,
@@ -2025,9 +2111,24 @@ export default function MetatronVectorFOIL() {
         wave: getLevel(levelIdxRef.current).wave,
         hitsTaken: player.hitsTaken,
       });
-      if (reason === "ship") markPlayerDestroyed(playerSlots[0]);
+      if (reason === "ship") {
+        markPlayerDestroyed(playerSlots[0]);
+        debugLog("player", "player-registry-after-destruction", {
+          players: playerSlotSummary(playerSlots),
+          allPlayersDown: shouldEndRunForPlayerLoss(playerSlots),
+          authorityTick: authorityClock.tick,
+        });
+      }
       if (reason === "sol") audioRef.current.solDestroyed();
       else audioRef.current.shipDestroyed();
+      if (reason === "ship" && !shouldEndRunForPlayerLoss(playerSlots)) {
+        debugWarn("player", "local-player-destroyed-world-continues", {
+          playerId: playerSlots[0]?.id,
+          alivePlayers: playerSlots.filter((slot) => slot.connected && slot.lifeState === "alive").length,
+          authorityTick: authorityClock.tick,
+        });
+        return;
+      }
       enterDebrief(causeKey);
     };
 
@@ -2054,6 +2155,9 @@ export default function MetatronVectorFOIL() {
         resilience: T.SHIP_RESILIENCE,
         x: player.pos.x,
         y: player.pos.y,
+        sourceX: sourcePos?.x,
+        sourceY: sourcePos?.y,
+        authorityTick: authorityClock.tick,
       });
       chainMultiplier = Math.max(1, chainMultiplier - SCORE_THRESHOLDS.chainDamagePenalty);
 
@@ -2305,6 +2409,12 @@ export default function MetatronVectorFOIL() {
           const tang = s.pos.copy().norm().rot(Math.PI / 2);
           const vel = tang.mul(rand(35, 85)); // gentle drift around the ring
           fuelBits.push({ pos: s.pos.copy(), vel, life: rand(9, 18), hue: s.hue });
+          debugLog("shrapnel", "shrapnel-destroyed", {
+            id: s.id,
+            sourceEnemyId: s.sourceEnemyId,
+            reason: "settled-to-fuel",
+            authorityTick: authorityClock.tick,
+          }, "debug");
           shards.splice(i, 1);
         }
       }
@@ -2489,12 +2599,94 @@ export default function MetatronVectorFOIL() {
 
           if (cleared) {
             breakOortCluster(c, timeSec);
+            debugLog("projectile", "projectile-destroyed", {
+              id: b.id,
+              ownerId: b.ownerId,
+              reason: "oort-impact",
+              authorityTick: authorityClock.tick,
+            }, "debug");
             resolveBurst(b.burstId, false);
             bullets.splice(bi, 1);
             break;
           }
         }
       }
+    };
+
+    const buildAuthoritySnapshot = (): NetWorldSnapshot => {
+      const localSlot = playerSlots[0];
+      const players = playerSlots.map((slot) => ({
+        id: slot.id,
+        slot: slot.slot,
+        callsign: slot.callsign ?? null,
+        alive: slot.lifeState === "alive",
+        respawnPending: slot.lifeState === "respawn-pending",
+        x: slot.id === localSlot?.id ? player.pos.x : 0,
+        y: slot.id === localSlot?.id ? player.pos.y : 0,
+        vx: slot.id === localSlot?.id ? player.vel.x : 0,
+        vy: slot.id === localSlot?.id ? player.vel.y : 0,
+        angle: slot.id === localSlot?.id ? player.angle : 0,
+        angularVelocity: slot.id === localSlot?.id ? player.angularVel : 0,
+        fuel: slot.id === localSlot?.id ? player.fuel : 0,
+        hitsTaken: slot.id === localSlot?.id ? player.hitsTaken : 0,
+        lastInputSeq: slot.lastInputSeq,
+      }));
+
+      return {
+        type: "world-snapshot",
+        protocolVersion: MULTIPLAYER_PROTOCOL_VERSION,
+        authorityRole: authorityClock.mode === "solo-authority" ? "solo" : authorityClock.mode === "host" ? "host" : "guest",
+        tick: authorityClock.tick,
+        serverTimeMs: Date.now(),
+        players,
+        enemies: enemies.map((e) => ({
+          id: e.id,
+          kind: e.kind,
+          x: e.pos.x,
+          y: e.pos.y,
+          vx: e.vel.x,
+          vy: e.vel.y,
+          morphing: e.morphing,
+          nextKind: e.nextKind,
+        })),
+        projectiles: bullets.map((b) => ({
+          id: b.id,
+          ownerId: b.ownerId,
+          hostTick: b.hostTick,
+          x: b.pos.x,
+          y: b.pos.y,
+          vx: b.vel.x,
+          vy: b.vel.y,
+          ageMs: Math.max(0, runClockMs - b.firedAtMs),
+          kind: "blaster",
+        })),
+        shrapnel: shards.map((s) => ({
+          id: s.id,
+          sourceEnemyId: s.sourceEnemyId,
+          hostTick: s.hostTick,
+          x: s.pos.x,
+          y: s.pos.y,
+          vx: s.vel.x,
+          vy: s.vel.y,
+          lifeMs: Math.max(0, s.life * 1000),
+          size: s.size,
+          hue: s.hue,
+        })),
+        wave: getLevel(levelIdxRef.current).wave,
+        score: Math.round(score),
+        solIntegrity: 1,
+        ackInputSeqByPlayer: ackInputSeqByPlayer(authorityClock),
+      };
+    };
+
+    const publishAuthoritySnapshotIfDue = (dt: number) => {
+      const shouldPublish = shouldPublishSnapshot(authorityClock, dt, MULTIPLAYER_NET_CONFIG.snapshotHz);
+      const shouldHeartbeat = shouldLogSnapshotHeartbeat(authorityClock, dt);
+      if (!shouldPublish && !shouldHeartbeat) return;
+      const snapshot = buildAuthoritySnapshot();
+      if (shouldHeartbeat) logSnapshotHeartbeat(snapshot, authorityClock.mode);
+      // Sprint leg 2 keeps this as a local authority snapshot until the WebRTC fanout layer is present.
+      // The actual host transport can broadcast this exact payload to every guest.
     };
 
     // =============== fixed timestep loop ===============
@@ -2584,6 +2776,8 @@ export default function MetatronVectorFOIL() {
         return;
       }
 
+      advanceAuthorityTick(authorityClock);
+
       for (const node of metaNodes) {
         if (node.awakened) {
           node.charge = T.META_NODE_MAX_CHARGE_SEC;
@@ -2616,6 +2810,34 @@ export default function MetatronVectorFOIL() {
       const keyboardBrakeInput = (keys.has("s") || keys.has("S") || keys.has("ArrowDown")) ? 1 : 0;
       const thrustIntent = Math.max(keyboardThrustInput, gamepadInput.thrust);
       const brakeIntent = Math.max(keyboardBrakeInput, gamepadInput.brake);
+      const fireHeld = keys.has(" ") || keys.has("Space") || gamepadInput.fire;
+      const localPlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
+      lastLocalInputSeq = nextInputSequence(authorityClock, localPlayerId);
+      if (playerSlots[0]) playerSlots[0].lastInputSeq = lastLocalInputSeq;
+      authorityClock.lastInputSeqByPlayer[localPlayerId] = lastLocalInputSeq;
+      const localInputMessage: NetInputMessage = {
+        type: "player-input",
+        protocolVersion: MULTIPLAYER_PROTOCOL_VERSION,
+        playerId: localPlayerId,
+        seq: lastLocalInputSeq,
+        clientTimeMs: Date.now(),
+        rotate: turnInput,
+        thrust: thrustIntent,
+        brake: brakeIntent,
+        fireHeld,
+        firePressed: gamepadInput.firePressed,
+      };
+      if (lastLocalInputSeq % MULTIPLAYER_NET_CONFIG.hostSimulationHz === 0 && (Math.abs(turnInput) > 0.01 || thrustIntent > 0.01 || brakeIntent > 0.01 || fireHeld)) {
+        debugLog("input", "local-input-heartbeat", {
+          playerId: localInputMessage.playerId,
+          seq: localInputMessage.seq,
+          rotate: localInputMessage.rotate,
+          thrust: localInputMessage.thrust,
+          brake: localInputMessage.brake,
+          fireHeld: localInputMessage.fireHeld,
+          authorityTick: authorityClock.tick,
+        }, "debug");
+      }
       player.thrust = lerp(player.thrust, thrustIntent, thrustIntent > 0 ? 0.16 : 0.10);
       shipBrakeInput = lerp(shipBrakeInput, brakeIntent, brakeIntent > 0 ? 0.18 : 0.12);
 
@@ -2745,7 +2967,7 @@ export default function MetatronVectorFOIL() {
 
       // ---- gun ----
       gunCD -= dt;
-      if ((keys.has(" ") || keys.has("Space") || gamepadInput.fire) && gunCD <= 0) {
+      if (fireHeld && gunCD <= 0) {
         const burstId = beginShotBurstIfNeeded();
         const stats = burstStats.get(burstId);
         if (stats) {
@@ -2768,6 +2990,12 @@ export default function MetatronVectorFOIL() {
         b.pos.add(b.vel.copy().mul(dt));
         b.life -= dt;
         if (b.life <= 0 || Math.abs(b.pos.x) > oortOuter * 3 || Math.abs(b.pos.y) > oortOuter * 3) {
+          debugLog("projectile", "projectile-destroyed", {
+            id: b.id,
+            ownerId: b.ownerId,
+            reason: b.life <= 0 ? "expired" : "out-of-bounds",
+            authorityTick: authorityClock.tick,
+          }, "debug");
           resolveBurst(b.burstId, false);
           bullets.splice(i, 1);
         }
@@ -2879,13 +3107,36 @@ export default function MetatronVectorFOIL() {
           const outward = e.pos.copy();
           applyEnemyImpulse(e, outward, T.ENEMY_HIT_DEFLECT_IMPULSE, T.ENEMY_HIT_DEFLECT_TANGENTIAL);
           audioRef.current.hit();
+          debugLog("projectile", "projectile-hit", {
+            id: b.id,
+            ownerId: b.ownerId,
+            targetEnemyId: e.id,
+            targetKind: e.kind,
+            impactX: impact.point.x,
+            impactY: impact.point.y,
+            authorityTick: authorityClock.tick,
+          });
           b.life = -1;
           resolveBurst(b.burstId, true);
-          if (!downgradeEnemy(e)) enemies.splice(ei, 1);
+          const downgraded = downgradeEnemy(e);
+          if (!downgraded) {
+            debugLog("enemy", "enemy-destroyed", { enemyId: e.id, kind: e.kind, authorityTick: authorityClock.tick });
+            enemies.splice(ei, 1);
+          } else {
+            debugLog("enemy", "enemy-morphed", { enemyId: e.id, fromKind: e.kind, toKind: e.nextKind, authorityTick: authorityClock.tick });
+          }
           hit = true;
           break;
         }
-        if (hit || b.life <= 0) bullets.splice(bi, 1);
+        if (hit || b.life <= 0) {
+          debugLog("projectile", "projectile-destroyed", {
+            id: b.id,
+            ownerId: b.ownerId,
+            reason: hit ? "enemy-hit" : "spent",
+            authorityTick: authorityClock.tick,
+          }, "debug");
+          bullets.splice(bi, 1);
+        }
       }
 
       // shrapnel update
@@ -2902,6 +3153,12 @@ export default function MetatronVectorFOIL() {
 
         if (s.pos.copy().sub(player.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD) {
           if (applyShipHit(s.pos.copy(), "shrapnel")) return;
+          debugLog("shrapnel", "shrapnel-destroyed", {
+            id: s.id,
+            sourceEnemyId: s.sourceEnemyId,
+            reason: "player-hit",
+            authorityTick: authorityClock.tick,
+          }, "debug");
           shards.splice(i, 1);
           continue;
         }
@@ -2919,13 +3176,28 @@ export default function MetatronVectorFOIL() {
             ? awayFromShard.norm().add(awayFromSol.len() > 0.0001 ? awayFromSol.norm().mul(T.SHARD_ENEMY_SOL_BIAS) : new V2()).norm()
             : awayFromSol;
           applyEnemyImpulse(e, impulseDir, T.SHARD_ENEMY_KNOCKBACK);
+          debugLog("shrapnel", "shrapnel-destroyed", {
+            id: s.id,
+            sourceEnemyId: s.sourceEnemyId,
+            reason: "enemy-deflection",
+            targetEnemyId: e.id,
+            authorityTick: authorityClock.tick,
+          }, "debug");
           shards.splice(i, 1);
           shardConsumed = true;
           break;
         }
         if (shardConsumed) continue;
 
-        if (s.life <= 0 || s.pos.len() > oortOuter * 2.4) shards.splice(i, 1);
+        if (s.life <= 0 || s.pos.len() > oortOuter * 2.4) {
+          debugLog("shrapnel", "shrapnel-destroyed", {
+            id: s.id,
+            sourceEnemyId: s.sourceEnemyId,
+            reason: s.life <= 0 ? "expired" : "out-of-bounds",
+            authorityTick: authorityClock.tick,
+          }, "debug");
+          shards.splice(i, 1);
+        }
       }
 
       // fuel bits update
@@ -2983,9 +3255,12 @@ export default function MetatronVectorFOIL() {
           perfect: waveDamageTaken <= 0,
           awakenedNodes: getAwakenedMetaNodeCount(),
         });
+        respawnPendingPlayersAtWaveBoundary();
         audioRef.current.levelUp();
         queueWaveBanner(levelIdxRef.current + 1);
       }
+
+      publishAuthoritySnapshotIfDue(dt);
 
       // camera (center stays on star; zoom guarantees ship in view)
       updateCamera(camera, canvas, dpr, player.pos, player.vel, horizonR);

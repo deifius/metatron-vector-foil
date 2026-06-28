@@ -70,6 +70,29 @@ export function alivePlayers(players: MetatronPlayerSlot[]) {
   return connectedPlayers(players).filter((player) => player.lifeState === "alive");
 }
 
+export function playerSlotSummary(players: MetatronPlayerSlot[]) {
+  return players.map((player) => ({
+    id: player.id,
+    slot: player.slot,
+    role: player.role,
+    lifeState: player.lifeState,
+    connected: player.connected,
+    lastInputSeq: player.lastInputSeq,
+  }));
+}
+
+export function isPlayerAlive(player: MetatronPlayerSlot | undefined | null) {
+  return !!player && player.connected && player.lifeState === "alive";
+}
+
+export function isPlayerRespawnPending(player: MetatronPlayerSlot | undefined | null) {
+  return !!player && player.connected && player.lifeState === "respawn-pending";
+}
+
+export function respawnPendingPlayers(players: MetatronPlayerSlot[]) {
+  return connectedPlayers(players).filter((player) => player.lifeState === "respawn-pending");
+}
+
 export function shouldEndRunForPlayerLoss(players: MetatronPlayerSlot[]) {
   const connected = connectedPlayers(players);
   return connected.length > 0 && alivePlayers(connected).length === 0;
