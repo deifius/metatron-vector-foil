@@ -6,8 +6,10 @@ import {
   type ClientToHostMessage,
   type HostToClientMessage,
   type MultiplayerMessage,
+  type PeerLifecycleMessage,
 } from "./multiplayerProtocol";
-import type { MultiplayerRole, PlayerId } from "./playerSlots";
+import type { MultiplayerRole, PlayerId, PlayerSlotIndex } from "./playerSlots";
+import { normalizePlayerSlotIndex } from "./playerSlots";
 
 export type TransportRole = MultiplayerRole;
 
@@ -35,6 +37,8 @@ export type TransportLaunchConfig = {
   roomId: string;
   localPlayerId: PlayerId;
   enableBroadcastChannel: boolean;
+  requestedSlot: PlayerSlotIndex | null;
+  showRoster: boolean;
 };
 
 export type TransportPeerSummary = {
@@ -65,6 +69,8 @@ const URL_ROLE_PARAM = "mvfRole";
 const URL_ROOM_PARAM = "mvfRoom";
 const URL_PLAYER_PARAM = "mvfPlayerId";
 const URL_BROADCAST_PARAM = "mvfBroadcast";
+const URL_SLOT_PARAM = "mvfSlot";
+const URL_ROSTER_PARAM = "mvfRoster";
 
 function nowMs() {
   return Date.now();
@@ -87,16 +93,24 @@ function parseRole(raw: string | null): TransportRole {
 
 export function detectMultiplayerTransportLaunch(): TransportLaunchConfig {
   if (typeof window === "undefined") {
-    return { role: "solo", roomId: "local", localPlayerId: "solo-0", enableBroadcastChannel: false };
+    return { role: "solo", roomId: "local", localPlayerId: "solo-0", enableBroadcastChannel: false, requestedSlot: null, showRoster: false };
   }
   const params = new URLSearchParams(window.location.search);
   const role = parseRole(params.get(URL_ROLE_PARAM));
   const roomId = sanitizeId(params.get(URL_ROOM_PARAM), "local");
-  const defaultPlayerId = role === "host" ? "host-0" : role === "guest" ? `guest-${randomSuffix()}` : "solo-0";
+  const requestedSlotRaw = normalizePlayerSlotIndex(params.get(URL_SLOT_PARAM));
+  const requestedSlot = role === "host" ? 0 : role === "guest" && requestedSlotRaw !== null ? requestedSlotRaw : null;
+  const defaultPlayerId = role === "host"
+    ? "host-0"
+    : role === "guest"
+      ? (requestedSlot !== null ? `guest-${requestedSlot}` : `guest-${randomSuffix()}`)
+      : "solo-0";
   const localPlayerId = sanitizeId(params.get(URL_PLAYER_PARAM), defaultPlayerId);
   const broadcastParam = params.get(URL_BROADCAST_PARAM);
   const enableBroadcastChannel = role !== "solo" && broadcastParam !== "0" && typeof BroadcastChannel !== "undefined";
-  return { role, roomId, localPlayerId, enableBroadcastChannel };
+  const rosterParam = params.get(URL_ROSTER_PARAM);
+  const showRoster = role !== "solo" || rosterParam === "1" || rosterParam === "true";
+  return { role, roomId, localPlayerId, enableBroadcastChannel, requestedSlot, showRoster };
 }
 
 export class MultiplayerTransportHub {
@@ -104,6 +118,8 @@ export class MultiplayerTransportHub {
   private role: TransportRole;
   private localPlayerId: PlayerId;
   private roomId: string;
+  private requestedSlot: PlayerSlotIndex | null;
+  private showRoster: boolean;
   private broadcastChannel: BroadcastChannel | null = null;
   private peers = new Map<PlayerId, PeerChannel>();
   private inbound: InboundTransportMessage[] = [];
@@ -113,12 +129,16 @@ export class MultiplayerTransportHub {
     this.role = config.role;
     this.localPlayerId = config.localPlayerId;
     this.roomId = config.roomId;
+    this.requestedSlot = config.requestedSlot;
+    this.showRoster = config.showRoster;
     if (config.enableBroadcastChannel) this.openBroadcastChannel();
     this.installGlobalBridge();
     debugLog("network", "transport-initialized", {
       role: this.role,
       localPlayerId: this.localPlayerId,
       roomId: this.roomId,
+      requestedSlot: this.requestedSlot,
+      showRoster: this.showRoster,
       broadcastChannel: Boolean(this.broadcastChannel),
       instanceId: this.instanceId,
     });
@@ -143,6 +163,8 @@ export class MultiplayerTransportHub {
   getRole() { return this.role; }
   getLocalPlayerId() { return this.localPlayerId; }
   getRoomId() { return this.roomId; }
+  getRequestedSlot() { return this.requestedSlot; }
+  shouldShowRoster() { return this.showRoster; }
 
   setRole(role: TransportRole) {
     if (this.role === role) return;
@@ -194,6 +216,21 @@ export class MultiplayerTransportHub {
     return this.sendEnvelope("host", message);
   }
 
+  sendLifecycleToHost(message: PeerLifecycleMessage) {
+    if (this.role === "host" || this.role === "solo") return 0;
+    return this.sendEnvelope("host", message);
+  }
+
+  sendLifecycleToPeer(playerId: PlayerId, message: PeerLifecycleMessage) {
+    if (this.role !== "host") return 0;
+    return this.sendEnvelope(playerId, message);
+  }
+
+  broadcastLifecycleFromHost(message: PeerLifecycleMessage) {
+    if (this.role !== "host") return 0;
+    return this.sendEnvelope("all", message);
+  }
+
   broadcastFromHost(message: HostToClientMessage) {
     if (this.role !== "host") return 0;
     return this.sendEnvelope("all", message);
@@ -211,6 +248,8 @@ export class MultiplayerTransportHub {
       roomId: this.roomId,
       instanceId: this.instanceId,
       peers: this.getPeers(),
+      requestedSlot: this.requestedSlot,
+      showRoster: this.showRoster,
       broadcastChannel: Boolean(this.broadcastChannel),
       queuedInbound: this.inbound.length,
       stats: { ...this.stats },

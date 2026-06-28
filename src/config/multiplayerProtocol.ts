@@ -132,9 +132,10 @@ export function isStaleInput(input: NetInputMessage, lastInputSeq: number) {
 export type PeerLifecycleMessage = {
   type: "peer-lifecycle";
   protocolVersion: typeof MULTIPLAYER_PROTOCOL_VERSION;
-  event: "join-request" | "join-accepted" | "join-denied" | "peer-left" | "host-migrated";
+  event: "join-request" | "join-accepted" | "join-denied" | "peer-left" | "host-migrated" | "roster-sync";
   playerId?: PlayerId;
   slot?: PlayerSlotIndex;
+  callsign?: string | null;
   reason?: string;
   serverTimeMs: number;
 };
@@ -155,4 +156,8 @@ export function isWorldSnapshotMessage(value: unknown): value is NetWorldSnapsho
 
 export function isPlayerInputMessage(value: unknown): value is NetInputMessage {
   return hasExpectedProtocolVersion(value) && (value as { type?: unknown }).type === "player-input";
+}
+
+export function isPeerLifecycleMessage(value: unknown): value is PeerLifecycleMessage {
+  return hasExpectedProtocolVersion(value) && (value as { type?: unknown }).type === "peer-lifecycle";
 }

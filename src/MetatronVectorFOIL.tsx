@@ -15,6 +15,7 @@ import {
 } from "./config/debugFlightRecorder";
 import {
   assignNextPlayerSlot,
+  assignPlayerSlot,
   createPlayerRegistryWithLocal,
   LOCAL_SOLO_PLAYER_ID,
   markPlayerDestroyed,
@@ -23,7 +24,7 @@ import {
   respawnPendingPlayers,
   shouldEndRunForPlayerLoss,
 } from "./config/playerSlots";
-import type { PlayerId } from "./config/playerSlots";
+import type { MultiplayerRole, PlayerId, PlayerLifeState, PlayerSlotIndex } from "./config/playerSlots";
 import { MULTIPLAYER_NET_CONFIG } from "./config/multiplayerNetConfig";
 import {
   acceptInputSequence,
@@ -40,8 +41,8 @@ import {
   shouldLogSnapshotHeartbeat,
   shouldPublishSnapshot,
 } from "./config/multiplayerAuthority";
-import { MULTIPLAYER_PROTOCOL_VERSION, isPlayerInputMessage, isWorldSnapshotMessage } from "./config/multiplayerProtocol";
-import type { NetInputMessage, NetWorldSnapshot } from "./config/multiplayerProtocol";
+import { MULTIPLAYER_PROTOCOL_VERSION, isPeerLifecycleMessage, isPlayerInputMessage, isWorldSnapshotMessage } from "./config/multiplayerProtocol";
+import type { NetInputMessage, NetWorldSnapshot, PeerLifecycleMessage } from "./config/multiplayerProtocol";
 import { createMultiplayerTransport, detectMultiplayerTransportLaunch } from "./config/multiplayerTransport";
 import type { InboundTransportMessage, MultiplayerTransportHub } from "./config/multiplayerTransport";
 import { SCORE_THRESHOLDS } from "./config/thresholds";
@@ -1523,6 +1524,7 @@ export default function MetatronVectorFOIL() {
       transportLaunch.localPlayerId,
       transportLaunch.role,
       playerIdentityRef.current.callsign,
+      transportLaunch.requestedSlot,
     );
     const authorityMode = transportLaunch.role === "host"
       ? "host"
@@ -2248,6 +2250,34 @@ export default function MetatronVectorFOIL() {
     let topCitationTier = 0;
     let topCitationScore = 0;
     let waveFlags: WaveCitationFlags = { oortReach: false, farOortReach: false, returnToTheBurn: false, periapsisKiss: false };
+    let lastJoinRequestSentMs = -Infinity;
+    let localJoinAccepted = transportLaunch.role !== "guest";
+
+    const makePeerLifecycleMessage = (event: PeerLifecycleMessage["event"], playerId: PlayerId, slot = playerSlots[0]?.slot, reason?: string): PeerLifecycleMessage => ({
+      type: "peer-lifecycle",
+      protocolVersion: MULTIPLAYER_PROTOCOL_VERSION,
+      event,
+      playerId,
+      slot,
+      callsign: playerIdentityRef.current.callsign ?? null,
+      reason,
+      serverTimeMs: Date.now(),
+    });
+
+    const sendGuestJoinRequest = (force = false) => {
+      if (transportLaunch.role !== "guest") return;
+      if (!force && runClockMs - lastJoinRequestSentMs < 1000) return;
+      lastJoinRequestSentMs = runClockMs;
+      const localId = playerSlots[0]?.id ?? transportLaunch.localPlayerId;
+      const message = makePeerLifecycleMessage("join-request", localId, transportLaunch.requestedSlot ?? playerSlots[0]?.slot);
+      const sent = transport.sendLifecycleToHost(message);
+      debugLog("network", "join-request-sent", {
+        playerId: localId,
+        requestedSlot: message.slot,
+        sent,
+        roomId: transportLaunch.roomId,
+      }, "debug");
+    };
 
     const resetWaveFlags = () => {
       waveFlags = { oortReach: false, farOortReach: false, returnToTheBurn: false, periapsisKiss: false };
@@ -2259,6 +2289,7 @@ export default function MetatronVectorFOIL() {
 
     // initial setup lands on the title / insert coin screen
     resetRun(true);
+    sendGuestJoinRequest(true);
     syncMetaNodeWorldPositions();
 
     const getCommendation = (id: string) => commendationMapRef.current[id] ?? DEFAULT_COMMENDATIONS.find((item) => item.id === id);
@@ -2711,15 +2742,22 @@ export default function MetatronVectorFOIL() {
       };
     };
 
-    const ensureRemoteSlot = (playerId: PlayerId, callsign?: string | null) => {
+    const ensureRemoteSlot = (playerId: PlayerId, callsign?: string | null, preferredSlot?: number | null) => {
       let slot = playerSlots.find((candidate) => candidate.id === playerId) ?? null;
-      if (slot) return slot;
-      slot = assignNextPlayerSlot(playerSlots, playerId, "guest", callsign);
+      if (slot) {
+        slot.connected = true;
+        if (callsign !== undefined) slot.callsign = callsign;
+        return slot;
+      }
+      const safePreferredSlot = preferredSlot === 0 || preferredSlot === 1 || preferredSlot === 2 || preferredSlot === 3
+        ? preferredSlot
+        : null;
+      slot = assignPlayerSlot(playerSlots, playerId, "guest", callsign, safePreferredSlot);
       if (!slot) {
-        debugWarn("network", "join-denied-no-slot", { playerId, maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers });
+        debugWarn("network", "join-denied-no-slot", { playerId, preferredSlot, maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers });
         return null;
       }
-      debugLog("network", "remote-player-slot-assigned", { playerId, slot: slot.slot, players: playerSlotSummary(playerSlots) });
+      debugLog("network", "remote-player-slot-assigned", { playerId, slot: slot.slot, preferredSlot, players: playerSlotSummary(playerSlots) });
       return slot;
     };
 
@@ -2771,6 +2809,7 @@ export default function MetatronVectorFOIL() {
       const localPlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
       const localNetPlayer = snapshot.players.find((candidate) => candidate.id === localPlayerId);
       if (localNetPlayer) {
+        localJoinAccepted = true;
         const before = player.pos.copy();
         player.pos = new V2(localNetPlayer.x, localNetPlayer.y);
         player.vel = new V2(localNetPlayer.vx, localNetPlayer.vy);
@@ -2791,6 +2830,8 @@ export default function MetatronVectorFOIL() {
       for (const netPlayer of snapshot.players) {
         const existing = playerSlots.find((slot) => slot.id === netPlayer.id) ?? assignNextPlayerSlot(playerSlots, netPlayer.id, netPlayer.id === localPlayerId ? transportLaunch.role : "guest", netPlayer.callsign ?? null);
         if (existing) {
+          existing.slot = netPlayer.slot;
+          existing.connected = true;
           existing.lifeState = netPlayer.alive ? "alive" : netPlayer.respawnPending ? "respawn-pending" : "dead";
           existing.lastInputSeq = netPlayer.lastInputSeq;
           existing.callsign = netPlayer.callsign ?? existing.callsign;
@@ -2896,11 +2937,74 @@ export default function MetatronVectorFOIL() {
       }, "debug");
     };
 
+    const handlePeerLifecycleMessage = (message: PeerLifecycleMessage, inbound: InboundTransportMessage) => {
+      const messagePlayerId = message.playerId ?? inbound.fromPlayerId;
+      if (!messagePlayerId) return;
+
+      if (authorityClock.mode === "host") {
+        if (message.event === "join-request") {
+          const slot = ensureRemoteSlot(messagePlayerId, message.callsign ?? null, message.slot ?? null);
+          if (!slot) {
+            transport.sendLifecycleToPeer(messagePlayerId, makePeerLifecycleMessage("join-denied", messagePlayerId, undefined, "room-full"));
+            return;
+          }
+          const accepted = makePeerLifecycleMessage("join-accepted", messagePlayerId, slot.slot);
+          const sent = transport.sendLifecycleToPeer(messagePlayerId, accepted);
+          debugLog("network", "join-accepted", {
+            playerId: messagePlayerId,
+            slot: slot.slot,
+            requestedSlot: message.slot,
+            sent,
+            via: inbound.via,
+            players: playerSlotSummary(playerSlots),
+          });
+          return;
+        }
+        if (message.event === "peer-left") {
+          const slot = playerSlots.find((candidate) => candidate.id === messagePlayerId);
+          if (slot) {
+            slot.connected = false;
+            slot.lifeState = "disconnected";
+            debugWarn("network", "peer-left", { playerId: messagePlayerId, slot: slot.slot, via: inbound.via });
+          }
+          return;
+        }
+      }
+
+      if (authorityClock.mode === "client-mirror") {
+        const localId = playerSlots[0]?.id ?? transportLaunch.localPlayerId;
+        if (messagePlayerId !== localId) return;
+        if (message.event === "join-accepted") {
+          localJoinAccepted = true;
+          if (playerSlots[0] && message.slot !== undefined) playerSlots[0].slot = message.slot;
+          debugLog("network", "join-accepted-received", {
+            playerId: localId,
+            slot: message.slot,
+            via: inbound.via,
+            roomId: transportLaunch.roomId,
+          });
+          return;
+        }
+        if (message.event === "join-denied") {
+          debugWarn("network", "join-denied-received", {
+            playerId: localId,
+            reason: message.reason,
+            via: inbound.via,
+            roomId: transportLaunch.roomId,
+          });
+        }
+      }
+    };
+
     const handleInboundTransportMessages = () => {
       const inbound = transport.drainInboundMessages();
       if (inbound.length <= 0) return;
       for (const item of inbound) {
         const message = item.message;
+        if (isPeerLifecycleMessage(message)) {
+          handlePeerLifecycleMessage(message, item);
+          continue;
+        }
         if (isPlayerInputMessage(message)) {
           if (authorityClock.mode !== "host") continue;
           const slot = ensureRemoteSlot(message.playerId);
@@ -2965,6 +3069,7 @@ export default function MetatronVectorFOIL() {
       runClockMs += dt * 1000;
       scoreIdleMs += dt * 1000;
       handleInboundTransportMessages();
+      if (!localJoinAccepted) sendGuestJoinRequest(false);
       for (const id of Object.keys(remoteGunCooldowns)) {
         remoteGunCooldowns[id] = Math.max(0, remoteGunCooldowns[id] - dt);
       }
@@ -3645,6 +3750,31 @@ export default function MetatronVectorFOIL() {
         acc -= T.FIXED_DT;
       }
 
+      const localPlayerIdForRender = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
+      const transportStateForRender = transport.getState();
+      const renderPlayers: RenderMultiplayerPlayer[] = playerSlots.map((slot) => {
+        const mirror = remotePlayerMirrors[slot.id];
+        const isLocal = slot.id === localPlayerIdForRender;
+        return {
+          id: slot.id,
+          slot: slot.slot,
+          role: slot.role,
+          callsign: slot.callsign ?? null,
+          lifeState: slot.lifeState,
+          connected: slot.connected,
+          isLocal,
+          x: isLocal ? player.pos.x : (mirror?.x ?? 0),
+          y: isLocal ? player.pos.y : (mirror?.y ?? 0),
+          vx: isLocal ? player.vel.x : (mirror?.vx ?? 0),
+          vy: isLocal ? player.vel.y : (mirror?.vy ?? 0),
+          angle: isLocal ? player.angle : (mirror?.angle ?? 0),
+          angularVelocity: isLocal ? player.angularVel : (mirror?.angularVelocity ?? 0),
+          fuel: isLocal ? player.fuel : (mirror?.fuel ?? T.FUEL_MAX),
+          hitsTaken: isLocal ? player.hitsTaken : (mirror?.hitsTaken ?? 0),
+          lastInputSeq: slot.lastInputSeq,
+        };
+      });
+
       render(ctx, canvas, dpr, {
         mode: modeRef.current,
         level: getLevel(levelIdxRef.current),
@@ -3656,6 +3786,17 @@ export default function MetatronVectorFOIL() {
         horizonR, oortInner, oortOuter,
         waveBannerTimer,
         waveBannerText,
+        multiplayer: {
+          role: transportLaunch.role,
+          roomId: transportLaunch.roomId,
+          localPlayerId: localPlayerIdForRender,
+          showRoster: transportLaunch.showRoster,
+          transportPeers: transportStateForRender.peers.length,
+          queuedInbound: transportStateForRender.queuedInbound,
+          sent: transportStateForRender.stats.sent,
+          received: transportStateForRender.stats.received,
+          players: renderPlayers,
+        },
         debrief: {
           phase: debriefPhase,
           phaseElapsedMs: debriefPhaseElapsedMs,
@@ -4639,6 +4780,37 @@ const btnStyle: React.CSSProperties = {
   cursor: "pointer",
 };
 
+type RenderMultiplayerPlayer = {
+  id: PlayerId;
+  slot: PlayerSlotIndex;
+  role: MultiplayerRole;
+  callsign?: string | null;
+  lifeState: PlayerLifeState;
+  connected: boolean;
+  isLocal: boolean;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  angle: number;
+  angularVelocity: number;
+  fuel: number;
+  hitsTaken: number;
+  lastInputSeq: number;
+};
+
+type RenderMultiplayerState = {
+  role: MultiplayerRole;
+  roomId: string;
+  localPlayerId: PlayerId;
+  showRoster: boolean;
+  transportPeers: number;
+  queuedInbound: number;
+  sent: number;
+  received: number;
+  players: RenderMultiplayerPlayer[];
+};
+
 // ===================== RENDERING + CAMERA =====================
 function render(
   ctx: CanvasRenderingContext2D,
@@ -4658,6 +4830,7 @@ function render(
     oortOuter: number;
     waveBannerTimer: number;
     waveBannerText: string;
+    multiplayer: RenderMultiplayerState;
     debrief: { phase: DebriefPhase; phaseElapsedMs: number; snapshot: DebriefSnapshot | null };
   }
 ) {
@@ -4984,6 +5157,16 @@ function render(
     ctx.restore();
   }
 
+  // remote player ships
+  ctx.save();
+  ctx.globalAlpha = worldAlpha;
+  for (const remote of S.multiplayer.players) {
+    if (remote.isLocal) continue;
+    if (!remote.connected || remote.lifeState === "disconnected") continue;
+    drawRemotePlayerShip(ctx, S.camera.zoom, remote);
+  }
+  ctx.restore();
+
   // ship
   ctx.save();
   ctx.globalAlpha = worldAlpha;
@@ -5016,7 +5199,80 @@ function render(
   }
   ctx.restore();
 
+  drawMultiplayerRosterOverlay(ctx, dpr, w, h, S.multiplayer);
+}
 
+function remotePlayerHue(slot: PlayerSlotIndex) {
+  return [165, 205, 285, 38][slot] ?? 165;
+}
+
+function drawRemotePlayerShip(ctx: CanvasRenderingContext2D, cameraZoom: number, remote: RenderMultiplayerPlayer) {
+  const hue = remotePlayerHue(remote.slot);
+  const alpha = remote.lifeState === "alive" ? 0.84 : 0.28;
+  ctx.save();
+  ctx.translate(remote.x, remote.y);
+  ctx.rotate(remote.angle);
+  ctx.lineWidth = 1.8 / cameraZoom;
+  ctx.strokeStyle = `hsla(${hue},92%,74%,${alpha})`;
+  ctx.beginPath();
+  ctx.moveTo(12, 0);
+  ctx.lineTo(-9, -7);
+  ctx.lineTo(-4, 0);
+  ctx.lineTo(-9, 7);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.strokeStyle = `hsla(${hue},95%,78%,${alpha * 0.35})`;
+  ctx.lineWidth = 0.9 / cameraZoom;
+  ctx.beginPath();
+  ctx.arc(0, 0, 18 / cameraZoom, 0, TAU);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `${Math.max(8, 10 / cameraZoom)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  ctx.fillStyle = `hsla(${hue},95%,78%,${alpha})`;
+  ctx.textAlign = "center";
+  ctx.fillText(`P${remote.slot + 1}`, remote.x, remote.y - 20 / cameraZoom);
+  ctx.restore();
+}
+
+function drawMultiplayerRosterOverlay(ctx: CanvasRenderingContext2D, dpr: number, w: number, h: number, multiplayer: RenderMultiplayerState) {
+  if (!multiplayer.showRoster) return;
+  const rows = multiplayer.players.slice().sort((a, b) => a.slot - b.slot);
+  const x = Math.max(18, w - 330);
+  const y = 18;
+  const rowH = 17;
+  const boxH = 58 + rows.length * rowH;
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "rgba(3,8,14,0.58)";
+  ctx.strokeStyle = "rgba(130,220,255,0.20)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(x, y, 312, boxH, 14);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.fillStyle = "rgba(210,240,255,0.88)";
+  ctx.fillText(`MULTIPLAYER TEST // ${multiplayer.role.toUpperCase()} // ROOM ${multiplayer.roomId}`, x + 14, y + 20);
+  ctx.fillStyle = "rgba(145,205,230,0.68)";
+  ctx.fillText(`PEERS ${multiplayer.transportPeers}  SENT ${multiplayer.sent}  RECV ${multiplayer.received}  Q ${multiplayer.queuedInbound}`, x + 14, y + 38);
+
+  for (let i = 0; i < rows.length; i++) {
+    const p = rows[i];
+    const py = y + 58 + i * rowH;
+    const hue = remotePlayerHue(p.slot);
+    const status = p.lifeState === "alive" ? "ONLINE" : p.lifeState === "respawn-pending" ? "RESPAWN" : p.lifeState.toUpperCase();
+    ctx.fillStyle = `hsla(${hue},95%,75%,${p.connected ? 0.88 : 0.38})`;
+    ctx.fillText(`P${p.slot + 1}`, x + 14, py);
+    ctx.fillStyle = p.isLocal ? "rgba(176,255,218,0.92)" : "rgba(210,235,255,0.74)";
+    const label = `${p.id}${p.isLocal ? " *" : ""}`.slice(0, 24);
+    ctx.fillText(label, x + 48, py);
+    ctx.fillStyle = "rgba(145,205,230,0.68)";
+    ctx.fillText(status, x + 220, py);
+  }
+  ctx.restore();
 }
 
 function updateCamera(camera: { pos: V2; zoom: number }, canvas: HTMLCanvasElement, dpr: number, shipPos: V2, shipVel: V2, horizonR: number) {

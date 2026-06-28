@@ -17,6 +17,15 @@ export type MetatronPlayerSlot = {
   joinedAtMs: number;
 };
 
+export function isPlayerSlotIndex(value: unknown): value is PlayerSlotIndex {
+  return Number.isInteger(value) && typeof value === "number" && value >= 0 && value < MAX_MULTIPLAYER_PLAYERS;
+}
+
+export function normalizePlayerSlotIndex(value: unknown): PlayerSlotIndex | null {
+  const n = typeof value === "string" ? Number(value) : value;
+  return isPlayerSlotIndex(n) ? n : null;
+}
+
 export function createLocalPlayerSlot(callsign?: string | null): MetatronPlayerSlot {
   return {
     id: LOCAL_SOLO_PLAYER_ID,
@@ -34,20 +43,43 @@ export function createEmptyPlayerRegistry(callsign?: string | null) {
   return [createLocalPlayerSlot(callsign)] as MetatronPlayerSlot[];
 }
 
-export function createPlayerRegistryWithLocal(id: PlayerId, role: MultiplayerRole, callsign?: string | null) {
+export function createPlayerRegistryWithLocal(id: PlayerId, role: MultiplayerRole, callsign?: string | null, preferredSlot?: PlayerSlotIndex | null) {
   const slot = createLocalPlayerSlot(callsign);
   slot.id = id;
   slot.role = role;
+  if (preferredSlot !== null && preferredSlot !== undefined) slot.slot = preferredSlot;
   return [slot] as MetatronPlayerSlot[];
 }
 
-export function assignNextPlayerSlot(players: MetatronPlayerSlot[], id: PlayerId, role: MultiplayerRole, callsign?: string | null) {
+export function assignPlayerSlot(
+  players: MetatronPlayerSlot[],
+  id: PlayerId,
+  role: MultiplayerRole,
+  callsign?: string | null,
+  preferredSlot?: PlayerSlotIndex | null,
+) {
+  const existing = players.find((player) => player.id === id);
+  if (existing) {
+    existing.connected = true;
+    existing.lifeState = existing.lifeState === "disconnected" ? "alive" : existing.lifeState;
+    if (callsign !== undefined) existing.callsign = callsign;
+    return existing;
+  }
+
   const used = new Set(players.map((player) => player.slot));
+  const requested = preferredSlot ?? null;
+  const slotOrder: PlayerSlotIndex[] = [];
+  if (requested !== null && !used.has(requested)) slotOrder.push(requested);
   for (let slot = 0; slot < MAX_MULTIPLAYER_PLAYERS; slot += 1) {
-    if (used.has(slot as PlayerSlotIndex)) continue;
+    const typed = slot as PlayerSlotIndex;
+    if (!slotOrder.includes(typed)) slotOrder.push(typed);
+  }
+
+  for (const slot of slotOrder) {
+    if (used.has(slot)) continue;
     const player: MetatronPlayerSlot = {
       id,
-      slot: slot as PlayerSlotIndex,
+      slot,
       role,
       callsign: callsign ?? null,
       lifeState: "alive",
@@ -61,11 +93,17 @@ export function assignNextPlayerSlot(players: MetatronPlayerSlot[], id: PlayerId
   return null;
 }
 
-export function markPlayerDestroyed(player: MetatronPlayerSlot) {
+export function assignNextPlayerSlot(players: MetatronPlayerSlot[], id: PlayerId, role: MultiplayerRole, callsign?: string | null) {
+  return assignPlayerSlot(players, id, role, callsign, null);
+}
+
+export function markPlayerDestroyed(player: MetatronPlayerSlot | undefined | null) {
+  if (!player) return;
   player.lifeState = "respawn-pending";
 }
 
-export function markPlayerRespawned(player: MetatronPlayerSlot) {
+export function markPlayerRespawned(player: MetatronPlayerSlot | undefined | null) {
+  if (!player) return;
   player.lifeState = "alive";
 }
 
