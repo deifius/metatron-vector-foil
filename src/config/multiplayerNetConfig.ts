@@ -9,4 +9,5 @@ export const MULTIPLAYER_NET_CONFIG = {
   debugLatencyMs: 0,
   debugJitterMs: 0,
   debugPacketDropRate: 0,
+  maxQueuedInboundMessages: 240,
 };

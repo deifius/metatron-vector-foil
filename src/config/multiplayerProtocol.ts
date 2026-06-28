@@ -16,6 +16,15 @@ export type NetInputMessage = {
   brake: number;
   fireHeld: boolean;
   firePressed: boolean;
+  // Optional client-side ship telemetry. Guests include this so the host can
+  // bridge current WebRTC transport into authoritative projectiles before the
+  // full remote-ship simulation lands. Host truth still wins in snapshots.
+  x?: number;
+  y?: number;
+  vx?: number;
+  vy?: number;
+  angle?: number;
+  angularVelocity?: number;
 };
 
 export type NetPlayerState = {

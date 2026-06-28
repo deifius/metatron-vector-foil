@@ -14,7 +14,8 @@ import {
   setFlightRecorderContext,
 } from "./config/debugFlightRecorder";
 import {
-  createEmptyPlayerRegistry,
+  assignNextPlayerSlot,
+  createPlayerRegistryWithLocal,
   LOCAL_SOLO_PLAYER_ID,
   markPlayerDestroyed,
   markPlayerRespawned,
@@ -25,6 +26,8 @@ import {
 import type { PlayerId } from "./config/playerSlots";
 import { MULTIPLAYER_NET_CONFIG } from "./config/multiplayerNetConfig";
 import {
+  acceptInputSequence,
+  acceptWorldSnapshot,
   ackInputSeqByPlayer,
   advanceAuthorityTick,
   createAuthorityClock,
@@ -37,8 +40,10 @@ import {
   shouldLogSnapshotHeartbeat,
   shouldPublishSnapshot,
 } from "./config/multiplayerAuthority";
-import { MULTIPLAYER_PROTOCOL_VERSION } from "./config/multiplayerProtocol";
+import { MULTIPLAYER_PROTOCOL_VERSION, isPlayerInputMessage, isWorldSnapshotMessage } from "./config/multiplayerProtocol";
 import type { NetInputMessage, NetWorldSnapshot } from "./config/multiplayerProtocol";
+import { createMultiplayerTransport, detectMultiplayerTransportLaunch } from "./config/multiplayerTransport";
+import type { InboundTransportMessage, MultiplayerTransportHub } from "./config/multiplayerTransport";
 import { SCORE_THRESHOLDS } from "./config/thresholds";
 import type { CitationCategory, CommendationDefinition } from "./types/scoring";
 import {
@@ -1061,6 +1066,7 @@ export default function MetatronVectorFOIL() {
   const audioRef = useRef(new AudioEngine());
   const keysRef = useRef(new Set<string>());
   const resetToMenuRef = useRef<(() => void) | null>(null);
+  const multiplayerTransportRef = useRef<MultiplayerTransportHub | null>(null);
 
   useEffect(() => {
     installFlightRecorderErrorCapture();
@@ -1431,6 +1437,7 @@ export default function MetatronVectorFOIL() {
           mode: modeRef.current,
           levelIdx: levelIdxRef.current,
           toggles: togglesRef.current,
+          transport: multiplayerTransportRef.current?.getState() ?? null,
         });
         debugLog("lifecycle", "debug-export-complete", { trigger: "hotkey", filename });
         return;
@@ -1511,15 +1518,36 @@ export default function MetatronVectorFOIL() {
     };
 
     let shipBrakeInput = 0;
-    const playerSlots = createEmptyPlayerRegistry(playerIdentityRef.current.callsign);
+    const transportLaunch = detectMultiplayerTransportLaunch();
+    const playerSlots = createPlayerRegistryWithLocal(
+      transportLaunch.localPlayerId,
+      transportLaunch.role,
+      playerIdentityRef.current.callsign,
+    );
+    const authorityMode = transportLaunch.role === "host"
+      ? "host"
+      : transportLaunch.role === "guest"
+        ? "client-mirror"
+        : "solo-authority";
+    const transport = createMultiplayerTransport(transportLaunch);
+    multiplayerTransportRef.current = transport;
+    setFlightRecorderContext({
+      role: transportLaunch.role,
+      playerId: transportLaunch.localPlayerId,
+      callsign: playerIdentityRef.current.callsign ?? null,
+    });
     debugLog("player", "player-registry-initialized", {
       players: playerSlots.map((slot) => ({ id: slot.id, slot: slot.slot, role: slot.role, lifeState: slot.lifeState })),
       maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers,
+      transportRole: transportLaunch.role,
+      roomId: transportLaunch.roomId,
     });
 
-    const authorityClock = createAuthorityClock("solo-authority");
+    const authorityClock = createAuthorityClock(authorityMode);
     const entityIdCounters = createEntityIdCounters();
     let lastLocalInputSeq = 0;
+    const remotePlayerMirrors: Record<PlayerId, { x: number; y: number; vx: number; vy: number; angle: number; angularVelocity: number; fuel: number; hitsTaken: number; lastInputSeq: number }> = {};
+    const remoteGunCooldowns: Record<PlayerId, number> = {};
 
     const bullets: Bullet[] = [];
     const enemies: Enemy[] = [];
@@ -1685,7 +1713,7 @@ export default function MetatronVectorFOIL() {
     const resetRun = (toMenu = false) => {
       debugLog("lifecycle", "run-reset", { toMenu, previousMode: modeRef.current, wave: getLevel(levelIdxRef.current).wave });
       bullets.length = 0; enemies.length = 0; shards.length = 0; fuelBits.length = 0; trail.length = 0;
-      resetAuthorityClock(authorityClock, "solo-authority");
+      resetAuthorityClock(authorityClock, authorityMode);
       resetEntityIdCounters(entityIdCounters);
       lastLocalInputSeq = 0;
       for (const c of oortClusters) {
@@ -1828,10 +1856,10 @@ export default function MetatronVectorFOIL() {
       return out.mul(k * press).add(tang.mul(k * tangAmt));
     };
 
-    const makeBullet = (burstId: number, ownerId: PlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID) => {
-      const muzzle = V2.fromAngle(player.angle, 18);
-      const pos = player.pos.copy().add(muzzle);
-      const vel = V2.fromAngle(player.angle, T.BULLET_SPEED).add(player.vel.copy());
+    const makeBulletFromState = (burstId: number, ownerId: PlayerId, shipState: { pos: V2; vel: V2; angle: number }) => {
+      const muzzle = V2.fromAngle(shipState.angle, 18);
+      const pos = shipState.pos.copy().add(muzzle);
+      const vel = V2.fromAngle(shipState.angle, T.BULLET_SPEED).add(shipState.vel.copy());
       const id = makeAuthorityEntityId("projectile", entityIdCounters, authorityClock.tick, ownerId);
       const bullet = {
         id,
@@ -1859,6 +1887,10 @@ export default function MetatronVectorFOIL() {
       });
       return bullet;
     };
+
+    const makeBullet = (burstId: number, ownerId: PlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID) => (
+      makeBulletFromState(burstId, ownerId, { pos: player.pos, vel: player.vel, angle: player.angle })
+    );
 
     const spawnEnemy = (kind: SolidKind, waveIdx: number, index: number, total: number) => {
       const baseAngle = rand(0, TAU);
@@ -2621,14 +2653,14 @@ export default function MetatronVectorFOIL() {
         callsign: slot.callsign ?? null,
         alive: slot.lifeState === "alive",
         respawnPending: slot.lifeState === "respawn-pending",
-        x: slot.id === localSlot?.id ? player.pos.x : 0,
-        y: slot.id === localSlot?.id ? player.pos.y : 0,
-        vx: slot.id === localSlot?.id ? player.vel.x : 0,
-        vy: slot.id === localSlot?.id ? player.vel.y : 0,
-        angle: slot.id === localSlot?.id ? player.angle : 0,
-        angularVelocity: slot.id === localSlot?.id ? player.angularVel : 0,
-        fuel: slot.id === localSlot?.id ? player.fuel : 0,
-        hitsTaken: slot.id === localSlot?.id ? player.hitsTaken : 0,
+        x: slot.id === localSlot?.id ? player.pos.x : (remotePlayerMirrors[slot.id]?.x ?? 0),
+        y: slot.id === localSlot?.id ? player.pos.y : (remotePlayerMirrors[slot.id]?.y ?? 0),
+        vx: slot.id === localSlot?.id ? player.vel.x : (remotePlayerMirrors[slot.id]?.vx ?? 0),
+        vy: slot.id === localSlot?.id ? player.vel.y : (remotePlayerMirrors[slot.id]?.vy ?? 0),
+        angle: slot.id === localSlot?.id ? player.angle : (remotePlayerMirrors[slot.id]?.angle ?? 0),
+        angularVelocity: slot.id === localSlot?.id ? player.angularVel : (remotePlayerMirrors[slot.id]?.angularVelocity ?? 0),
+        fuel: slot.id === localSlot?.id ? player.fuel : (remotePlayerMirrors[slot.id]?.fuel ?? 0),
+        hitsTaken: slot.id === localSlot?.id ? player.hitsTaken : (remotePlayerMirrors[slot.id]?.hitsTaken ?? 0),
         lastInputSeq: slot.lastInputSeq,
       }));
 
@@ -2679,14 +2711,235 @@ export default function MetatronVectorFOIL() {
       };
     };
 
+    const ensureRemoteSlot = (playerId: PlayerId, callsign?: string | null) => {
+      let slot = playerSlots.find((candidate) => candidate.id === playerId) ?? null;
+      if (slot) return slot;
+      slot = assignNextPlayerSlot(playerSlots, playerId, "guest", callsign);
+      if (!slot) {
+        debugWarn("network", "join-denied-no-slot", { playerId, maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers });
+        return null;
+      }
+      debugLog("network", "remote-player-slot-assigned", { playerId, slot: slot.slot, players: playerSlotSummary(playerSlots) });
+      return slot;
+    };
+
+    const mirrorRemoteInputTelemetry = (input: NetInputMessage) => {
+      if (
+        typeof input.x !== "number" || typeof input.y !== "number" ||
+        typeof input.vx !== "number" || typeof input.vy !== "number" ||
+        typeof input.angle !== "number"
+      ) return;
+      remotePlayerMirrors[input.playerId] = {
+        x: input.x,
+        y: input.y,
+        vx: input.vx,
+        vy: input.vy,
+        angle: input.angle,
+        angularVelocity: typeof input.angularVelocity === "number" ? input.angularVelocity : 0,
+        fuel: remotePlayerMirrors[input.playerId]?.fuel ?? T.FUEL_MAX,
+        hitsTaken: remotePlayerMirrors[input.playerId]?.hitsTaken ?? 0,
+        lastInputSeq: input.seq,
+      };
+    };
+
+    const maybeFireRemoteProjectile = (input: NetInputMessage) => {
+      if (!input.firePressed) return;
+      if ((remoteGunCooldowns[input.playerId] ?? 0) > 0) return;
+      const mirror = remotePlayerMirrors[input.playerId];
+      if (!mirror) {
+        debugWarn("projectile", "remote-fire-without-telemetry", { playerId: input.playerId, seq: input.seq, authorityTick: authorityClock.tick });
+        return;
+      }
+      const burstId = currentBurstId++;
+      bullets.push(makeBulletFromState(burstId, input.playerId, {
+        pos: new V2(mirror.x, mirror.y),
+        vel: new V2(mirror.vx, mirror.vy),
+        angle: mirror.angle,
+      }));
+      remoteGunCooldowns[input.playerId] = T.FIRE_RATE;
+      audioRef.current.shoot();
+      debugLog("projectile", "remote-projectile-authorized", {
+        playerId: input.playerId,
+        seq: input.seq,
+        burstId,
+        authorityTick: authorityClock.tick,
+      });
+    };
+
+    const applyAuthoritySnapshot = (snapshot: NetWorldSnapshot, inbound: InboundTransportMessage) => {
+      if (!acceptWorldSnapshot(authorityClock, snapshot)) return;
+      const localPlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
+      const localNetPlayer = snapshot.players.find((candidate) => candidate.id === localPlayerId);
+      if (localNetPlayer) {
+        const before = player.pos.copy();
+        player.pos = new V2(localNetPlayer.x, localNetPlayer.y);
+        player.vel = new V2(localNetPlayer.vx, localNetPlayer.vy);
+        player.angle = localNetPlayer.angle;
+        player.angularVel = localNetPlayer.angularVelocity;
+        player.fuel = localNetPlayer.fuel;
+        player.hitsTaken = localNetPlayer.hitsTaken;
+        const correction = before.sub(player.pos).len();
+        if (correction > MULTIPLAYER_NET_CONFIG.largeCorrectionWarnDistance) {
+          debugWarn("snapshot", "large-player-correction", {
+            playerId: localPlayerId,
+            correction,
+            tick: snapshot.tick,
+            via: inbound.via,
+          });
+        }
+      }
+      for (const netPlayer of snapshot.players) {
+        const existing = playerSlots.find((slot) => slot.id === netPlayer.id) ?? assignNextPlayerSlot(playerSlots, netPlayer.id, netPlayer.id === localPlayerId ? transportLaunch.role : "guest", netPlayer.callsign ?? null);
+        if (existing) {
+          existing.lifeState = netPlayer.alive ? "alive" : netPlayer.respawnPending ? "respawn-pending" : "dead";
+          existing.lastInputSeq = netPlayer.lastInputSeq;
+          existing.callsign = netPlayer.callsign ?? existing.callsign;
+        }
+        if (netPlayer.id !== localPlayerId) {
+          remotePlayerMirrors[netPlayer.id] = {
+            x: netPlayer.x,
+            y: netPlayer.y,
+            vx: netPlayer.vx,
+            vy: netPlayer.vy,
+            angle: netPlayer.angle,
+            angularVelocity: netPlayer.angularVelocity,
+            fuel: netPlayer.fuel,
+            hitsTaken: netPlayer.hitsTaken,
+            lastInputSeq: netPlayer.lastInputSeq,
+          };
+        }
+      }
+
+      const incomingEnemies = new Map(snapshot.enemies.map((enemy) => [enemy.id, enemy]));
+      for (let i = enemies.length - 1; i >= 0; i--) {
+        if (!incomingEnemies.has(enemies[i].id)) enemies.splice(i, 1);
+      }
+      for (const netEnemy of snapshot.enemies) {
+        let enemy = enemies.find((candidate) => candidate.id === netEnemy.id);
+        if (!enemy) {
+          enemy = {
+            id: netEnemy.id,
+            pos: new V2(netEnemy.x, netEnemy.y),
+            vel: new V2(netEnemy.vx, netEnemy.vy),
+            ax: 0,
+            ay: 0,
+            az: 0,
+            r: 16,
+            hue: 210,
+            kind: netEnemy.kind,
+            mesh: makePolyhedron(netEnemy.kind, 16),
+            morphing: netEnemy.morphing,
+            morph: netEnemy.morphing ? 0.5 : 0,
+            nextKind: netEnemy.nextKind,
+          };
+          enemies.push(enemy);
+        }
+        enemy.pos = new V2(netEnemy.x, netEnemy.y);
+        enemy.vel = new V2(netEnemy.vx, netEnemy.vy);
+        if (enemy.kind !== netEnemy.kind) {
+          enemy.kind = netEnemy.kind;
+          enemy.mesh = makePolyhedron(netEnemy.kind, enemy.r);
+        }
+        enemy.morphing = netEnemy.morphing;
+        enemy.nextKind = netEnemy.nextKind;
+      }
+
+      bullets.length = 0;
+      for (const projectile of snapshot.projectiles) {
+        const pos = new V2(projectile.x, projectile.y);
+        bullets.push({
+          id: projectile.id,
+          ownerId: projectile.ownerId,
+          hostTick: projectile.hostTick ?? snapshot.tick,
+          pos,
+          prevPos: pos.copy(),
+          vel: new V2(projectile.vx, projectile.vy),
+          life: Math.max(0.02, T.BULLET_LIFE - projectile.ageMs / 1000),
+          mass: T.BULLET_MASS,
+          origin: pos.copy(),
+          firedAtMs: runClockMs - projectile.ageMs,
+          burstId: 0,
+        });
+      }
+
+      shards.length = 0;
+      for (const fragment of snapshot.shrapnel) {
+        const life = Math.max(0.02, fragment.lifeMs / 1000);
+        shards.push({
+          id: fragment.id,
+          sourceEnemyId: fragment.sourceEnemyId,
+          hostTick: fragment.hostTick ?? snapshot.tick,
+          pos: new V2(fragment.x, fragment.y),
+          vel: new V2(fragment.vx, fragment.vy),
+          life,
+          life0: life,
+          hue: fragment.hue ?? 210,
+          size: fragment.size,
+          ang: 0,
+          spin: 0,
+        });
+      }
+
+      score = snapshot.score;
+      const nextLevelIdx = Math.max(0, snapshot.wave - 1);
+      if (nextLevelIdx !== levelIdxRef.current) {
+        levelIdxRef.current = nextLevelIdx;
+        setLevelIdx(nextLevelIdx);
+      }
+      debugLog("snapshot", "snapshot-applied", {
+        tick: snapshot.tick,
+        via: inbound.via,
+        players: snapshot.players.length,
+        enemies: snapshot.enemies.length,
+        projectiles: snapshot.projectiles.length,
+        shrapnel: snapshot.shrapnel.length,
+      }, "debug");
+    };
+
+    const handleInboundTransportMessages = () => {
+      const inbound = transport.drainInboundMessages();
+      if (inbound.length <= 0) return;
+      for (const item of inbound) {
+        const message = item.message;
+        if (isPlayerInputMessage(message)) {
+          if (authorityClock.mode !== "host") continue;
+          const slot = ensureRemoteSlot(message.playerId);
+          if (!slot) continue;
+          if (!acceptInputSequence(authorityClock, message)) continue;
+          slot.lastInputSeq = message.seq;
+          mirrorRemoteInputTelemetry(message);
+          maybeFireRemoteProjectile(message);
+          debugLog("input", "remote-input-accepted", {
+            playerId: message.playerId,
+            seq: message.seq,
+            rotate: message.rotate,
+            thrust: message.thrust,
+            brake: message.brake,
+            firePressed: message.firePressed,
+            via: item.via,
+            authorityTick: authorityClock.tick,
+          }, "debug");
+          continue;
+        }
+        if (isWorldSnapshotMessage(message)) {
+          if (authorityClock.mode === "client-mirror") applyAuthoritySnapshot(message, item);
+          continue;
+        }
+      }
+    };
+
     const publishAuthoritySnapshotIfDue = (dt: number) => {
       const shouldPublish = shouldPublishSnapshot(authorityClock, dt, MULTIPLAYER_NET_CONFIG.snapshotHz);
       const shouldHeartbeat = shouldLogSnapshotHeartbeat(authorityClock, dt);
       if (!shouldPublish && !shouldHeartbeat) return;
       const snapshot = buildAuthoritySnapshot();
       if (shouldHeartbeat) logSnapshotHeartbeat(snapshot, authorityClock.mode);
-      // Sprint leg 2 keeps this as a local authority snapshot until the WebRTC fanout layer is present.
-      // The actual host transport can broadcast this exact payload to every guest.
+      if (shouldPublish && authorityClock.mode === "host") {
+        const sent = transport.broadcastFromHost(snapshot);
+        if (sent > 0 && shouldHeartbeat) {
+          debugLog("network", "snapshot-broadcast", { tick: snapshot.tick, sent, peers: transport.getState().peers.length }, "debug");
+        }
+      }
     };
 
     // =============== fixed timestep loop ===============
@@ -2711,6 +2964,10 @@ export default function MetatronVectorFOIL() {
 
       runClockMs += dt * 1000;
       scoreIdleMs += dt * 1000;
+      handleInboundTransportMessages();
+      for (const id of Object.keys(remoteGunCooldowns)) {
+        remoteGunCooldowns[id] = Math.max(0, remoteGunCooldowns[id] - dt);
+      }
       if (scoreIdleMs >= SCORE_THRESHOLDS.chainDecayMs) {
         chainMultiplier = 1;
         lastScoreCategory = null;
@@ -2811,6 +3068,7 @@ export default function MetatronVectorFOIL() {
       const thrustIntent = Math.max(keyboardThrustInput, gamepadInput.thrust);
       const brakeIntent = Math.max(keyboardBrakeInput, gamepadInput.brake);
       const fireHeld = keys.has(" ") || keys.has("Space") || gamepadInput.fire;
+      const firePressedIntent = gamepadInput.firePressed || (fireHeld && gunCD <= 0);
       const localPlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
       lastLocalInputSeq = nextInputSequence(authorityClock, localPlayerId);
       if (playerSlots[0]) playerSlots[0].lastInputSeq = lastLocalInputSeq;
@@ -2825,8 +3083,20 @@ export default function MetatronVectorFOIL() {
         thrust: thrustIntent,
         brake: brakeIntent,
         fireHeld,
-        firePressed: gamepadInput.firePressed,
+        firePressed: firePressedIntent,
+        x: player.pos.x,
+        y: player.pos.y,
+        vx: player.vel.x,
+        vy: player.vel.y,
+        angle: player.angle,
+        angularVelocity: player.angularVel,
       };
+      if (authorityClock.mode === "client-mirror") {
+        const sent = transport.sendToHost(localInputMessage);
+        if (sent > 0 && lastLocalInputSeq % MULTIPLAYER_NET_CONFIG.hostSimulationHz === 0) {
+          debugLog("network", "input-sent-to-host", { playerId: localPlayerId, seq: lastLocalInputSeq, sent }, "debug");
+        }
+      }
       if (lastLocalInputSeq % MULTIPLAYER_NET_CONFIG.hostSimulationHz === 0 && (Math.abs(turnInput) > 0.01 || thrustIntent > 0.01 || brakeIntent > 0.01 || fireHeld)) {
         debugLog("input", "local-input-heartbeat", {
           playerId: localInputMessage.playerId,
@@ -3405,6 +3675,8 @@ export default function MetatronVectorFOIL() {
       window.removeEventListener("keydown", onKeyDown as any);
       window.removeEventListener("keyup", onKeyUp as any);
       window.removeEventListener("pointerdown", onPointerDown as any);
+      transport.dispose();
+      if (multiplayerTransportRef.current === transport) multiplayerTransportRef.current = null;
       audioRef.current.stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3813,6 +4085,7 @@ export default function MetatronVectorFOIL() {
                 levelIdx,
                 toggles,
                 sliders,
+                transport: multiplayerTransportRef.current?.getState() ?? null,
               });
               debugLog("lifecycle", "debug-export-complete", { trigger: "pause-menu", filename });
             }} style={btnStyle}>Export flight recorder</button>

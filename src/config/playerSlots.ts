@@ -34,6 +34,13 @@ export function createEmptyPlayerRegistry(callsign?: string | null) {
   return [createLocalPlayerSlot(callsign)] as MetatronPlayerSlot[];
 }
 
+export function createPlayerRegistryWithLocal(id: PlayerId, role: MultiplayerRole, callsign?: string | null) {
+  const slot = createLocalPlayerSlot(callsign);
+  slot.id = id;
+  slot.role = role;
+  return [slot] as MetatronPlayerSlot[];
+}
+
 export function assignNextPlayerSlot(players: MetatronPlayerSlot[], id: PlayerId, role: MultiplayerRole, callsign?: string | null) {
   const used = new Set(players.map((player) => player.slot));
   for (let slot = 0; slot < MAX_MULTIPLAYER_PLAYERS; slot += 1) {
