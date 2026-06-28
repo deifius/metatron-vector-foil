@@ -218,42 +218,6 @@ export const T = {
   AUDIO_OORT_DUST_URL: "/static/audio/oort-dust.wav",
   AUDIO_SPHERE_ACTIVATE_URL: "/static/audio/sphere-activate.wav",
 
-  // Multiplayer / Constellation Defense audio hooks. Optional files can be
-  // dropped into /static/audio; the engine falls back to synthetic carrier
-  // chirps when they are absent.
-  AUDIO_ROOM_CREATE_URL: "/static/audio/room-create.wav",
-  AUDIO_ROOM_INVITE_URL: "/static/audio/room-invite.wav",
-  AUDIO_ROOM_INVITE_RECEIVED_URL: "/static/audio/room-invite-received.wav",
-  AUDIO_ROOM_JOIN_URL: "/static/audio/room-join.wav",
-  AUDIO_ROOM_LEAVE_URL: "/static/audio/room-leave.wav",
-  AUDIO_SIGNAL_LOCK_URL: "/static/audio/signal-lock.wav",
-  AUDIO_SIGNAL_LOST_URL: "/static/audio/signal-lost.wav",
-  AUDIO_TRANSPONDER_PING_URL: "/static/audio/transponder-ping.wav",
-  AUDIO_RELAY_FALLBACK_URL: "/static/audio/relay-fallback.wav",
-
-  MULTIPLAYER_MAX_PILOTS: 6,
-  MULTIPLAYER_DEFAULT_VISIBILITY: "UNLISTED",
-  MULTIPLAYER_DEFAULT_CONFIG_POLICY: "HOST LOCKED",
-  MULTIPLAYER_TRACE_SEND_MS: 80,
-  MULTIPLAYER_TRACE_INTERP_MS: 120,
-  MULTIPLAYER_TRACE_STALE_MS: 2600,
-  MULTIPLAYER_TRACE_SNAP_DISTANCE: 520,
-  MULTIPLAYER_TRACE_MAX_EXTRAPOLATE_SEC: 0.22,
-  MULTIPLAYER_TRACE_MAX_BYTES: 2048,
-  MULTIPLAYER_CARRIER_MAX_BYTES: 24576,
-  MULTIPLAYER_CARRIER_BUFFER_SOFT_BYTES: 32768,
-  MULTIPLAYER_CARRIER_BUFFER_HARD_BYTES: 131072,
-  MULTIPLAYER_HEARTBEAT_MS: 1200,
-  MULTIPLAYER_HEARTBEAT_WARN_MS: 2400,
-  MULTIPLAYER_HEARTBEAT_LOST_MS: 5200,
-  MULTIPLAYER_WORLD_SNAPSHOT_MS: 180,
-  MULTIPLAYER_WORLD_INTERP_MS: 170,
-  MULTIPLAYER_WORLD_STALE_MS: 3200,
-  MULTIPLAYER_WORLD_SNAP_DISTANCE: 720,
-  MULTIPLAYER_WORLD_MAX_ENEMIES: 16,
-  MULTIPLAYER_WORLD_MAX_SHARDS: 64,
-  MULTIPLAYER_WORLD_DEGRADED_MAX_SHARDS: 24,
-
   AUDIO_THRUST_SAMPLE_GAIN: 0.18,      // level of looped thrust.wav when present
   AUDIO_THRUST_RATE_MIN: 0.92,         // idle playback rate for thrust.wav
   AUDIO_THRUST_RATE_MAX: 1.24,         // full-thrust playback rate for thrust.wav
@@ -269,16 +233,6 @@ export const T = {
   AUDIO_OORT_DUST_GAIN: 0.12,           // max gain for looped oort-dust.wav while abrading shields
   AUDIO_OORT_DUST_FILTER_HZ: 2600,      // high, icy dust tone when the optional loop is present
   AUDIO_SPHERE_ACTIVATE_GAIN: 0.18,      // one-shot gain for sphere-activate.wav
-
-  AUDIO_ROOM_CREATE_GAIN: 0.13,
-  AUDIO_ROOM_INVITE_GAIN: 0.10,
-  AUDIO_ROOM_INVITE_RECEIVED_GAIN: 0.12,
-  AUDIO_ROOM_JOIN_GAIN: 0.13,
-  AUDIO_ROOM_LEAVE_GAIN: 0.11,
-  AUDIO_SIGNAL_LOCK_GAIN: 0.12,
-  AUDIO_SIGNAL_LOST_GAIN: 0.13,
-  AUDIO_TRANSPONDER_PING_GAIN: 0.055,
-  AUDIO_RELAY_FALLBACK_GAIN: 0.12,
 };
 
 export const TAU = Math.PI * 2;
