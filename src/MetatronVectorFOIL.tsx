@@ -4,6 +4,7 @@ import { HUDRoot } from "./ui/hud/HUDRoot";
 import { HUDState } from "./ui/hud/hudTypes";
 import { loadJson, loadTextLines } from "./data/textLoader";
 import { scoreForCitation, scoreForEnemy, scoreForPerfectWave, scoreForWaveClear } from "./config/scoring";
+import { getGamepadControlsHint, readGamepadShipInput } from "./config/gamepadControls";
 import { SCORE_THRESHOLDS } from "./config/thresholds";
 import type { CitationCategory, CommendationDefinition } from "./types/scoring";
 import {
@@ -1432,6 +1433,8 @@ export default function MetatronVectorFOIL() {
       hitInvuln: 0,
     };
 
+    let shipBrakeInput = 0;
+
     const bullets: Bullet[] = [];
     const enemies: Enemy[] = [];
     let nextEnemyId = 1;
@@ -1607,6 +1610,8 @@ export default function MetatronVectorFOIL() {
       player.vel = new V2(0, v0);
       player.angle = Math.atan2(player.vel.y, player.vel.x);
       player.angularVel = 0;
+      player.thrust = 0;
+      shipBrakeInput = 0;
       player.brakeAnim = 0;
       player.thrustGlow = 0;
       player.inActivatedSphere = false;
@@ -2400,6 +2405,15 @@ export default function MetatronVectorFOIL() {
       const gm = slidersRef.current.gravity;
       const thrust = slidersRef.current.thrust;
       const solar = slidersRef.current.solar;
+      const gamepadInput = readGamepadShipInput(dt);
+      const gamepadActive = gamepadInput.connected && (
+        Math.abs(gamepadInput.rotate) > 0.08 ||
+        gamepadInput.thrust > 0.05 ||
+        gamepadInput.brake > 0.05 ||
+        gamepadInput.firePressed ||
+        gamepadInput.pausePressed
+      );
+      if (gamepadActive) audioRef.current.init();
 
       runClockMs += dt * 1000;
       scoreIdleMs += dt * 1000;
@@ -2414,6 +2428,9 @@ export default function MetatronVectorFOIL() {
 
       // handle pause/menu/debrief/transition
       if (modeRef.current === "debrief") {
+        if (gamepadInput.firePressed || gamepadInput.pausePressed) {
+          onDebriefAdvance?.();
+        }
         debriefPhaseElapsedMs += dt * 1000;
         debriefPublishAccumulator += dt * 1000;
         if (debriefPhase === "burn_fade" && debriefPhaseElapsedMs >= DEBRIEF_SEQUENCE.burnFadeMs) {
@@ -2443,6 +2460,14 @@ export default function MetatronVectorFOIL() {
         audioRef.current.setThrust(0);
         return;
       }
+      if (gamepadInput.pausePressed) {
+        setMode((m) => {
+          const next = m === "playing" ? "paused" : ((m === "menu" || m === "paused") ? "playing" : m);
+          modeRef.current = next;
+          return next;
+        });
+      }
+
       if (modeRef.current !== "playing") {
         // still animate metatron slowly for menu vibes
         const dist = player.pos.len();
@@ -2465,28 +2490,32 @@ export default function MetatronVectorFOIL() {
 
       player.hitInvuln = Math.max(0, player.hitInvuln - dt);
 
-      // ---- ship input (A/D + W/S) ----
+      // ---- ship input (keyboard + gamepad) ----
       const turnLeft = keys.has("a") || keys.has("A") || keys.has("ArrowLeft");
       const turnRight = keys.has("d") || keys.has("D") || keys.has("ArrowRight");
-      const turnInput = (turnRight ? 1 : 0) - (turnLeft ? 1 : 0);
+      const keyboardTurnInput = (turnRight ? 1 : 0) - (turnLeft ? 1 : 0);
+      const turnInput = keyboardTurnInput !== 0 ? keyboardTurnInput : gamepadInput.rotate;
       if (T.SHIP_ROTATIONAL_INERTIA_ENABLED) {
         player.angularVel = clamp(
           player.angularVel + turnInput * T.SHIP_ANGULAR_ACCEL * dt,
           -T.SHIP_MAX_ANGULAR_SPEED,
           T.SHIP_MAX_ANGULAR_SPEED,
         );
-        if (turnInput === 0 && T.SHIP_ANGULAR_DAMPING > 0) {
+        if (Math.abs(turnInput) < 0.001 && T.SHIP_ANGULAR_DAMPING > 0) {
           player.angularVel *= Math.exp(-T.SHIP_ANGULAR_DAMPING * dt);
         }
         player.angle += player.angularVel * dt;
       } else {
         player.angularVel = 0;
-        if (turnLeft) player.angle -= T.ROT_SPEED * dt;
-        if (turnRight) player.angle += T.ROT_SPEED * dt;
+        player.angle += turnInput * T.ROT_SPEED * dt;
       }
 
-      const want = (keys.has("w") || keys.has("W") || keys.has("ArrowUp")) ? 1 : ((keys.has("s") || keys.has("S") || keys.has("ArrowDown")) ? -1 : 0);
-      player.thrust = lerp(player.thrust, want, want !== 0 ? 0.16 : 0.10);
+      const keyboardThrustInput = (keys.has("w") || keys.has("W") || keys.has("ArrowUp")) ? 1 : 0;
+      const keyboardBrakeInput = (keys.has("s") || keys.has("S") || keys.has("ArrowDown")) ? 1 : 0;
+      const thrustIntent = Math.max(keyboardThrustInput, gamepadInput.thrust);
+      const brakeIntent = Math.max(keyboardBrakeInput, gamepadInput.brake);
+      player.thrust = lerp(player.thrust, thrustIntent, thrustIntent > 0 ? 0.16 : 0.10);
+      shipBrakeInput = lerp(shipBrakeInput, brakeIntent, brakeIntent > 0 ? 0.18 : 0.12);
 
       // fuel burn/regen
       const dist = player.pos.len();
@@ -2519,7 +2548,7 @@ export default function MetatronVectorFOIL() {
       player.vel.add(sail.mul(dt / T.SHIP_MASS));
       player.vel.add(engine.mul(dt / T.SHIP_MASS));
 
-      const brake = clamp(-player.thrust, 0, 1);
+      const brake = clamp(shipBrakeInput, 0, 1);
       const oortBrakeMedium = T.OORT_ALLOWS_BRAKING
         ? T.OORT_BRAKE_MULTIPLIER * oortMediumDepthAt(player.pos, metaPulseClock)
         : 0;
@@ -2614,7 +2643,7 @@ export default function MetatronVectorFOIL() {
 
       // ---- gun ----
       gunCD -= dt;
-      if ((keys.has(" ") || keys.has("Space")) && gunCD <= 0) {
+      if ((keys.has(" ") || keys.has("Space") || gamepadInput.fire) && gunCD <= 0) {
         const burstId = beginShotBurstIfNeeded();
         const stats = burstStats.get(burstId);
         if (stats) {
@@ -2916,7 +2945,7 @@ export default function MetatronVectorFOIL() {
         const trimDeg = Math.atan2(trimVec.x * radialDir.y - trimVec.y * radialDir.x, trimVec.dot(radialDir)) * 180 / Math.PI;
         setHUDState({
           title: `Metatron Vector FOIL · SCORE ${Math.round(score).toLocaleString()}`,
-          controlsText: "A/D rotate · W/S trim · Space shoot · Enter launch · P pause · M/T/B toggles",
+          controlsText: getGamepadControlsHint(gamepadInput),
           alert: { text: alertText, severity: alertSeverity, flashing, subtitle: alertSubtitle },
           player: {
             shieldsPct,

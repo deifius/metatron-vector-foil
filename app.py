@@ -7,6 +7,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
 from functools import wraps
@@ -56,6 +57,15 @@ from app_config import (
     LOG_STATIC_REQUESTS,
     LOG_STRING_MAX_CHARS,
     MAX_CONTENT_LENGTH_BYTES,
+    MULTIPLAYER_INVITE_RATE_LIMIT_SECONDS,
+    MULTIPLAYER_INVITE_TTL_SECONDS,
+    MULTIPLAYER_ICE_SERVERS,
+    MULTIPLAYER_MAX_PILOTS,
+    MULTIPLAYER_MAX_SIGNAL_BYTES,
+    MULTIPLAYER_ROOM_RATE_LIMIT_SECONDS,
+    MULTIPLAYER_ROOM_TTL_SECONDS,
+    MULTIPLAYER_SIGNAL_RATE_LIMIT_SECONDS,
+    MULTIPLAYER_SIGNAL_TTL_SECONDS,
     OAUTH_LOGIN_RATE_LIMIT_SECONDS,
     PERMISSIONS_POLICY,
     REQUEST_ID_RE,
@@ -146,6 +156,20 @@ def setup_logging() -> None:
 
 
 setup_logging()
+
+
+# Multiplayer room/invite state is intentionally ephemeral in this pass. It is
+# the central signaling/coordination layer, not the gameplay transport. Live
+# gameplay should move over WebRTC DataChannels once the peers have carrier lock.
+MULTIPLAYER_ROOM_VISIBILITIES = {"PUBLIC", "UNLISTED", "PRIVATE"}
+MULTIPLAYER_CONFIG_POLICIES = {"HOST LOCKED", "PERSONAL SHIPS", "OPEN LAB"}
+MULTIPLAYER_ROOM_STATUSES = {"LOBBY", "COUNTDOWN", "PLAYING", "DEBRIEF"}
+MULTIPLAYER_INVITE_DECISIONS = {"accept", "decline"}
+_multiplayer_lock = threading.Lock()
+_multiplayer_rooms: dict[str, dict[str, Any]] = {}
+_multiplayer_invites: dict[str, dict[str, Any]] = {}
+_multiplayer_signals: list[dict[str, Any]] = []
+_multiplayer_signal_seq = 0
 
 
 def log_secret() -> bytes:
@@ -618,6 +642,155 @@ def public_player_payload(row: sqlite3.Row | None) -> dict[str, Any]:
     }
 
 
+def require_callsign_player() -> sqlite3.Row:
+    player = current_player()
+    if not session.get("google_sub"):
+        abort(403, "login_required_before_multiplayer")
+    if not player or not player["callsign"]:
+        abort(403, "set_callsign_before_multiplayer")
+    return player
+
+
+def normalize_room_visibility(raw: Any) -> str:
+    value = str(raw or "UNLISTED").strip().upper().replace("_", " ")
+    if value not in MULTIPLAYER_ROOM_VISIBILITIES:
+        abort(400, "invalid_room_visibility")
+    return value
+
+
+def normalize_config_policy(raw: Any) -> str:
+    value = str(raw or "HOST LOCKED").strip().upper().replace("_", " ")
+    if value not in MULTIPLAYER_CONFIG_POLICIES:
+        abort(400, "invalid_config_policy")
+    return value
+
+
+def normalize_room_status(raw: Any) -> str:
+    value = str(raw or "LOBBY").strip().upper().replace("_", " ")
+    if value not in MULTIPLAYER_ROOM_STATUSES:
+        abort(400, "invalid_room_status")
+    return value
+
+
+def multiplayer_room_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(4))
+
+
+def multiplayer_public_room(room: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "roomId": room["roomId"],
+        "roomCode": room["roomCode"],
+        "hostCallsign": room["hostCallsign"],
+        "visibility": room["visibility"],
+        "configPolicy": room["configPolicy"],
+        "status": room["status"],
+        "route": room.get("route", "SIGNAL SERVER"),
+        "lastSignal": room.get("lastSignal", "DEFENSE CHANNEL OPEN"),
+        "createdAt": room["createdAt"],
+        "updatedAt": room["updatedAt"],
+        "pilots": list(room.get("pilots", []))[:MULTIPLAYER_MAX_PILOTS],
+    }
+
+
+def multiplayer_public_invite(invite: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "inviteId": invite["inviteId"],
+        "roomId": invite["roomId"],
+        "roomCode": invite["roomCode"],
+        "fromCallsign": invite["fromCallsign"],
+        "toCallsign": invite["toCallsign"],
+        "status": invite["status"],
+        "createdAt": invite["createdAt"],
+        "expiresAt": invite["expiresAt"],
+    }
+
+
+def cleanup_multiplayer_state(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    expired_rooms = [
+        room_id
+        for room_id, room in _multiplayer_rooms.items()
+        if now - float(room.get("updatedAtEpoch", room.get("createdAtEpoch", now))) > MULTIPLAYER_ROOM_TTL_SECONDS
+    ]
+    for room_id in expired_rooms:
+        _multiplayer_rooms.pop(room_id, None)
+    expired_invites = [
+        invite_id
+        for invite_id, invite in _multiplayer_invites.items()
+        if float(invite.get("expiresAtEpoch", 0.0)) <= now
+        or (invite.get("status") != "PENDING" and now - float(invite.get("updatedAtEpoch", now)) > 60)
+    ]
+    for invite_id in expired_invites:
+        _multiplayer_invites.pop(invite_id, None)
+
+    live_room_ids = set(_multiplayer_rooms.keys())
+    _multiplayer_signals[:] = [
+        signal for signal in _multiplayer_signals
+        if signal.get("roomId") in live_room_ids
+        and now - float(signal.get("createdAtEpoch", now)) <= MULTIPLAYER_SIGNAL_TTL_SECONDS
+    ]
+
+
+def find_room_by_code(room_code: str) -> dict[str, Any] | None:
+    for room in _multiplayer_rooms.values():
+        if room.get("roomCode") == room_code:
+            return room
+    return None
+
+
+
+def room_callsigns(room: dict[str, Any]) -> set[str]:
+    return {str(pilot.get("callsign")) for pilot in room.get("pilots", []) if pilot.get("callsign") and pilot.get("role") != "SLOT"}
+
+
+def require_room_member(room_id: str, player: sqlite3.Row) -> dict[str, Any]:
+    room = _multiplayer_rooms.get(room_id)
+    if not room:
+        abort(404, "room_not_found")
+    if player["callsign"] not in room_callsigns(room):
+        abort(403, "room_membership_required")
+    return room
+
+
+def sanitize_signal_payload(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        abort(400, "invalid_signal_payload")
+    try:
+        encoded = json.dumps(raw, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError):
+        abort(400, "invalid_signal_payload")
+    if len(encoded.encode("utf-8")) > MULTIPLAYER_MAX_SIGNAL_BYTES:
+        abort(413, "signal_payload_too_large")
+    return raw
+
+
+def multiplayer_public_signal(signal: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "seq": signal["seq"],
+        "roomId": signal["roomId"],
+        "fromCallsign": signal["fromCallsign"],
+        "toCallsign": signal["toCallsign"],
+        "signalType": signal["signalType"],
+        "payload": signal["payload"],
+        "createdAt": signal["createdAt"],
+    }
+
+def add_or_update_room_pilot(room: dict[str, Any], callsign: str, role: str, status: str) -> None:
+    pilots = list(room.get("pilots", []))
+    for pilot in pilots:
+        if pilot.get("callsign") == callsign:
+            pilot["role"] = role
+            pilot["status"] = status
+            pilot["signalAgeMs"] = 0
+            break
+    else:
+        if len([pilot for pilot in pilots if pilot.get("role") != "SLOT"]) >= MULTIPLAYER_MAX_PILOTS:
+            abort(409, "room_full")
+        pilots.append({"callsign": callsign, "role": role, "status": status, "signalAgeMs": 0})
+    room["pilots"] = pilots[:MULTIPLAYER_MAX_PILOTS]
+
+
 def parse_int(data: dict[str, Any], name: str, default: int, low: int, high: int) -> int:
     try:
         value = int(data.get(name, default))
@@ -825,6 +998,7 @@ def security_status():
             "devAuthEnabled": DEV_AUTH_ENABLED,
             "googleAuthEnabled": GOOGLE_OAUTH_ENABLED,
             "googleLoginUrl": "/auth/google/start" if GOOGLE_OAUTH_ENABLED else None,
+            "multiplayerIceServers": MULTIPLAYER_ICE_SERVERS,
             "identityPolicy": {
                 "publicIdentifier": "3-character case-sensitive callsign",
                 "callsignClaiming": "requires authenticated account and no existing callsign",
@@ -907,6 +1081,294 @@ def set_callsign():
     updated_player = current_player()
     log_event("player.callsign_set", "info", player=updated_player, details={"callsign": callsign}, persist=True)
     return jsonify({"ok": True, "player": public_player_payload(updated_player)})
+
+
+@app.post("/api/multiplayer/rooms")
+@require_csrf
+def multiplayer_create_room():
+    session_rate_limit("multiplayer_room", MULTIPLAYER_ROOM_RATE_LIMIT_SECONDS)
+    player = require_callsign_player()
+    data = json_body()
+    visibility = normalize_room_visibility(data.get("visibility", "UNLISTED"))
+    config_policy = normalize_config_policy(data.get("configPolicy", "HOST LOCKED"))
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    room_id = secrets.token_urlsafe(10)
+    with _multiplayer_lock:
+        cleanup_multiplayer_state(now)
+        room_code = multiplayer_room_code()
+        while find_room_by_code(room_code):
+            room_code = multiplayer_room_code()
+        room = {
+            "roomId": room_id,
+            "roomCode": room_code,
+            "hostCallsign": player["callsign"],
+            "visibility": visibility,
+            "configPolicy": config_policy,
+            "status": "LOBBY",
+            "route": "SIGNAL SERVER",
+            "lastSignal": "DEFENSE CHANNEL OPEN // SIGNAL SERVER READY",
+            "createdAt": stamp,
+            "updatedAt": stamp,
+            "createdAtEpoch": now,
+            "updatedAtEpoch": now,
+            "pilots": [
+                {"callsign": player["callsign"], "role": "HOST", "status": "HOST LOCKED", "signalAgeMs": 0},
+            ],
+        }
+        _multiplayer_rooms[room_id] = room
+        public_room = multiplayer_public_room(room)
+    log_event(
+        "multiplayer.room_created",
+        "info",
+        player=player,
+        details={"room_id": room_id, "visibility": visibility, "config_policy": config_policy},
+        persist=True,
+    )
+    return jsonify({"ok": True, "room": public_room})
+
+
+@app.get("/api/multiplayer/rooms/<room_id>")
+def multiplayer_get_room(room_id: str):
+    with _multiplayer_lock:
+        cleanup_multiplayer_state()
+        room = _multiplayer_rooms.get(room_id)
+        if not room:
+            abort(404, "room_not_found")
+        return jsonify({"ok": True, "room": multiplayer_public_room(room)})
+
+
+@app.post("/api/multiplayer/rooms/<room_id>/close")
+@require_csrf
+def multiplayer_close_room(room_id: str):
+    player = require_callsign_player()
+    with _multiplayer_lock:
+        cleanup_multiplayer_state()
+        room = _multiplayer_rooms.get(room_id)
+        if not room:
+            abort(404, "room_not_found")
+        if room.get("hostCallsign") != player["callsign"]:
+            abort(403, "host_required_to_close_room")
+        _multiplayer_rooms.pop(room_id, None)
+    log_event("multiplayer.room_closed", "info", player=player, details={"room_id": room_id}, persist=True)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/multiplayer/rooms/<room_id>/status")
+@require_csrf
+def multiplayer_room_status(room_id: str):
+    player = require_callsign_player()
+    data = json_body()
+    status = normalize_room_status(data.get("status", "LOBBY"))
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    with _multiplayer_lock:
+        cleanup_multiplayer_state(now)
+        room = _multiplayer_rooms.get(room_id)
+        if not room:
+            abort(404, "room_not_found")
+        if room.get("hostCallsign") != player["callsign"]:
+            abort(403, "host_required_to_set_room_status")
+        room["status"] = status
+        room["lastSignal"] = f"HOST SCOPE {status} // {player['callsign']}"
+        room["updatedAt"] = stamp
+        room["updatedAtEpoch"] = now
+        public_room = multiplayer_public_room(room)
+    log_event("multiplayer.room_status", "info", player=player, details={"room_id": room_id, "status": status}, persist=False)
+    return jsonify({"ok": True, "room": public_room})
+
+
+@app.post("/api/multiplayer/rooms/<room_id>/invite")
+@require_csrf
+def multiplayer_invite(room_id: str):
+    session_rate_limit("multiplayer_invite", MULTIPLAYER_INVITE_RATE_LIMIT_SECONDS)
+    player = require_callsign_player()
+    data = json_body()
+    callsign = str(data.get("callsign", ""))
+    if not CALLSIGN_RE.fullmatch(callsign):
+        abort(400, "invalid_invite_callsign")
+    if callsign == player["callsign"]:
+        abort(400, "cannot_invite_self")
+    target = get_db().execute("SELECT id, callsign FROM players WHERE callsign = ? COLLATE BINARY", (callsign,)).fetchone()
+    if not target:
+        abort(404, "callsign_not_found")
+
+    now = time.time()
+    created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    expires_at_epoch = now + MULTIPLAYER_INVITE_TTL_SECONDS
+    expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires_at_epoch))
+    invite_id = secrets.token_urlsafe(10)
+    with _multiplayer_lock:
+        cleanup_multiplayer_state(now)
+        room = _multiplayer_rooms.get(room_id)
+        if not room:
+            abort(404, "room_not_found")
+        if room.get("hostCallsign") != player["callsign"]:
+            abort(403, "host_required_to_invite")
+        add_or_update_room_pilot(room, callsign, "ALLY", "VECTOR SENT")
+        room["lastSignal"] = f"CALLSIGN VECTOR SENT // {callsign}"
+        room["updatedAt"] = created_at
+        room["updatedAtEpoch"] = now
+        invite = {
+            "inviteId": invite_id,
+            "roomId": room_id,
+            "roomCode": room["roomCode"],
+            "fromCallsign": player["callsign"],
+            "toCallsign": callsign,
+            "status": "PENDING",
+            "createdAt": created_at,
+            "updatedAtEpoch": now,
+            "expiresAt": expires_at,
+            "expiresAtEpoch": expires_at_epoch,
+        }
+        _multiplayer_invites[invite_id] = invite
+        public_room = multiplayer_public_room(room)
+        public_invite = multiplayer_public_invite(invite)
+    log_event("multiplayer.invite_sent", "info", player=player, details={"room_id": room_id, "to_callsign": callsign}, persist=True)
+    return jsonify({"ok": True, "room": public_room, "invite": public_invite})
+
+
+@app.get("/api/multiplayer/invites")
+def multiplayer_invites():
+    player = current_player()
+    if not player or not player["callsign"]:
+        return jsonify({"ok": True, "invites": []})
+    with _multiplayer_lock:
+        cleanup_multiplayer_state()
+        invites = [
+            multiplayer_public_invite(invite)
+            for invite in _multiplayer_invites.values()
+            if invite.get("toCallsign") == player["callsign"] and invite.get("status") == "PENDING"
+        ]
+    invites.sort(key=lambda item: item["createdAt"], reverse=True)
+    return jsonify({"ok": True, "invites": invites[:10]})
+
+
+@app.post("/api/multiplayer/invites/<invite_id>/respond")
+@require_csrf
+def multiplayer_invite_respond(invite_id: str):
+    player = require_callsign_player()
+    data = json_body()
+    decision = str(data.get("decision", "")).strip().lower()
+    if decision not in MULTIPLAYER_INVITE_DECISIONS:
+        abort(400, "invalid_invite_decision")
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    with _multiplayer_lock:
+        cleanup_multiplayer_state(now)
+        invite = _multiplayer_invites.get(invite_id)
+        if not invite:
+            abort(404, "invite_not_found")
+        if invite.get("toCallsign") != player["callsign"]:
+            abort(403, "invite_not_for_this_callsign")
+        if invite.get("status") != "PENDING":
+            abort(409, "invite_already_resolved")
+        invite["status"] = "ACCEPTED" if decision == "accept" else "DECLINED"
+        invite["updatedAtEpoch"] = now
+        room = _multiplayer_rooms.get(invite["roomId"])
+        if decision == "accept":
+            if not room:
+                abort(404, "room_not_found")
+            add_or_update_room_pilot(room, player["callsign"], "ALLY", "SIGNAL ACQUIRED")
+            room["lastSignal"] = f"{player['callsign']} SIGNAL ACQUIRED // P2P CARRIER NEXT"
+            room["updatedAt"] = stamp
+            room["updatedAtEpoch"] = now
+            public_room = multiplayer_public_room(room)
+        else:
+            if room:
+                add_or_update_room_pilot(room, player["callsign"], "ALLY", "TRACE DECLINED")
+                room["lastSignal"] = f"{player['callsign']} TRACE DECLINED"
+                room["updatedAt"] = stamp
+                room["updatedAtEpoch"] = now
+            public_room = multiplayer_public_room(room) if room else None
+        public_invite = multiplayer_public_invite(invite)
+    log_event(
+        "multiplayer.invite_responded",
+        "info",
+        player=player,
+        details={"invite_id": invite_id, "decision": decision},
+        persist=True,
+    )
+    return jsonify({"ok": True, "invite": public_invite, "room": public_room})
+
+
+@app.post("/api/multiplayer/signal")
+@require_csrf
+def multiplayer_signal_post():
+    # Identity-authorized WebRTC signaling mailbox. This endpoint carries only
+    # offer/answer/ICE/heartbeat envelopes; live gameplay belongs on the P2P
+    # DataChannel after PHOSPHOR LOCK. Payloads are size-limited and room-bound.
+    global _multiplayer_signal_seq
+    session_rate_limit("multiplayer_signal", MULTIPLAYER_SIGNAL_RATE_LIMIT_SECONDS)
+    player = require_callsign_player()
+    data = json_body()
+    room_id = str(data.get("roomId", ""))
+    signal_type = str(data.get("signalType", "")).strip().lower()
+    to_callsign = str(data.get("toCallsign", ""))
+    if signal_type not in {"offer", "answer", "ice", "heartbeat"}:
+        abort(400, "invalid_signal_type")
+    if not CALLSIGN_RE.fullmatch(to_callsign):
+        abort(400, "invalid_signal_target")
+    if to_callsign == player["callsign"]:
+        abort(400, "cannot_signal_self")
+    payload = sanitize_signal_payload(data.get("payload"))
+
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    with _multiplayer_lock:
+        cleanup_multiplayer_state(now)
+        room = require_room_member(room_id, player)
+        if to_callsign not in room_callsigns(room):
+            abort(403, "signal_target_not_in_room")
+        _multiplayer_signal_seq += 1
+        signal = {
+            "seq": _multiplayer_signal_seq,
+            "roomId": room_id,
+            "fromCallsign": player["callsign"],
+            "toCallsign": to_callsign,
+            "signalType": signal_type,
+            "payload": payload,
+            "createdAt": stamp,
+            "createdAtEpoch": now,
+        }
+        _multiplayer_signals.append(signal)
+        room["lastSignal"] = f"{player['callsign']} {signal_type.upper()} TRACE → {to_callsign}"
+        room["updatedAt"] = stamp
+        room["updatedAtEpoch"] = now
+        public_signal = multiplayer_public_signal(signal)
+    log_event(
+        "multiplayer.signal_posted",
+        "info",
+        player=player,
+        details={"room_id": room_id, "to_callsign": to_callsign, "signal_type": signal_type},
+        persist=False,
+    )
+    return jsonify({"ok": True, "signal": public_signal})
+
+
+@app.get("/api/multiplayer/signal")
+def multiplayer_signal_get():
+    player = require_callsign_player()
+    room_id = str(request.args.get("roomId", ""))
+    try:
+        since = int(request.args.get("since", "0"))
+    except ValueError:
+        abort(400, "invalid_signal_since")
+    if since < 0:
+        abort(400, "invalid_signal_since")
+    with _multiplayer_lock:
+        cleanup_multiplayer_state()
+        room = require_room_member(room_id, player)
+        inbox = [
+            multiplayer_public_signal(signal)
+            for signal in _multiplayer_signals
+            if signal.get("roomId") == room_id
+            and signal.get("toCallsign") == player["callsign"]
+            and int(signal.get("seq", 0)) > since
+        ]
+        latest_seq = max([since, *[int(signal.get("seq", since)) for signal in _multiplayer_signals if signal.get("roomId") == room_id]], default=since)
+        room["updatedAtEpoch"] = time.time()
+    return jsonify({"ok": True, "signals": inbox[-50:], "latestSeq": latest_seq})
 
 
 @app.get("/api/leaderboard")

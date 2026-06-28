@@ -125,6 +125,16 @@ You are not just dodging enemies in space. You are defending a metaphysical mach
 - Node awakening, fuel recovery, and shield regeneration
 - Expanding camera instead of screen wrap
 - Stylized vector-space combat with metaphysical sci-fi framing
+- Planned **Constellation Defense** multiplayer mode: callsign invites, P2P/WebRTC gameplay traffic, host-authoritative shared Sol defense, team/individual debriefs, and oscilloscope-native lobby/audio treatment. See `docs/MULTIPLAYER_SYSTEM.md`.
+
+
+## Multiplayer Design: Constellation Defense
+
+The multiplayer roadmap is documented in [`docs/MULTIPLAYER_SYSTEM.md`](docs/MULTIPLAYER_SYSTEM.md). The intended model is hybrid: the central Flask server handles identity, callsigns, rooms, invites, WebRTC signaling, configuration hashes, and leaderboards, while gameplay packets use peer-to-peer WebRTC DataChannels whenever possible. LAN play should get the lowest-latency direct route; remote play should attempt direct P2P before any relay fallback.
+
+Multiplayer must preserve the retro oscilloscope aesthetic. Rooms are defense channels, callsign invites are signal vectors, joins are signal locks, and remote pilots are dim phosphor traces rather than modern avatar markers. Gameplay HUD widgets should remain hidden until an active run begins so the front/title screen stays sparse.
+
+Current multiplayer status: UI/audio/remote-trace scaffolding, a lightweight Flask room/invite coordination layer, identity-checked WebRTC signal lock, live `pilot_trace` telemetry, host-authored `world_snapshot` packets, and an initial true shared-defense loop now exist. Accepted callsigns can negotiate a P2P DataChannel, exchange heartbeat/echo telemetry, see each other’s sphenic corsairs, and let the client send `pilot_input` packets to the host. The host uses authorized peer input to emit allied fire into the host simulation, steer enemies toward the nearest pilot trace, and broadcast shared enemy/sphere/Sol/team-score telemetry. Host-side contribution accounting now records per-pilot hits, kills, assists, awakenings, and scores from actual host-simulated bullet impacts; debriefs are labeled `P2P / UNVERIFIED` and include a team/pilot contribution lattice. The current stability pass adds carrier RTT/silence/drop telemetry, heartbeat-loss detection, stale-trace decay, outbound buffer guards, and smoothing/snap thresholds for remote pilots and host enemy contacts. This is still unranked P2P; relay fallback, multi-peer mesh/rooms beyond the first peer, stronger reconciliation, host migration, server persistence, and server verification remain future passes. ICE servers are empty by default for privacy/LAN testing; configure `MVF_MULTIPLAYER_ICE_SERVERS_JSON` for remote STUN/TURN routing.
 
 ## Tech Stack
 
