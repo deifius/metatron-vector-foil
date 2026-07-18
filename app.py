@@ -171,6 +171,38 @@ _multiplayer_invites: dict[str, dict[str, Any]] = {}
 _multiplayer_signals: list[dict[str, Any]] = []
 _multiplayer_signal_seq = 0
 
+_multiplayer_transport_signals: list[dict[str, Any]] = []
+_multiplayer_transport_signal_seq = 0
+MULTIPLAYER_TRANSPORT_SIGNAL_TYPES = {"offer", "answer", "ice"}
+
+
+def sanitize_transport_id(raw: Any, fallback: str) -> str:
+    value = str(raw or "").strip()
+    cleaned = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in value)[:40]
+    return cleaned or fallback
+
+
+def cleanup_multiplayer_transport_signals(now: float | None = None) -> None:
+    if now is None:
+        now = time.time()
+    _multiplayer_transport_signals[:] = [
+        signal for signal in _multiplayer_transport_signals
+        if now - float(signal.get("createdAtEpoch", now)) <= MULTIPLAYER_SIGNAL_TTL_SECONDS
+    ]
+
+
+def multiplayer_public_transport_signal(signal: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "seq": signal["seq"],
+        "roomId": signal["roomId"],
+        "fromPlayerId": signal["fromPlayerId"],
+        "toPlayerId": signal["toPlayerId"],
+        "signalType": signal["signalType"],
+        "payload": signal["payload"],
+        "createdAt": signal["createdAt"],
+    }
+
+
 
 def log_secret() -> bytes:
     configured = LOG_PEPPER or app.secret_key
@@ -957,6 +989,72 @@ def google_oauth_callback():
         persist=True,
     )
     return redirect(next_path, code=303)
+
+
+
+@app.post("/api/multiplayer/transport-signal")
+def multiplayer_transport_signal_send():
+    global _multiplayer_transport_signal_seq
+
+    data = request.get_json(silent=True) or {}
+    room_id = sanitize_transport_id(data.get("roomId"), "local")
+    from_player_id = sanitize_transport_id(data.get("fromPlayerId"), "unknown")
+    to_player_id = sanitize_transport_id(data.get("toPlayerId"), "host-0")
+    signal_type = str(data.get("signalType") or "").strip().lower()
+
+    if signal_type not in MULTIPLAYER_TRANSPORT_SIGNAL_TYPES:
+        abort(400, "invalid_transport_signal_type")
+
+    payload = data.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+
+    now = time.time()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    with _multiplayer_lock:
+        cleanup_multiplayer_transport_signals(now)
+        _multiplayer_transport_signal_seq += 1
+        signal = {
+            "seq": _multiplayer_transport_signal_seq,
+            "roomId": room_id,
+            "fromPlayerId": from_player_id,
+            "toPlayerId": to_player_id,
+            "signalType": signal_type,
+            "payload": payload,
+            "createdAt": stamp,
+            "createdAtEpoch": now,
+        }
+        _multiplayer_transport_signals.append(signal)
+
+    return jsonify({"ok": True, "seq": signal["seq"]})
+
+
+@app.get("/api/multiplayer/transport-signal")
+def multiplayer_transport_signal_poll():
+    room_id = sanitize_transport_id(request.args.get("roomId"), "local")
+    player_id = sanitize_transport_id(request.args.get("playerId"), "unknown")
+
+    try:
+        since = int(request.args.get("since", "0"))
+    except ValueError:
+        since = 0
+
+    with _multiplayer_lock:
+        cleanup_multiplayer_transport_signals()
+        matching = [
+            multiplayer_public_transport_signal(signal)
+            for signal in _multiplayer_transport_signals
+            if signal.get("roomId") == room_id
+            and signal.get("toPlayerId") == player_id
+            and int(signal.get("seq", 0)) > since
+        ]
+
+        latest_seq = max(
+            [since] + [int(signal.get("seq", 0)) for signal in matching]
+        )
+
+    return jsonify({"ok": True, "signals": matching, "latestSeq": latest_seq})
 
 
 @app.post("/api/client-events")

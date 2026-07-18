@@ -5,6 +5,46 @@ import { HUDState } from "./ui/hud/hudTypes";
 import { loadJson, loadTextLines } from "./data/textLoader";
 import { scoreForCitation, scoreForEnemy, scoreForPerfectWave, scoreForWaveClear } from "./config/scoring";
 import { getGamepadControlsHint, readGamepadShipInput } from "./config/gamepadControls";
+import {
+  debugLog,
+  debugWarn,
+  exportDebugBundle,
+  getFlightRecorderSessionId,
+  installFlightRecorderErrorCapture,
+  setFlightRecorderContext,
+} from "./config/debugFlightRecorder";
+import {
+  assignNextPlayerSlot,
+  assignPlayerSlot,
+  createPlayerRegistryWithLocal,
+  LOCAL_SOLO_PLAYER_ID,
+  markPlayerDestroyed,
+  markPlayerRespawned,
+  playerSlotSummary,
+  respawnPendingPlayers,
+  shouldEndRunForPlayerLoss,
+} from "./config/playerSlots";
+import type { MultiplayerRole, PlayerId, PlayerLifeState, PlayerSlotIndex } from "./config/playerSlots";
+import { MULTIPLAYER_NET_CONFIG } from "./config/multiplayerNetConfig";
+import {
+  acceptInputSequence,
+  acceptWorldSnapshot,
+  ackInputSeqByPlayer,
+  advanceAuthorityTick,
+  createAuthorityClock,
+  createEntityIdCounters,
+  logSnapshotHeartbeat,
+  makeAuthorityEntityId,
+  nextInputSequence,
+  resetAuthorityClock,
+  resetEntityIdCounters,
+  shouldLogSnapshotHeartbeat,
+  shouldPublishSnapshot,
+} from "./config/multiplayerAuthority";
+import { MULTIPLAYER_PROTOCOL_VERSION, isPeerLifecycleMessage, isPlayerInputMessage, isWorldSnapshotMessage } from "./config/multiplayerProtocol";
+import type { NetInputMessage, NetWorldSnapshot, PeerLifecycleMessage } from "./config/multiplayerProtocol";
+import { createMultiplayerTransport, detectMultiplayerTransportLaunch } from "./config/multiplayerTransport";
+import type { InboundTransportMessage, MultiplayerTransportHub } from "./config/multiplayerTransport";
 import { SCORE_THRESHOLDS } from "./config/thresholds";
 import type { CitationCategory, CommendationDefinition } from "./types/scoring";
 import {
@@ -189,9 +229,9 @@ function makePolyhedron(kind: SolidKind, r: number): PolyMesh {
 
 
 // ===================== GAME TYPES =====================
-type Bullet = { pos: V2; prevPos: V2; vel: V2; life: number; mass: number; origin: V2; firedAtMs: number; burstId: number };
+type Bullet = { id: string; ownerId: PlayerId; hostTick: number; pos: V2; prevPos: V2; vel: V2; life: number; mass: number; origin: V2; firedAtMs: number; burstId: number };
 type FuelBit = { pos: V2; vel: V2; life: number; hue: number; };
-type Shard = { pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
+type Shard = { id: string; sourceEnemyId?: string; hostTick: number; pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
 type OortCluster = {
   orbitRadius: number;
   orbitPhase: number;
@@ -322,6 +362,8 @@ function scoreAlertSeverity(tier: 1 | 2 | 3): HUDState["alert"]["severity"] {
 
 // ===================== WEB AUDIO (DRONES + SFX) =====================
 type GameMode = "menu" | "playing" | "paused" | "transition" | "debrief";
+type StartPanelId = "identity" | "multiplayer" | "flight";
+type StartPanelFocus = StartPanelId | null;
 
 
 
@@ -983,7 +1025,7 @@ export default function MetatronVectorFOIL() {
   // UI state
   const [mode, setMode] = useState<GameMode>("menu");
   const [levelIdx, setLevelIdx] = useState(0);
-  const [toggles, setToggles] = useState({ metatron: true, trails: true, debug: T.DEBUG_TEXT });
+  const [toggles, setToggles] = useState({ metatron: true, trails: false, debug: T.DEBUG_TEXT });
   const [hudState, setHUDState] = useState<HUDState>(DEFAULT_HUD_STATE);
   const [hudConfig, setHUDConfig] = useState(DEFAULT_HUD_CONFIG);
   const [flightHints, setFlightHints] = useState<string[]>(DEFAULT_FLIGHT_HINTS);
@@ -1005,6 +1047,7 @@ export default function MetatronVectorFOIL() {
   const [menuHintTick, setMenuHintTick] = useState(0);
   const [attractIdx, setAttractIdx] = useState(0);
   const [attractPhaseTick, setAttractPhaseTick] = useState(0);
+  const [startPanelFocus, setStartPanelFocus] = useState<StartPanelFocus>(null);
 
   const modeRef = useRef(mode);
   const levelIdxRef = useRef(levelIdx);
@@ -1027,6 +1070,25 @@ export default function MetatronVectorFOIL() {
   const audioRef = useRef(new AudioEngine());
   const keysRef = useRef(new Set<string>());
   const resetToMenuRef = useRef<(() => void) | null>(null);
+  const multiplayerTransportRef = useRef<MultiplayerTransportHub | null>(null);
+
+  useEffect(() => {
+    installFlightRecorderErrorCapture();
+    debugLog("lifecycle", "component-mounted", {
+      sessionId: getFlightRecorderSessionId(),
+      maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers,
+      snapshotHz: MULTIPLAYER_NET_CONFIG.snapshotHz,
+    });
+    return () => debugLog("lifecycle", "component-unmounted");
+  }, []);
+
+  useEffect(() => {
+    setFlightRecorderContext({
+      role: "solo",
+      playerId: LOCAL_SOLO_PLAYER_ID,
+      callsign: playerIdentity.callsign ?? null,
+    });
+  }, [playerIdentity.callsign]);
 
   // Keep slider values available inside the loop without rerenders
   const slidersRef = useRef(sliders);
@@ -1051,6 +1113,10 @@ export default function MetatronVectorFOIL() {
       setLeaderboard(board.entries ?? []);
     } catch (err) {
       setLeaderboard([]);
+      debugWarn("network", "leaderboard-refresh-failed", {
+        endpoint: "/api/leaderboard",
+        message: err instanceof Error ? err.message : "unknown",
+      });
       void logClientEvent(csrfTokenRef.current, "client.api_error", "warning", {
         endpoint: "/api/leaderboard",
         message: err instanceof Error ? err.message : "unknown",
@@ -1070,12 +1136,17 @@ export default function MetatronVectorFOIL() {
       setCallsignMessage(callsignStatusMessage(status.player ?? DEFAULT_PLAYER));
       if (!clientStartupLoggedRef.current) {
         clientStartupLoggedRef.current = true;
+        debugLog("lifecycle", "client-startup", {
+          authProvider: status.player?.authProvider ?? "none",
+          hasCallsign: Boolean(status.player?.callsign),
+        });
         void logClientEvent(status.csrfToken, "client.startup", "info", {
           authProvider: status.player?.authProvider ?? "none",
           hasCallsign: Boolean(status.player?.callsign),
         });
       }
-    } catch {
+    } catch (err) {
+      debugWarn("network", "security-status-unavailable", { message: err instanceof Error ? err.message : "unknown" });
       setCallsignMessage("Identity bus unavailable; local flight still works.");
     }
   };
@@ -1117,6 +1188,11 @@ export default function MetatronVectorFOIL() {
       })
       .catch((err) => {
         setScoreSubmitStatus("error");
+        debugWarn("network", "score-submission-failed", {
+          message: err instanceof Error ? err.message : "unknown",
+          score: snapshot.score,
+          wave: snapshot.wave,
+        });
         void logClientEvent(token, "client.score_submission_error", "warning", {
           message: err instanceof Error ? err.message : "unknown",
           score: snapshot.score,
@@ -1358,6 +1434,18 @@ export default function MetatronVectorFOIL() {
     const keys = keysRef.current;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === " ") e.preventDefault();
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        const filename = exportDebugBundle({
+          trigger: "hotkey",
+          mode: modeRef.current,
+          levelIdx: levelIdxRef.current,
+          toggles: togglesRef.current,
+          transport: multiplayerTransportRef.current?.getState() ?? null,
+        });
+        debugLog("lifecycle", "debug-export-complete", { trigger: "hotkey", filename });
+        return;
+      }
       // Audio unlock on first interaction
       audioRef.current.init();
 
@@ -1434,6 +1522,37 @@ export default function MetatronVectorFOIL() {
     };
 
     let shipBrakeInput = 0;
+    const transportLaunch = detectMultiplayerTransportLaunch();
+    const playerSlots = createPlayerRegistryWithLocal(
+      transportLaunch.localPlayerId,
+      transportLaunch.role,
+      playerIdentityRef.current.callsign,
+      transportLaunch.requestedSlot,
+    );
+    const authorityMode = transportLaunch.role === "host"
+      ? "host"
+      : transportLaunch.role === "guest"
+        ? "client-mirror"
+        : "solo-authority";
+    const transport = createMultiplayerTransport(transportLaunch);
+    multiplayerTransportRef.current = transport;
+    setFlightRecorderContext({
+      role: transportLaunch.role,
+      playerId: transportLaunch.localPlayerId,
+      callsign: playerIdentityRef.current.callsign ?? null,
+    });
+    debugLog("player", "player-registry-initialized", {
+      players: playerSlots.map((slot) => ({ id: slot.id, slot: slot.slot, role: slot.role, lifeState: slot.lifeState })),
+      maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers,
+      transportRole: transportLaunch.role,
+      roomId: transportLaunch.roomId,
+    });
+
+    const authorityClock = createAuthorityClock(authorityMode);
+    const entityIdCounters = createEntityIdCounters();
+    let lastLocalInputSeq = 0;
+    const remotePlayerMirrors: Record<PlayerId, { x: number; y: number; vx: number; vy: number; angle: number; angularVelocity: number; fuel: number; hitsTaken: number; lastInputSeq: number }> = {};
+    const remoteGunCooldowns: Record<PlayerId, number> = {};
 
     const bullets: Bullet[] = [];
     const enemies: Enemy[] = [];
@@ -1596,19 +1715,57 @@ export default function MetatronVectorFOIL() {
       publishDebriefUI();
     };
 
+    const slotSpawnAngle = (slot?: PlayerSlotIndex | null) => {
+      const safeSlot = slot === 1 || slot === 2 || slot === 3 ? slot : 0;
+      return safeSlot * Math.PI * 0.5;
+    };
+
+    const slotSpawnState = (slot?: PlayerSlotIndex | null, tangentialSpeed = 0) => {
+      const angle = slotSpawnAngle(slot);
+      const pos = V2.fromAngle(angle, metaRadius);
+      const vel = V2.fromAngle(angle + Math.PI * 0.5, tangentialSpeed);
+      const shipAngle = Math.atan2(vel.y, vel.x);
+      return { pos, vel, angle: shipAngle };
+    };
+
+    const applyLocalSlotSpawn = (tangentialSpeed: number) => {
+      const spawn = slotSpawnState(playerSlots[0]?.slot ?? transportLaunch.requestedSlot ?? 0, tangentialSpeed);
+      player.pos = spawn.pos;
+      player.vel = spawn.vel;
+      player.angle = spawn.angle;
+    };
+
+    const seedRemoteMirrorSpawn = (slot: { id: PlayerId; slot: PlayerSlotIndex }) => {
+      if (remotePlayerMirrors[slot.id]) return;
+      const spawn = slotSpawnState(slot.slot, 0);
+      remotePlayerMirrors[slot.id] = {
+        x: spawn.pos.x,
+        y: spawn.pos.y,
+        vx: spawn.vel.x,
+        vy: spawn.vel.y,
+        angle: spawn.angle,
+        angularVelocity: 0,
+        fuel: T.FUEL_MAX,
+        hitsTaken: 0,
+        lastInputSeq: 0,
+      };
+    };
+
     const resetRun = (toMenu = false) => {
+      debugLog("lifecycle", "run-reset", { toMenu, previousMode: modeRef.current, wave: getLevel(levelIdxRef.current).wave });
       bullets.length = 0; enemies.length = 0; shards.length = 0; fuelBits.length = 0; trail.length = 0;
+      resetAuthorityClock(authorityClock, authorityMode);
+      resetEntityIdCounters(entityIdCounters);
+      lastLocalInputSeq = 0;
       for (const c of oortClusters) {
         c.brokenUntil = 0;
         c.pulseUntil = 0;
       }
       resetMetaNodes();
-      player.pos = new V2(metaRadius, 0);
       // orbit init
       const gm = slidersRef.current.gravity;
       const v0 = Math.sqrt((gm) / metaRadius) * T.ORBIT_GAIN;
-      player.vel = new V2(0, v0);
-      player.angle = Math.atan2(player.vel.y, player.vel.x);
+      applyLocalSlotSpawn(v0);
       player.angularVel = 0;
       player.thrust = 0;
       shipBrakeInput = 0;
@@ -1619,6 +1776,8 @@ export default function MetatronVectorFOIL() {
       player.stuckTime = 0;
       player.hitsTaken = 0;
       player.hitInvuln = 0;
+      markPlayerRespawned(playerSlots[0]);
+      debugLog("player", "player-respawned", { playerId: playerSlots[0]?.id, slot: playerSlots[0]?.slot, reason: "run-reset", authorityTick: authorityClock.tick });
       gunCD = 0;
       nextEnemyId = 1;
       metaAx = 0; metaAy = 0; metaAz = 0; metaPulseClock = 0;
@@ -1660,6 +1819,37 @@ export default function MetatronVectorFOIL() {
       setMode(nextMode);
     };
     resetToMenuRef.current = () => resetRun(true);
+
+    const respawnPendingPlayersAtWaveBoundary = () => {
+      const pending = respawnPendingPlayers(playerSlots);
+      if (pending.length <= 0) return;
+      const localPlayerId = playerSlots[0]?.id;
+      for (const slot of pending) {
+        markPlayerRespawned(slot);
+        debugLog("player", "player-respawned", {
+          playerId: slot.id,
+          slot: slot.slot,
+          reason: "wave-boundary",
+          authorityTick: authorityClock.tick,
+        });
+      }
+      if (localPlayerId && pending.some((slot) => slot.id === localPlayerId)) {
+        const gm = slidersRef.current.gravity;
+        const v0 = Math.sqrt(gm / metaRadius) * T.ORBIT_GAIN;
+        applyLocalSlotSpawn(v0);
+        player.angularVel = 0;
+        player.thrust = 0;
+        shipBrakeInput = 0;
+        player.brakeAnim = 0;
+        player.thrustGlow = 0;
+        player.inActivatedSphere = false;
+        player.fuel = T.FUEL_MAX;
+        player.stuckTime = 0;
+        player.hitsTaken = 0;
+        player.hitInvuln = T.SHIP_HIT_IFRAME_SEC * 2;
+        trail.length = 0;
+      }
+    };
 
     // helpers
     const gravityAt = (p: V2, gm: number) => {
@@ -1703,12 +1893,41 @@ export default function MetatronVectorFOIL() {
       return out.mul(k * press).add(tang.mul(k * tangAmt));
     };
 
-    const makeBullet = (burstId: number) => {
-      const muzzle = V2.fromAngle(player.angle, 18);
-      const pos = player.pos.copy().add(muzzle);
-      const vel = V2.fromAngle(player.angle, T.BULLET_SPEED).add(player.vel.copy());
-      return { pos, prevPos: pos.copy(), vel, life: T.BULLET_LIFE, mass: T.BULLET_MASS, origin: pos.copy(), firedAtMs: runClockMs, burstId };
+    const makeBulletFromState = (burstId: number, ownerId: PlayerId, shipState: { pos: V2; vel: V2; angle: number }) => {
+      const muzzle = V2.fromAngle(shipState.angle, 18);
+      const pos = shipState.pos.copy().add(muzzle);
+      const vel = V2.fromAngle(shipState.angle, T.BULLET_SPEED).add(shipState.vel.copy());
+      const id = makeAuthorityEntityId("projectile", entityIdCounters, authorityClock.tick, ownerId);
+      const bullet = {
+        id,
+        ownerId,
+        hostTick: authorityClock.tick,
+        pos,
+        prevPos: pos.copy(),
+        vel,
+        life: T.BULLET_LIFE,
+        mass: T.BULLET_MASS,
+        origin: pos.copy(),
+        firedAtMs: runClockMs,
+        burstId,
+      };
+      debugLog("projectile", "projectile-created", {
+        id,
+        ownerId,
+        burstId,
+        authorityTick: authorityClock.tick,
+        x: pos.x,
+        y: pos.y,
+        vx: vel.x,
+        vy: vel.y,
+        mass: T.BULLET_MASS,
+      });
+      return bullet;
     };
+
+    const makeBullet = (burstId: number, ownerId: PlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID) => (
+      makeBulletFromState(burstId, ownerId, { pos: player.pos, vel: player.vel, angle: player.angle })
+    );
 
     const spawnEnemy = (kind: SolidKind, waveIdx: number, index: number, total: number) => {
       const baseAngle = rand(0, TAU);
@@ -1743,6 +1962,7 @@ export default function MetatronVectorFOIL() {
       const lvl = getLevel(waveIdx);
       enemies.length = 0;
       resetWaveFlags();
+      debugLog("wave", "wave-started", { waveIdx, wave: lvl.wave, enemyKind: lvl.enemyKind, enemyCount: lvl.enemyCount });
       for (let i = 0; i < lvl.enemyCount; i++) {
         enemies.push(spawnEnemy(lvl.enemyKind, waveIdx, i, lvl.enemyCount));
       }
@@ -1866,13 +2086,27 @@ export default function MetatronVectorFOIL() {
 
       const kindFactor: Record<SolidKind, number> = { tetra: 0.6, cube: 0.78, octa: 0.88, dodeca: 1.0, icosa: 1.12 };
       const N = Math.max(3, ((rand(T.SHRAPNEL_COUNT_MIN, T.SHRAPNEL_COUNT_MAX + 1) * kindFactor[e.kind]) | 0));
+      const firstShardId = makeAuthorityEntityId("shrapnel", entityIdCounters, authorityClock.tick, e.id);
+      debugLog("shrapnel", "shrapnel-spawned", {
+        sourceEnemyId: e.id,
+        sourceKind: e.kind,
+        count: N,
+        firstShardId,
+        authorityTick: authorityClock.tick,
+        x: origin.x,
+        y: origin.y,
+      });
       for (let k = 0; k < N; k++) {
         const jitter = rand(-Math.PI / 6, Math.PI / 6);
         const dj = dir.copy().rot(jitter).norm();
         const sp = rand(T.SHRAPNEL_SPEED_MIN, T.SHRAPNEL_SPEED_MAX);
         const v = dj.copy().mul(sp).add(e.vel.copy().mul(T.SHRAPNEL_PARENT_VEL));
         const life0 = rand(T.SHRAPNEL_LIFE_MIN, T.SHRAPNEL_LIFE_MAX);
+        const id = k === 0 ? firstShardId : makeAuthorityEntityId("shrapnel", entityIdCounters, authorityClock.tick, e.id);
         shards.push({
+          id,
+          sourceEnemyId: e.id,
+          hostTick: authorityClock.tick,
           pos: origin.copy().add(dj.copy().mul(rand(0.2, 2.4))),
           vel: v,
           life: life0,
@@ -1912,6 +2146,12 @@ export default function MetatronVectorFOIL() {
 
     const enterDebrief = (causeKey: DeathCauseKey) => {
       debriefSnapshot = buildDebriefSnapshot(causeKey);
+      debugLog("lifecycle", "debrief-entered", {
+        causeKey,
+        score: debriefSnapshot.score,
+        wave: debriefSnapshot.wave,
+        survivalTimeSec: debriefSnapshot.survivalTimeSec,
+      });
       submitScoreRef.current(debriefSnapshot);
       debriefVisibleRows = 0;
       debriefPublishAccumulator = 0;
@@ -1933,8 +2173,31 @@ export default function MetatronVectorFOIL() {
     };
 
     const loseRun = (reason: "ship" | "sol" = "ship", causeKey: DeathCauseKey = reason === "sol" ? "sol" : "enemy") => {
+      debugWarn(reason === "sol" ? "wave" : "player", reason === "sol" ? "sol-destroyed" : "player-destroyed", {
+        reason,
+        causeKey,
+        playerId: playerSlots[0]?.id,
+        wave: getLevel(levelIdxRef.current).wave,
+        hitsTaken: player.hitsTaken,
+      });
+      if (reason === "ship") {
+        markPlayerDestroyed(playerSlots[0]);
+        debugLog("player", "player-registry-after-destruction", {
+          players: playerSlotSummary(playerSlots),
+          allPlayersDown: shouldEndRunForPlayerLoss(playerSlots),
+          authorityTick: authorityClock.tick,
+        });
+      }
       if (reason === "sol") audioRef.current.solDestroyed();
       else audioRef.current.shipDestroyed();
+      if (reason === "ship" && !shouldEndRunForPlayerLoss(playerSlots)) {
+        debugWarn("player", "local-player-destroyed-world-continues", {
+          playerId: playerSlots[0]?.id,
+          alivePlayers: playerSlots.filter((slot) => slot.connected && slot.lifeState === "alive").length,
+          authorityTick: authorityClock.tick,
+        });
+        return;
+      }
       enterDebrief(causeKey);
     };
 
@@ -1953,6 +2216,18 @@ export default function MetatronVectorFOIL() {
       player.hitsTaken += appliedDamage;
       player.hitInvuln = T.SHIP_HIT_IFRAME_SEC;
       waveDamageTaken += appliedDamage;
+      debugWarn("collision", "player-hit", {
+        playerId: playerSlots[0]?.id,
+        causeKey,
+        damage: appliedDamage,
+        hitsTaken: player.hitsTaken,
+        resilience: T.SHIP_RESILIENCE,
+        x: player.pos.x,
+        y: player.pos.y,
+        sourceX: sourcePos?.x,
+        sourceY: sourcePos?.y,
+        authorityTick: authorityClock.tick,
+      });
       chainMultiplier = Math.max(1, chainMultiplier - SCORE_THRESHOLDS.chainDamagePenalty);
 
       if (sourcePos) {
@@ -2010,6 +2285,34 @@ export default function MetatronVectorFOIL() {
     let topCitationTier = 0;
     let topCitationScore = 0;
     let waveFlags: WaveCitationFlags = { oortReach: false, farOortReach: false, returnToTheBurn: false, periapsisKiss: false };
+    let lastJoinRequestSentMs = -Infinity;
+    let localJoinAccepted = transportLaunch.role !== "guest";
+
+    const makePeerLifecycleMessage = (event: PeerLifecycleMessage["event"], playerId: PlayerId, slot = playerSlots[0]?.slot, reason?: string): PeerLifecycleMessage => ({
+      type: "peer-lifecycle",
+      protocolVersion: MULTIPLAYER_PROTOCOL_VERSION,
+      event,
+      playerId,
+      slot,
+      callsign: playerIdentityRef.current.callsign ?? null,
+      reason,
+      serverTimeMs: Date.now(),
+    });
+
+    const sendGuestJoinRequest = (force = false) => {
+      if (transportLaunch.role !== "guest") return;
+      if (!force && runClockMs - lastJoinRequestSentMs < 1000) return;
+      lastJoinRequestSentMs = runClockMs;
+      const localId = playerSlots[0]?.id ?? transportLaunch.localPlayerId;
+      const message = makePeerLifecycleMessage("join-request", localId, transportLaunch.requestedSlot ?? playerSlots[0]?.slot);
+      const sent = transport.sendLifecycleToHost(message);
+      debugLog("network", "join-request-sent", {
+        playerId: localId,
+        requestedSlot: message.slot,
+        sent,
+        roomId: transportLaunch.roomId,
+      }, "debug");
+    };
 
     const resetWaveFlags = () => {
       waveFlags = { oortReach: false, farOortReach: false, returnToTheBurn: false, periapsisKiss: false };
@@ -2021,6 +2324,7 @@ export default function MetatronVectorFOIL() {
 
     // initial setup lands on the title / insert coin screen
     resetRun(true);
+    sendGuestJoinRequest(true);
     syncMetaNodeWorldPositions();
 
     const getCommendation = (id: string) => commendationMapRef.current[id] ?? DEFAULT_COMMENDATIONS.find((item) => item.id === id);
@@ -2203,6 +2507,12 @@ export default function MetatronVectorFOIL() {
           const tang = s.pos.copy().norm().rot(Math.PI / 2);
           const vel = tang.mul(rand(35, 85)); // gentle drift around the ring
           fuelBits.push({ pos: s.pos.copy(), vel, life: rand(9, 18), hue: s.hue });
+          debugLog("shrapnel", "shrapnel-destroyed", {
+            id: s.id,
+            sourceEnemyId: s.sourceEnemyId,
+            reason: "settled-to-fuel",
+            authorityTick: authorityClock.tick,
+          }, "debug");
           shards.splice(i, 1);
         }
       }
@@ -2387,10 +2697,388 @@ export default function MetatronVectorFOIL() {
 
           if (cleared) {
             breakOortCluster(c, timeSec);
+            debugLog("projectile", "projectile-destroyed", {
+              id: b.id,
+              ownerId: b.ownerId,
+              reason: "oort-impact",
+              authorityTick: authorityClock.tick,
+            }, "debug");
             resolveBurst(b.burstId, false);
             bullets.splice(bi, 1);
             break;
           }
+        }
+      }
+    };
+
+    const buildAuthoritySnapshot = (): NetWorldSnapshot => {
+      const localSlot = playerSlots[0];
+      const players = playerSlots.map((slot) => ({
+        id: slot.id,
+        slot: slot.slot,
+        callsign: slot.callsign ?? null,
+        alive: slot.lifeState === "alive",
+        respawnPending: slot.lifeState === "respawn-pending",
+        x: slot.id === localSlot?.id ? player.pos.x : (remotePlayerMirrors[slot.id]?.x ?? 0),
+        y: slot.id === localSlot?.id ? player.pos.y : (remotePlayerMirrors[slot.id]?.y ?? 0),
+        vx: slot.id === localSlot?.id ? player.vel.x : (remotePlayerMirrors[slot.id]?.vx ?? 0),
+        vy: slot.id === localSlot?.id ? player.vel.y : (remotePlayerMirrors[slot.id]?.vy ?? 0),
+        angle: slot.id === localSlot?.id ? player.angle : (remotePlayerMirrors[slot.id]?.angle ?? 0),
+        angularVelocity: slot.id === localSlot?.id ? player.angularVel : (remotePlayerMirrors[slot.id]?.angularVelocity ?? 0),
+        fuel: slot.id === localSlot?.id ? player.fuel : (remotePlayerMirrors[slot.id]?.fuel ?? 0),
+        hitsTaken: slot.id === localSlot?.id ? player.hitsTaken : (remotePlayerMirrors[slot.id]?.hitsTaken ?? 0),
+        lastInputSeq: slot.lastInputSeq,
+      }));
+
+      return {
+        type: "world-snapshot",
+        protocolVersion: MULTIPLAYER_PROTOCOL_VERSION,
+        authorityRole: authorityClock.mode === "solo-authority" ? "solo" : authorityClock.mode === "host" ? "host" : "guest",
+        tick: authorityClock.tick,
+        serverTimeMs: Date.now(),
+        players,
+        enemies: enemies.map((e) => ({
+          id: e.id,
+          kind: e.kind,
+          x: e.pos.x,
+          y: e.pos.y,
+          vx: e.vel.x,
+          vy: e.vel.y,
+          morphing: e.morphing,
+          nextKind: e.nextKind,
+        })),
+        projectiles: bullets.map((b) => ({
+          id: b.id,
+          ownerId: b.ownerId,
+          hostTick: b.hostTick,
+          x: b.pos.x,
+          y: b.pos.y,
+          vx: b.vel.x,
+          vy: b.vel.y,
+          ageMs: Math.max(0, runClockMs - b.firedAtMs),
+          kind: "blaster",
+        })),
+        shrapnel: shards.map((s) => ({
+          id: s.id,
+          sourceEnemyId: s.sourceEnemyId,
+          hostTick: s.hostTick,
+          x: s.pos.x,
+          y: s.pos.y,
+          vx: s.vel.x,
+          vy: s.vel.y,
+          lifeMs: Math.max(0, s.life * 1000),
+          size: s.size,
+          hue: s.hue,
+        })),
+        wave: getLevel(levelIdxRef.current).wave,
+        score: Math.round(score),
+        solIntegrity: 1,
+        ackInputSeqByPlayer: ackInputSeqByPlayer(authorityClock),
+      };
+    };
+
+    const ensureRemoteSlot = (playerId: PlayerId, callsign?: string | null, preferredSlot?: number | null) => {
+      let slot = playerSlots.find((candidate) => candidate.id === playerId) ?? null;
+      if (slot) {
+        slot.connected = true;
+        if (callsign !== undefined) slot.callsign = callsign;
+        seedRemoteMirrorSpawn(slot);
+        return slot;
+      }
+      const safePreferredSlot = preferredSlot === 0 || preferredSlot === 1 || preferredSlot === 2 || preferredSlot === 3
+        ? preferredSlot
+        : null;
+      slot = assignPlayerSlot(playerSlots, playerId, "guest", callsign, safePreferredSlot);
+      if (!slot) {
+        debugWarn("network", "join-denied-no-slot", { playerId, preferredSlot, maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers });
+        return null;
+      }
+      seedRemoteMirrorSpawn(slot);
+      debugLog("network", "remote-player-slot-assigned", { playerId, slot: slot.slot, preferredSlot, players: playerSlotSummary(playerSlots) });
+      return slot;
+    };
+
+    const mirrorRemoteInputTelemetry = (input: NetInputMessage) => {
+      if (
+        typeof input.x !== "number" || typeof input.y !== "number" ||
+        typeof input.vx !== "number" || typeof input.vy !== "number" ||
+        typeof input.angle !== "number"
+      ) return;
+      remotePlayerMirrors[input.playerId] = {
+        x: input.x,
+        y: input.y,
+        vx: input.vx,
+        vy: input.vy,
+        angle: input.angle,
+        angularVelocity: typeof input.angularVelocity === "number" ? input.angularVelocity : 0,
+        fuel: remotePlayerMirrors[input.playerId]?.fuel ?? T.FUEL_MAX,
+        hitsTaken: remotePlayerMirrors[input.playerId]?.hitsTaken ?? 0,
+        lastInputSeq: input.seq,
+      };
+    };
+
+    const maybeFireRemoteProjectile = (input: NetInputMessage) => {
+      if (!input.firePressed) return;
+      if ((remoteGunCooldowns[input.playerId] ?? 0) > 0) return;
+      const mirror = remotePlayerMirrors[input.playerId];
+      if (!mirror) {
+        debugWarn("projectile", "remote-fire-without-telemetry", { playerId: input.playerId, seq: input.seq, authorityTick: authorityClock.tick });
+        return;
+      }
+      const burstId = currentBurstId++;
+      bullets.push(makeBulletFromState(burstId, input.playerId, {
+        pos: new V2(mirror.x, mirror.y),
+        vel: new V2(mirror.vx, mirror.vy),
+        angle: mirror.angle,
+      }));
+      remoteGunCooldowns[input.playerId] = T.FIRE_RATE;
+      audioRef.current.shoot();
+      debugLog("projectile", "remote-projectile-authorized", {
+        playerId: input.playerId,
+        seq: input.seq,
+        burstId,
+        authorityTick: authorityClock.tick,
+      });
+    };
+
+    const applyAuthoritySnapshot = (snapshot: NetWorldSnapshot, inbound: InboundTransportMessage) => {
+      if (!acceptWorldSnapshot(authorityClock, snapshot)) return;
+      const localPlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
+      const localNetPlayer = snapshot.players.find((candidate) => candidate.id === localPlayerId);
+      if (localNetPlayer) {
+        localJoinAccepted = true;
+        const before = player.pos.copy();
+        player.pos = new V2(localNetPlayer.x, localNetPlayer.y);
+        player.vel = new V2(localNetPlayer.vx, localNetPlayer.vy);
+        player.angle = localNetPlayer.angle;
+        player.angularVel = localNetPlayer.angularVelocity;
+        player.fuel = localNetPlayer.fuel;
+        player.hitsTaken = localNetPlayer.hitsTaken;
+        const correction = before.sub(player.pos).len();
+        if (correction > MULTIPLAYER_NET_CONFIG.largeCorrectionWarnDistance) {
+          debugWarn("snapshot", "large-player-correction", {
+            playerId: localPlayerId,
+            correction,
+            tick: snapshot.tick,
+            via: inbound.via,
+          });
+        }
+      }
+      for (const netPlayer of snapshot.players) {
+        const existing = playerSlots.find((slot) => slot.id === netPlayer.id) ?? assignNextPlayerSlot(playerSlots, netPlayer.id, netPlayer.id === localPlayerId ? transportLaunch.role : "guest", netPlayer.callsign ?? null);
+        if (existing) {
+          existing.slot = netPlayer.slot;
+          existing.connected = true;
+          existing.lifeState = netPlayer.alive ? "alive" : netPlayer.respawnPending ? "respawn-pending" : "dead";
+          existing.lastInputSeq = netPlayer.lastInputSeq;
+          existing.callsign = netPlayer.callsign ?? existing.callsign;
+        }
+        if (netPlayer.id !== localPlayerId) {
+          remotePlayerMirrors[netPlayer.id] = {
+            x: netPlayer.x,
+            y: netPlayer.y,
+            vx: netPlayer.vx,
+            vy: netPlayer.vy,
+            angle: netPlayer.angle,
+            angularVelocity: netPlayer.angularVelocity,
+            fuel: netPlayer.fuel,
+            hitsTaken: netPlayer.hitsTaken,
+            lastInputSeq: netPlayer.lastInputSeq,
+          };
+        }
+      }
+
+      const incomingEnemies = new Map(snapshot.enemies.map((enemy) => [enemy.id, enemy]));
+      for (let i = enemies.length - 1; i >= 0; i--) {
+        if (!incomingEnemies.has(enemies[i].id)) enemies.splice(i, 1);
+      }
+      for (const netEnemy of snapshot.enemies) {
+        let enemy = enemies.find((candidate) => candidate.id === netEnemy.id);
+        if (!enemy) {
+          enemy = {
+            id: netEnemy.id,
+            pos: new V2(netEnemy.x, netEnemy.y),
+            vel: new V2(netEnemy.vx, netEnemy.vy),
+            ax: 0,
+            ay: 0,
+            az: 0,
+            r: 16,
+            hue: 210,
+            kind: netEnemy.kind,
+            mesh: makePolyhedron(netEnemy.kind, 16),
+            morphing: netEnemy.morphing,
+            morph: netEnemy.morphing ? 0.5 : 0,
+            nextKind: netEnemy.nextKind,
+          };
+          enemies.push(enemy);
+        }
+        enemy.pos = new V2(netEnemy.x, netEnemy.y);
+        enemy.vel = new V2(netEnemy.vx, netEnemy.vy);
+        if (enemy.kind !== netEnemy.kind) {
+          enemy.kind = netEnemy.kind;
+          enemy.mesh = makePolyhedron(netEnemy.kind, enemy.r);
+        }
+        enemy.morphing = netEnemy.morphing;
+        enemy.nextKind = netEnemy.nextKind;
+      }
+
+      bullets.length = 0;
+      for (const projectile of snapshot.projectiles) {
+        const pos = new V2(projectile.x, projectile.y);
+        bullets.push({
+          id: projectile.id,
+          ownerId: projectile.ownerId,
+          hostTick: projectile.hostTick ?? snapshot.tick,
+          pos,
+          prevPos: pos.copy(),
+          vel: new V2(projectile.vx, projectile.vy),
+          life: Math.max(0.02, T.BULLET_LIFE - projectile.ageMs / 1000),
+          mass: T.BULLET_MASS,
+          origin: pos.copy(),
+          firedAtMs: runClockMs - projectile.ageMs,
+          burstId: 0,
+        });
+      }
+
+      shards.length = 0;
+      for (const fragment of snapshot.shrapnel) {
+        const life = Math.max(0.02, fragment.lifeMs / 1000);
+        shards.push({
+          id: fragment.id,
+          sourceEnemyId: fragment.sourceEnemyId,
+          hostTick: fragment.hostTick ?? snapshot.tick,
+          pos: new V2(fragment.x, fragment.y),
+          vel: new V2(fragment.vx, fragment.vy),
+          life,
+          life0: life,
+          hue: fragment.hue ?? 210,
+          size: fragment.size,
+          ang: 0,
+          spin: 0,
+        });
+      }
+
+      score = snapshot.score;
+      const nextLevelIdx = Math.max(0, snapshot.wave - 1);
+      if (nextLevelIdx !== levelIdxRef.current) {
+        levelIdxRef.current = nextLevelIdx;
+        setLevelIdx(nextLevelIdx);
+      }
+      debugLog("snapshot", "snapshot-applied", {
+        tick: snapshot.tick,
+        via: inbound.via,
+        players: snapshot.players.length,
+        enemies: snapshot.enemies.length,
+        projectiles: snapshot.projectiles.length,
+        shrapnel: snapshot.shrapnel.length,
+      }, "debug");
+    };
+
+    const handlePeerLifecycleMessage = (message: PeerLifecycleMessage, inbound: InboundTransportMessage) => {
+      const messagePlayerId = message.playerId ?? inbound.fromPlayerId;
+      if (!messagePlayerId) return;
+
+      if (authorityClock.mode === "host") {
+        if (message.event === "join-request") {
+          const slot = ensureRemoteSlot(messagePlayerId, message.callsign ?? null, message.slot ?? null);
+          if (!slot) {
+            transport.sendLifecycleToPeer(messagePlayerId, makePeerLifecycleMessage("join-denied", messagePlayerId, undefined, "room-full"));
+            return;
+          }
+          const accepted = makePeerLifecycleMessage("join-accepted", messagePlayerId, slot.slot);
+          const sent = transport.sendLifecycleToPeer(messagePlayerId, accepted);
+          debugLog("network", "join-accepted", {
+            playerId: messagePlayerId,
+            slot: slot.slot,
+            requestedSlot: message.slot,
+            sent,
+            via: inbound.via,
+            players: playerSlotSummary(playerSlots),
+          });
+          return;
+        }
+        if (message.event === "peer-left") {
+          const slot = playerSlots.find((candidate) => candidate.id === messagePlayerId);
+          if (slot) {
+            slot.connected = false;
+            slot.lifeState = "disconnected";
+            debugWarn("network", "peer-left", { playerId: messagePlayerId, slot: slot.slot, via: inbound.via });
+          }
+          return;
+        }
+      }
+
+      if (authorityClock.mode === "client-mirror") {
+        const localId = playerSlots[0]?.id ?? transportLaunch.localPlayerId;
+        if (messagePlayerId !== localId) return;
+        if (message.event === "join-accepted") {
+          localJoinAccepted = true;
+          if (playerSlots[0] && message.slot !== undefined) playerSlots[0].slot = message.slot;
+          debugLog("network", "join-accepted-received", {
+            playerId: localId,
+            slot: message.slot,
+            via: inbound.via,
+            roomId: transportLaunch.roomId,
+          });
+          return;
+        }
+        if (message.event === "join-denied") {
+          debugWarn("network", "join-denied-received", {
+            playerId: localId,
+            reason: message.reason,
+            via: inbound.via,
+            roomId: transportLaunch.roomId,
+          });
+        }
+      }
+    };
+
+    const handleInboundTransportMessages = () => {
+      const inbound = transport.drainInboundMessages();
+      if (inbound.length <= 0) return;
+      for (const item of inbound) {
+        const message = item.message;
+        if (isPeerLifecycleMessage(message)) {
+          handlePeerLifecycleMessage(message, item);
+          continue;
+        }
+        if (isPlayerInputMessage(message)) {
+          if (authorityClock.mode !== "host") continue;
+          const slot = ensureRemoteSlot(message.playerId);
+          if (!slot) continue;
+          if (!acceptInputSequence(authorityClock, message)) continue;
+          slot.lastInputSeq = message.seq;
+          mirrorRemoteInputTelemetry(message);
+          maybeFireRemoteProjectile(message);
+          debugLog("input", "remote-input-accepted", {
+            playerId: message.playerId,
+            seq: message.seq,
+            rotate: message.rotate,
+            thrust: message.thrust,
+            brake: message.brake,
+            firePressed: message.firePressed,
+            via: item.via,
+            authorityTick: authorityClock.tick,
+          }, "debug");
+          continue;
+        }
+        if (isWorldSnapshotMessage(message)) {
+          if (authorityClock.mode === "client-mirror") applyAuthoritySnapshot(message, item);
+          continue;
+        }
+      }
+    };
+
+    const publishAuthoritySnapshotIfDue = (dt: number) => {
+      const shouldPublish = shouldPublishSnapshot(authorityClock, dt, MULTIPLAYER_NET_CONFIG.snapshotHz);
+      const shouldHeartbeat = shouldLogSnapshotHeartbeat(authorityClock, dt);
+      if (!shouldPublish && !shouldHeartbeat) return;
+      const snapshot = buildAuthoritySnapshot();
+      if (shouldHeartbeat) logSnapshotHeartbeat(snapshot, authorityClock.mode);
+      if (shouldPublish && authorityClock.mode === "host") {
+        const sent = transport.broadcastFromHost(snapshot);
+        if (sent > 0 && shouldHeartbeat) {
+          debugLog("network", "snapshot-broadcast", { tick: snapshot.tick, sent, peers: transport.getState().peers.length }, "debug");
         }
       }
     };
@@ -2417,6 +3105,11 @@ export default function MetatronVectorFOIL() {
 
       runClockMs += dt * 1000;
       scoreIdleMs += dt * 1000;
+      handleInboundTransportMessages();
+      if (!localJoinAccepted) sendGuestJoinRequest(false);
+      for (const id of Object.keys(remoteGunCooldowns)) {
+        remoteGunCooldowns[id] = Math.max(0, remoteGunCooldowns[id] - dt);
+      }
       if (scoreIdleMs >= SCORE_THRESHOLDS.chainDecayMs) {
         chainMultiplier = 1;
         lastScoreCategory = null;
@@ -2482,6 +3175,8 @@ export default function MetatronVectorFOIL() {
         return;
       }
 
+      advanceAuthorityTick(authorityClock);
+
       for (const node of metaNodes) {
         if (node.awakened) {
           node.charge = T.META_NODE_MAX_CHARGE_SEC;
@@ -2514,6 +3209,47 @@ export default function MetatronVectorFOIL() {
       const keyboardBrakeInput = (keys.has("s") || keys.has("S") || keys.has("ArrowDown")) ? 1 : 0;
       const thrustIntent = Math.max(keyboardThrustInput, gamepadInput.thrust);
       const brakeIntent = Math.max(keyboardBrakeInput, gamepadInput.brake);
+      const fireHeld = keys.has(" ") || keys.has("Space") || gamepadInput.fire;
+      const firePressedIntent = gamepadInput.firePressed || (fireHeld && gunCD <= 0);
+      const localPlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
+      lastLocalInputSeq = nextInputSequence(authorityClock, localPlayerId);
+      if (playerSlots[0]) playerSlots[0].lastInputSeq = lastLocalInputSeq;
+      authorityClock.lastInputSeqByPlayer[localPlayerId] = lastLocalInputSeq;
+      const localInputMessage: NetInputMessage = {
+        type: "player-input",
+        protocolVersion: MULTIPLAYER_PROTOCOL_VERSION,
+        playerId: localPlayerId,
+        seq: lastLocalInputSeq,
+        clientTimeMs: Date.now(),
+        rotate: turnInput,
+        thrust: thrustIntent,
+        brake: brakeIntent,
+        fireHeld,
+        firePressed: firePressedIntent,
+        x: player.pos.x,
+        y: player.pos.y,
+        vx: player.vel.x,
+        vy: player.vel.y,
+        angle: player.angle,
+        angularVelocity: player.angularVel,
+      };
+      if (authorityClock.mode === "client-mirror") {
+        const sent = transport.sendToHost(localInputMessage);
+        if (sent > 0 && lastLocalInputSeq % MULTIPLAYER_NET_CONFIG.hostSimulationHz === 0) {
+          debugLog("network", "input-sent-to-host", { playerId: localPlayerId, seq: lastLocalInputSeq, sent }, "debug");
+        }
+      }
+      if (lastLocalInputSeq % MULTIPLAYER_NET_CONFIG.hostSimulationHz === 0 && (Math.abs(turnInput) > 0.01 || thrustIntent > 0.01 || brakeIntent > 0.01 || fireHeld)) {
+        debugLog("input", "local-input-heartbeat", {
+          playerId: localInputMessage.playerId,
+          seq: localInputMessage.seq,
+          rotate: localInputMessage.rotate,
+          thrust: localInputMessage.thrust,
+          brake: localInputMessage.brake,
+          fireHeld: localInputMessage.fireHeld,
+          authorityTick: authorityClock.tick,
+        }, "debug");
+      }
       player.thrust = lerp(player.thrust, thrustIntent, thrustIntent > 0 ? 0.16 : 0.10);
       shipBrakeInput = lerp(shipBrakeInput, brakeIntent, brakeIntent > 0 ? 0.18 : 0.12);
 
@@ -2643,7 +3379,7 @@ export default function MetatronVectorFOIL() {
 
       // ---- gun ----
       gunCD -= dt;
-      if ((keys.has(" ") || keys.has("Space") || gamepadInput.fire) && gunCD <= 0) {
+      if (fireHeld && gunCD <= 0) {
         const burstId = beginShotBurstIfNeeded();
         const stats = burstStats.get(burstId);
         if (stats) {
@@ -2666,6 +3402,12 @@ export default function MetatronVectorFOIL() {
         b.pos.add(b.vel.copy().mul(dt));
         b.life -= dt;
         if (b.life <= 0 || Math.abs(b.pos.x) > oortOuter * 3 || Math.abs(b.pos.y) > oortOuter * 3) {
+          debugLog("projectile", "projectile-destroyed", {
+            id: b.id,
+            ownerId: b.ownerId,
+            reason: b.life <= 0 ? "expired" : "out-of-bounds",
+            authorityTick: authorityClock.tick,
+          }, "debug");
           resolveBurst(b.burstId, false);
           bullets.splice(i, 1);
         }
@@ -2777,13 +3519,36 @@ export default function MetatronVectorFOIL() {
           const outward = e.pos.copy();
           applyEnemyImpulse(e, outward, T.ENEMY_HIT_DEFLECT_IMPULSE, T.ENEMY_HIT_DEFLECT_TANGENTIAL);
           audioRef.current.hit();
+          debugLog("projectile", "projectile-hit", {
+            id: b.id,
+            ownerId: b.ownerId,
+            targetEnemyId: e.id,
+            targetKind: e.kind,
+            impactX: impact.point.x,
+            impactY: impact.point.y,
+            authorityTick: authorityClock.tick,
+          });
           b.life = -1;
           resolveBurst(b.burstId, true);
-          if (!downgradeEnemy(e)) enemies.splice(ei, 1);
+          const downgraded = downgradeEnemy(e);
+          if (!downgraded) {
+            debugLog("enemy", "enemy-destroyed", { enemyId: e.id, kind: e.kind, authorityTick: authorityClock.tick });
+            enemies.splice(ei, 1);
+          } else {
+            debugLog("enemy", "enemy-morphed", { enemyId: e.id, fromKind: e.kind, toKind: e.nextKind, authorityTick: authorityClock.tick });
+          }
           hit = true;
           break;
         }
-        if (hit || b.life <= 0) bullets.splice(bi, 1);
+        if (hit || b.life <= 0) {
+          debugLog("projectile", "projectile-destroyed", {
+            id: b.id,
+            ownerId: b.ownerId,
+            reason: hit ? "enemy-hit" : "spent",
+            authorityTick: authorityClock.tick,
+          }, "debug");
+          bullets.splice(bi, 1);
+        }
       }
 
       // shrapnel update
@@ -2800,6 +3565,12 @@ export default function MetatronVectorFOIL() {
 
         if (s.pos.copy().sub(player.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD) {
           if (applyShipHit(s.pos.copy(), "shrapnel")) return;
+          debugLog("shrapnel", "shrapnel-destroyed", {
+            id: s.id,
+            sourceEnemyId: s.sourceEnemyId,
+            reason: "player-hit",
+            authorityTick: authorityClock.tick,
+          }, "debug");
           shards.splice(i, 1);
           continue;
         }
@@ -2817,13 +3588,28 @@ export default function MetatronVectorFOIL() {
             ? awayFromShard.norm().add(awayFromSol.len() > 0.0001 ? awayFromSol.norm().mul(T.SHARD_ENEMY_SOL_BIAS) : new V2()).norm()
             : awayFromSol;
           applyEnemyImpulse(e, impulseDir, T.SHARD_ENEMY_KNOCKBACK);
+          debugLog("shrapnel", "shrapnel-destroyed", {
+            id: s.id,
+            sourceEnemyId: s.sourceEnemyId,
+            reason: "enemy-deflection",
+            targetEnemyId: e.id,
+            authorityTick: authorityClock.tick,
+          }, "debug");
           shards.splice(i, 1);
           shardConsumed = true;
           break;
         }
         if (shardConsumed) continue;
 
-        if (s.life <= 0 || s.pos.len() > oortOuter * 2.4) shards.splice(i, 1);
+        if (s.life <= 0 || s.pos.len() > oortOuter * 2.4) {
+          debugLog("shrapnel", "shrapnel-destroyed", {
+            id: s.id,
+            sourceEnemyId: s.sourceEnemyId,
+            reason: s.life <= 0 ? "expired" : "out-of-bounds",
+            authorityTick: authorityClock.tick,
+          }, "debug");
+          shards.splice(i, 1);
+        }
       }
 
       // fuel bits update
@@ -2875,9 +3661,18 @@ export default function MetatronVectorFOIL() {
             duration: 1.8,
           });
         }
+        debugLog("wave", "wave-cleared", {
+          wave: waveNumber,
+          score: Math.round(score),
+          perfect: waveDamageTaken <= 0,
+          awakenedNodes: getAwakenedMetaNodeCount(),
+        });
+        respawnPendingPlayersAtWaveBoundary();
         audioRef.current.levelUp();
         queueWaveBanner(levelIdxRef.current + 1);
       }
+
+      publishAuthoritySnapshotIfDue(dt);
 
       // camera (center stays on star; zoom guarantees ship in view)
       updateCamera(camera, canvas, dpr, player.pos, player.vel, horizonR);
@@ -2992,6 +3787,31 @@ export default function MetatronVectorFOIL() {
         acc -= T.FIXED_DT;
       }
 
+      const localPlayerIdForRender = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
+      const transportStateForRender = transport.getState();
+      const renderPlayers: RenderMultiplayerPlayer[] = playerSlots.map((slot) => {
+        const mirror = remotePlayerMirrors[slot.id];
+        const isLocal = slot.id === localPlayerIdForRender;
+        return {
+          id: slot.id,
+          slot: slot.slot,
+          role: slot.role,
+          callsign: slot.callsign ?? null,
+          lifeState: slot.lifeState,
+          connected: slot.connected,
+          isLocal,
+          x: isLocal ? player.pos.x : (mirror?.x ?? 0),
+          y: isLocal ? player.pos.y : (mirror?.y ?? 0),
+          vx: isLocal ? player.vel.x : (mirror?.vx ?? 0),
+          vy: isLocal ? player.vel.y : (mirror?.vy ?? 0),
+          angle: isLocal ? player.angle : (mirror?.angle ?? 0),
+          angularVelocity: isLocal ? player.angularVel : (mirror?.angularVelocity ?? 0),
+          fuel: isLocal ? player.fuel : (mirror?.fuel ?? T.FUEL_MAX),
+          hitsTaken: isLocal ? player.hitsTaken : (mirror?.hitsTaken ?? 0),
+          lastInputSeq: slot.lastInputSeq,
+        };
+      });
+
       render(ctx, canvas, dpr, {
         mode: modeRef.current,
         level: getLevel(levelIdxRef.current),
@@ -3003,6 +3823,17 @@ export default function MetatronVectorFOIL() {
         horizonR, oortInner, oortOuter,
         waveBannerTimer,
         waveBannerText,
+        multiplayer: {
+          role: transportLaunch.role,
+          roomId: transportLaunch.roomId,
+          localPlayerId: localPlayerIdForRender,
+          showRoster: transportLaunch.showRoster,
+          transportPeers: transportStateForRender.peers.length,
+          queuedInbound: transportStateForRender.queuedInbound,
+          sent: transportStateForRender.stats.sent,
+          received: transportStateForRender.stats.received,
+          players: renderPlayers,
+        },
         debrief: {
           phase: debriefPhase,
           phaseElapsedMs: debriefPhaseElapsedMs,
@@ -3022,6 +3853,8 @@ export default function MetatronVectorFOIL() {
       window.removeEventListener("keydown", onKeyDown as any);
       window.removeEventListener("keyup", onKeyUp as any);
       window.removeEventListener("pointerdown", onPointerDown as any);
+      transport.dispose();
+      if (multiplayerTransportRef.current === transport) multiplayerTransportRef.current = null;
       audioRef.current.stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3052,6 +3885,24 @@ export default function MetatronVectorFOIL() {
     : playerIdentity.authenticated
       ? "CALLSIGN OPEN // PUBLIC BOARD STANDBY"
       : "ANONYMOUS FLIGHT // LOCAL SCORE ONLY";
+
+  const effectiveStartPanelFocus: StartPanelFocus = startPanelFocus ?? "multiplayer";
+  const startPanelFocusEngaged = effectiveStartPanelFocus !== null;
+  const identityPanelExpanded = !startPanelFocusEngaged || effectiveStartPanelFocus === "identity";
+  const multiplayerPanelExpanded = !startPanelFocusEngaged || effectiveStartPanelFocus === "multiplayer";
+  const flightPanelExpanded = !startPanelFocusEngaged || effectiveStartPanelFocus === "flight";
+  const startPanelColumns = effectiveStartPanelFocus === "identity"
+    ? "minmax(320px, 1.58fr) minmax(230px, 0.82fr) minmax(230px, 0.82fr)"
+    : effectiveStartPanelFocus === "multiplayer"
+      ? "minmax(240px, 0.82fr) minmax(350px, 1.68fr) minmax(240px, 0.82fr)"
+      : "minmax(230px, 0.82fr) minmax(230px, 0.82fr) minmax(320px, 1.58fr)";
+  const identityPanelSummary = playerIdentity.callsign
+    ? `PILOT ${playerIdentity.callsign} // ${leaderboard.length} BOARD ECHOES`
+    : playerIdentity.authenticated
+      ? "CALLSIGN OPEN // CLAIM TRACE"
+      : "ANONYMOUS // LOCAL SCORE";
+  const multiplayerPanelSummary = "CARRIER ROOM // HAIL VECTOR";
+  const flightPanelSummary = `${menuFlightHint.slice(0, 34)}${menuFlightHint.length > 34 ? "..." : ""}`;
 
   return (
     <div
@@ -3126,6 +3977,22 @@ export default function MetatronVectorFOIL() {
               38% { opacity: 0.64; }
               41% { opacity: 0.84; }
             }
+            @keyframes mvfPanelStarshine {
+              0%, 100% { opacity: 0.22; filter: brightness(1); transform: translateX(-120%) skewX(-16deg); }
+              38% { opacity: 0.78; filter: brightness(1.45); }
+              58% { opacity: 0.18; filter: brightness(0.82); }
+              74% { opacity: 0.62; filter: brightness(1.22); }
+              100% { transform: translateX(138%) skewX(-16deg); opacity: 0; }
+            }
+            .mvfStartPanelScroll {
+              scrollbar-width: none;
+              -ms-overflow-style: none;
+            }
+            .mvfStartPanelScroll::-webkit-scrollbar {
+              width: 0;
+              height: 0;
+            }
+
             @keyframes mvfHintSignal {
               0% { transform: translateX(-110%); opacity: 0; }
               16% { opacity: 0.78; }
@@ -3252,8 +4119,8 @@ export default function MetatronVectorFOIL() {
             </div>
 
             <div style={{ display: "grid", placeItems: "center", minHeight: 0 }}>
-              <div style={{ width: "min(1140px, 96vw)", display: "grid", gridTemplateColumns: "minmax(286px, 398px) minmax(42px, 1fr) minmax(286px, 420px)", gap: "clamp(12px, 2vw, 20px)", alignItems: "end" }}>
-                <VectorFrame title="PILOT // IDENTITY TRACE">
+              <div style={{ width: "min(1280px, 98vw)", display: "grid", gridTemplateColumns: startPanelColumns, gap: "clamp(12px, 2vw, 20px)", alignItems: "end" }}>
+                <StartFocusPanel panel="identity" title="PILOT // IDENTITY TRACE" summary={identityPanelSummary} focus={effectiveStartPanelFocus} onFocusChange={setStartPanelFocus}>
                   <div style={{ display: "grid", gap: 10 }}>
                     <div style={{ fontSize: 15, lineHeight: 1.3, letterSpacing: "0.13em", textTransform: "uppercase", color: "rgba(176,255,218,0.86)", textShadow: "0 0 12px rgba(145,255,212,0.12)" }}>
                       {publicBoardStatus}
@@ -3282,13 +4149,18 @@ export default function MetatronVectorFOIL() {
                   />
 
                   <LeaderboardConsole entries={leaderboard} status={scoreSubmitStatus} compact />
-                </VectorFrame>
+                </StartFocusPanel>
 
-                <div aria-hidden style={{ alignSelf: "stretch", minHeight: 220, display: "grid", placeItems: "center", pointerEvents: "none" }}>
-                  <GhostMetatronCube glow={featuredGlow} opacity={featuredOpacity} headline={featuredHeadline} subline={featuredSubline} />
-                </div>
+                <StartFocusPanel panel="multiplayer" title="CONSTELLATION DEFENSE // MULTIPLAYER" summary={multiplayerPanelSummary} focus={effectiveStartPanelFocus} onFocusChange={setStartPanelFocus}>
+                  <MultiplayerStartConsole
+                    featuredGlow={featuredGlow}
+                    featuredOpacity={featuredOpacity}
+                    featuredHeadline={featuredHeadline}
+                    featuredSubline={featuredSubline}
+                  />
+                </StartFocusPanel>
 
-                <VectorFrame title="FLIGHT SCHOOL // ORBITAL TRACE">
+                <StartFocusPanel panel="flight" title="FLIGHT SCHOOL // ORBITAL TRACE" summary={flightPanelSummary} focus={effectiveStartPanelFocus} onFocusChange={setStartPanelFocus}>
                   <div
                     style={{
                       position: "relative",
@@ -3338,7 +4210,7 @@ export default function MetatronVectorFOIL() {
                     <VectorTelemetry label="Tree Status" value="DORMANT // AWAKEN WHAT YOU TOUCH" />
                     <VectorTelemetry label="Scope Signal" value={featuredSubline} />
                   </div>
-                </VectorFrame>
+                </StartFocusPanel>
               </div>
             </div>
 
@@ -3419,10 +4291,24 @@ export default function MetatronVectorFOIL() {
           </div>
 
           <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
-            <button onClick={() => setMode("playing")} style={btnStyle}>Resume</button>
+            <button onClick={() => { modeRef.current = "playing"; debugLog("lifecycle", "resume-from-pause"); setMode("playing"); }} style={btnStyle}>Resume</button>
             <button onClick={() => {
               resetToMenuRef.current?.();
             }} style={btnStyle}>Back to title</button>
+            <button onClick={() => {
+              const filename = exportDebugBundle({
+                trigger: "pause-menu",
+                mode,
+                levelIdx,
+                toggles,
+                sliders,
+                transport: multiplayerTransportRef.current?.getState() ?? null,
+              });
+              debugLog("lifecycle", "debug-export-complete", { trigger: "pause-menu", filename });
+            }} style={btnStyle}>Export flight recorder</button>
+          </div>
+          <div style={{ marginTop: 8, fontSize: 11, opacity: 0.72, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+            Debug export hotkey: Ctrl/⌘ + Shift + L
           </div>
         </Overlay>
       )}
@@ -3569,6 +4455,98 @@ function GhostMetatronCube({ glow, opacity, headline, subline }: { glow: number;
   );
 }
 
+
+function StartFocusPanel({
+  panel,
+  title,
+  summary,
+  focus,
+  onFocusChange,
+  urgent = false,
+  children,
+}: {
+  panel: StartPanelId;
+  title: string;
+  summary: string;
+  focus: StartPanelFocus;
+  onFocusChange: (panel: StartPanelFocus) => void;
+  urgent?: boolean;
+  children: React.ReactNode;
+}) {
+  const focusEngaged = focus !== null;
+  const focused = focus === panel;
+  const active = !focusEngaged || focused;
+  const compressed = focusEngaged && !focused;
+  const accent = panel === "identity"
+    ? "rgba(150,205,255,0.76)"
+    : panel === "multiplayer"
+      ? "rgba(176,255,218,0.82)"
+      : "rgba(243,214,152,0.78)";
+  const glow = panel === "multiplayer"
+    ? "rgba(98,220,180,0.075)"
+    : panel === "flight"
+      ? "rgba(243,214,152,0.055)"
+      : "rgba(110,190,255,0.060)";
+
+  return (
+    <section
+      tabIndex={0}
+      onMouseEnter={() => onFocusChange(panel)}
+      onMouseLeave={() => onFocusChange(null)}
+      onFocus={() => onFocusChange(panel)}
+      onBlur={() => onFocusChange(null)}
+      style={{
+        position: "relative",
+        alignSelf: "stretch",
+        minHeight: compressed ? 252 : 330,
+        overflow: "hidden",
+        border: `1px solid ${focused ? accent : "rgba(150,205,255,0.16)"}`,
+        background: `linear-gradient(180deg, rgba(4,13,20,${focused ? 0.78 : 0.58}), rgba(0,0,0,0.22))`,
+        boxShadow: focused
+          ? `inset 0 0 34px ${glow}, 0 0 28px ${glow}`
+          : `inset 0 0 24px rgba(110,190,255,0.035), 0 0 16px rgba(110,190,255,0.020)`,
+        color: "rgba(218,244,255,0.86)",
+        padding: compressed ? "11px 12px" : "13px 14px",
+        opacity: active ? 1 : 0.56,
+        transform: focused ? "translateY(-8px)" : "translateY(0)",
+        transition: "grid-template-columns 340ms ease, transform 260ms ease, opacity 220ms ease, min-height 260ms ease, border-color 220ms ease, box-shadow 260ms ease, padding 240ms ease",
+        outline: "none",
+      }}
+    >
+      <div aria-hidden style={{ position: "absolute", inset: 0, opacity: focused ? 0.16 : 0.09, backgroundImage: "linear-gradient(rgba(150,205,255,0.12) 1px, transparent 1px), linear-gradient(90deg, rgba(150,205,255,0.08) 1px, transparent 1px)", backgroundSize: "18px 18px", pointerEvents: "none" }} />
+      <div aria-hidden style={{ position: "absolute", left: 0, right: 0, top: 0, height: 1, background: `linear-gradient(90deg, transparent, ${accent}, transparent)`, opacity: focused ? 0.82 : 0.32, pointerEvents: "none" }} />
+      {(focused || urgent) && (
+        <div aria-hidden style={{ position: "absolute", top: 0, bottom: 0, left: "-42%", width: "34%", background: "linear-gradient(90deg, transparent, rgba(255,244,206,0.18), rgba(176,255,218,0.08), transparent)", animation: "mvfPanelStarshine 1.35s ease-out 1", pointerEvents: "none" }} />
+      )}
+
+      <div style={{ position: "relative", zIndex: 1, display: "grid", gap: compressed ? 8 : 11, height: "100%" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", minWidth: 0 }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: accent, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {title}
+          </div>
+          <div style={{ fontSize: 9, letterSpacing: "0.14em", textTransform: "uppercase", color: "rgba(190,224,248,0.52)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: focused ? 170 : 76 }}>
+            {summary}
+          </div>
+        </div>
+
+        <div
+          className="mvfStartPanelScroll"
+          style={{
+            minHeight: 0,
+            maxHeight: focused ? "min(56vh, 520px)" : compressed ? 238 : "min(46vh, 430px)",
+            overflowY: "auto",
+            overflowX: "hidden",
+            paddingRight: 2,
+            transition: "max-height 280ms ease",
+          }}
+        >
+          {children}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function VectorFrame({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div style={{
@@ -3597,6 +4575,226 @@ function VectorTelemetry({ label, value }: { label: string; value: string }) {
     <div style={{ display: "grid", gap: 4, borderTop: "1px solid rgba(150,205,255,0.14)", paddingTop: 8 }}>
       <div style={{ fontSize: 10, letterSpacing: "0.24em", textTransform: "uppercase", color: "rgba(150,205,255,0.56)" }}>{label}</div>
       <div style={{ fontSize: 13, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(214,242,255,0.86)" }}>{value}</div>
+    </div>
+  );
+}
+
+
+function sanitizeMultiplayerRoomInput(value: string) {
+  return value.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24);
+}
+
+function fallbackMultiplayerRoomId(value: string) {
+  const clean = sanitizeMultiplayerRoomInput(value);
+  return clean || "local-carrier";
+}
+
+function normalizeHailCallsign(value: string) {
+  return value.replace(/[^A-Za-z0-9]/g, "").slice(0, 3).toUpperCase();
+}
+
+function MultiplayerStartConsole({
+  featuredGlow,
+  featuredOpacity,
+  featuredHeadline,
+  featuredSubline,
+}: {
+  featuredGlow: number;
+  featuredOpacity: number;
+  featuredHeadline: string;
+  featuredSubline: string;
+}) {
+  const [roomId, setRoomId] = useState(() => {
+    if (typeof window === "undefined") return "mvf-carrier";
+    const params = new URLSearchParams(window.location.search);
+    return sanitizeMultiplayerRoomInput(params.get("mvfRoom") ?? `mvf-${Math.random().toString(36).slice(2, 7)}`);
+  });
+  const [hailCallsign, setHailCallsign] = useState("");
+  const [hailSlot, setHailSlot] = useState<1 | 2 | 3>(1);
+  const [hailStatus, setHailStatus] = useState("CARRIER COLD // NAME ROOM THEN HAIL A PILOT");
+
+  const baseUrl = typeof window !== "undefined" ? `${window.location.origin}${window.location.pathname}` : "";
+  const safeRoom = fallbackMultiplayerRoomId(roomId);
+
+  const launchUrl = (role: "host" | "guest", slot?: 1 | 2 | 3) => {
+    const params = new URLSearchParams();
+    params.set("mvfRole", role);
+    params.set("mvfRoom", safeRoom);
+    params.set("mvfRoster", "1");
+    params.set("mvfBroadcast", "0");
+    if (slot !== undefined) params.set("mvfSlot", String(slot));
+    return `${baseUrl}?${params.toString()}`;
+  };
+
+  const multiplayerInputStyle: React.CSSProperties = {
+    padding: "6px 8px",
+    border: "1px solid rgba(150,205,255,0.24)",
+    borderRadius: 0,
+    background: "rgba(0,0,0,0.36)",
+    color: "rgba(232,248,255,0.94)",
+    fontFamily: "ui-monospace, Menlo, monospace",
+    outline: "none",
+  };
+
+  const copyText = async (value: string) => {
+    if (typeof navigator === "undefined" || !navigator.clipboard) return false;
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const openHost = () => {
+    if (typeof window === "undefined") return;
+    setHailStatus(`HOST CARRIER ARMING // ROOM ${safeRoom}`);
+    window.location.assign(launchUrl("host"));
+  };
+
+  const hailPilot = async () => {
+    const callsign = normalizeHailCallsign(hailCallsign);
+    if (callsign.length !== 3) {
+      setHailStatus("HAIL REJECTED // ENTER THREE-CHARACTER CALLSIGN");
+      return;
+    }
+
+    const href = launchUrl("guest", hailSlot);
+    const copied = await copyText(href);
+    setHailStatus(copied
+      ? `HAIL VECTOR READY // ${callsign} // P${hailSlot + 1} // LINK COPIED`
+      : `HAIL VECTOR READY // ${callsign} // P${hailSlot + 1} // CLIPBOARD BLOCKED`);
+
+    if (typeof navigator !== "undefined" && "share" in navigator) {
+      try {
+        await navigator.share({
+          title: "Metatron Vector Foil carrier hail",
+          text: `${callsign}, join carrier room ${safeRoom} as P${hailSlot + 1}.`,
+          url: href,
+        });
+        setHailStatus(`HAIL SENT // ${callsign} // P${hailSlot + 1}`);
+      } catch {
+        // User cancelled share or platform does not permit it. The copied link is still useful.
+      }
+    }
+  };
+
+  return (
+    <div style={{ display: "grid", gap: 10 }}>
+      <div aria-hidden style={{ pointerEvents: "none", display: "grid", placeItems: "center", maxHeight: 112, overflow: "hidden", opacity: 0.72 }}>
+        <GhostMetatronCube glow={featuredGlow} opacity={featuredOpacity} headline={featuredHeadline} subline={featuredSubline} compact />
+      </div>
+
+      <div style={{
+        display: "grid",
+        gap: 8,
+        padding: 10,
+        border: "1px solid rgba(176,255,218,0.16)",
+        background: "linear-gradient(180deg, rgba(4,17,20,0.56), rgba(0,0,0,0.18))",
+        boxShadow: "inset 0 0 24px rgba(98,220,180,0.055), 0 0 18px rgba(98,220,180,0.035)",
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+          <div style={{ fontSize: 9, letterSpacing: "0.25em", textTransform: "uppercase", color: "rgba(176,255,218,0.72)" }}>
+            Carrier Room
+          </div>
+          <div style={{ fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: "rgba(243,214,152,0.70)" }}>
+            {safeRoom}
+          </div>
+        </div>
+
+        <input
+          value={roomId}
+          maxLength={24}
+          spellCheck={false}
+          autoComplete="off"
+          aria-label="Carrier room name"
+          placeholder="name carrier room"
+          onChange={(e) => setRoomId(sanitizeMultiplayerRoomInput(e.target.value))}
+          onKeyDown={(e) => e.stopPropagation()}
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            padding: "7px 8px",
+            border: "1px solid rgba(150,205,255,0.22)",
+            borderRadius: 0,
+            background: "rgba(0,0,0,0.34)",
+            color: "rgba(232,248,255,0.94)",
+            fontFamily: "ui-monospace, Menlo, monospace",
+            fontSize: 12,
+            letterSpacing: "0.10em",
+            outline: "none",
+          }}
+        />
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 7, alignItems: "center" }}>
+          <button type="button" onClick={openHost} style={{ ...btnStyle, padding: "7px 9px", fontSize: 10, borderColor: "rgba(176,255,218,0.28)", color: "rgba(212,255,230,0.92)" }}>
+            Open Host Carrier
+          </button>
+          <span style={{ fontSize: 9, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(150,205,255,0.56)" }}>
+            P1 AUTHORITY
+          </span>
+        </div>
+
+        <div style={{ display: "grid", gap: 6, paddingTop: 7, borderTop: "1px solid rgba(150,205,255,0.10)" }}>
+          <div style={{ fontSize: 9, letterSpacing: "0.25em", textTransform: "uppercase", color: "rgba(176,255,218,0.66)" }}>
+            Hail Pilot
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "64px 76px 1fr", gap: 7, alignItems: "center" }}>
+            <input
+              value={hailCallsign}
+              maxLength={3}
+              spellCheck={false}
+              autoComplete="off"
+              aria-label="Hail callsign"
+              placeholder="ABC"
+              onChange={(e) => setHailCallsign(normalizeHailCallsign(e.target.value))}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void hailPilot();
+                }
+              }}
+              style={{
+                ...multiplayerInputStyle,
+                width: 64,
+                boxSizing: "border-box",
+                fontSize: 14,
+                letterSpacing: "0.16em",
+                textTransform: "uppercase",
+              }}
+            />
+
+            <select
+              value={hailSlot}
+              aria-label="Guest player slot"
+              onChange={(e) => setHailSlot(Number(e.target.value) as 1 | 2 | 3)}
+              onKeyDown={(e) => e.stopPropagation()}
+              style={{
+                ...multiplayerInputStyle,
+                width: 76,
+                boxSizing: "border-box",
+                fontSize: 11,
+                letterSpacing: "0.08em",
+                textTransform: "uppercase",
+              }}
+            >
+              <option value={1}>P2</option>
+              <option value={2}>P3</option>
+              <option value={3}>P4</option>
+            </select>
+
+            <button type="button" onClick={() => void hailPilot()} style={{ ...btnStyle, padding: "7px 9px", fontSize: 10, borderColor: "rgba(243,214,152,0.28)", color: "rgba(255,235,184,0.92)" }}>
+              Hail
+            </button>
+          </div>
+        </div>
+
+        <div style={{ fontSize: 9, lineHeight: 1.42, letterSpacing: "0.09em", textTransform: "uppercase", color: "rgba(190,224,248,0.60)" }}>
+          {hailStatus}
+        </div>
+      </div>
     </div>
   );
 }
@@ -3970,6 +5168,37 @@ const btnStyle: React.CSSProperties = {
   cursor: "pointer",
 };
 
+type RenderMultiplayerPlayer = {
+  id: PlayerId;
+  slot: PlayerSlotIndex;
+  role: MultiplayerRole;
+  callsign?: string | null;
+  lifeState: PlayerLifeState;
+  connected: boolean;
+  isLocal: boolean;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  angle: number;
+  angularVelocity: number;
+  fuel: number;
+  hitsTaken: number;
+  lastInputSeq: number;
+};
+
+type RenderMultiplayerState = {
+  role: MultiplayerRole;
+  roomId: string;
+  localPlayerId: PlayerId;
+  showRoster: boolean;
+  transportPeers: number;
+  queuedInbound: number;
+  sent: number;
+  received: number;
+  players: RenderMultiplayerPlayer[];
+};
+
 // ===================== RENDERING + CAMERA =====================
 function render(
   ctx: CanvasRenderingContext2D,
@@ -3989,6 +5218,7 @@ function render(
     oortOuter: number;
     waveBannerTimer: number;
     waveBannerText: string;
+    multiplayer: RenderMultiplayerState;
     debrief: { phase: DebriefPhase; phaseElapsedMs: number; snapshot: DebriefSnapshot | null };
   }
 ) {
@@ -4315,6 +5545,16 @@ function render(
     ctx.restore();
   }
 
+  // remote player ships
+  ctx.save();
+  ctx.globalAlpha = worldAlpha;
+  for (const remote of S.multiplayer.players) {
+    if (remote.isLocal) continue;
+    if (!remote.connected || remote.lifeState === "disconnected") continue;
+    drawRemotePlayerShip(ctx, S.camera.zoom, remote);
+  }
+  ctx.restore();
+
   // ship
   ctx.save();
   ctx.globalAlpha = worldAlpha;
@@ -4347,7 +5587,80 @@ function render(
   }
   ctx.restore();
 
+  drawMultiplayerRosterOverlay(ctx, dpr, w, h, S.multiplayer);
+}
 
+function remotePlayerHue(slot: PlayerSlotIndex) {
+  return [165, 205, 285, 38][slot] ?? 165;
+}
+
+function drawRemotePlayerShip(ctx: CanvasRenderingContext2D, cameraZoom: number, remote: RenderMultiplayerPlayer) {
+  const hue = remotePlayerHue(remote.slot);
+  const alpha = remote.lifeState === "alive" ? 0.84 : 0.28;
+  ctx.save();
+  ctx.translate(remote.x, remote.y);
+  ctx.rotate(remote.angle);
+  ctx.lineWidth = 1.8 / cameraZoom;
+  ctx.strokeStyle = `hsla(${hue},92%,74%,${alpha})`;
+  ctx.beginPath();
+  ctx.moveTo(12, 0);
+  ctx.lineTo(-9, -7);
+  ctx.lineTo(-4, 0);
+  ctx.lineTo(-9, 7);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.strokeStyle = `hsla(${hue},95%,78%,${alpha * 0.35})`;
+  ctx.lineWidth = 0.9 / cameraZoom;
+  ctx.beginPath();
+  ctx.arc(0, 0, 18 / cameraZoom, 0, TAU);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  ctx.font = `${Math.max(8, 10 / cameraZoom)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  ctx.fillStyle = `hsla(${hue},95%,78%,${alpha})`;
+  ctx.textAlign = "center";
+  ctx.fillText(`P${remote.slot + 1}`, remote.x, remote.y - 20 / cameraZoom);
+  ctx.restore();
+}
+
+function drawMultiplayerRosterOverlay(ctx: CanvasRenderingContext2D, dpr: number, w: number, h: number, multiplayer: RenderMultiplayerState) {
+  if (!multiplayer.showRoster) return;
+  const rows = multiplayer.players.slice().sort((a, b) => a.slot - b.slot);
+  const x = Math.max(18, w - 330);
+  const y = 18;
+  const rowH = 17;
+  const boxH = 58 + rows.length * rowH;
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "rgba(3,8,14,0.58)";
+  ctx.strokeStyle = "rgba(130,220,255,0.20)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(x, y, 312, boxH, 14);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.fillStyle = "rgba(210,240,255,0.88)";
+  ctx.fillText(`MULTIPLAYER TEST // ${multiplayer.role.toUpperCase()} // ROOM ${multiplayer.roomId}`, x + 14, y + 20);
+  ctx.fillStyle = "rgba(145,205,230,0.68)";
+  ctx.fillText(`PEERS ${multiplayer.transportPeers}  SENT ${multiplayer.sent}  RECV ${multiplayer.received}  Q ${multiplayer.queuedInbound}`, x + 14, y + 38);
+
+  for (let i = 0; i < rows.length; i++) {
+    const p = rows[i];
+    const py = y + 58 + i * rowH;
+    const hue = remotePlayerHue(p.slot);
+    const status = p.lifeState === "alive" ? "ONLINE" : p.lifeState === "respawn-pending" ? "RESPAWN" : p.lifeState.toUpperCase();
+    ctx.fillStyle = `hsla(${hue},95%,75%,${p.connected ? 0.88 : 0.38})`;
+    ctx.fillText(`P${p.slot + 1}`, x + 14, py);
+    ctx.fillStyle = p.isLocal ? "rgba(176,255,218,0.92)" : "rgba(210,235,255,0.74)";
+    const label = `${p.id}${p.isLocal ? " *" : ""}`.slice(0, 24);
+    ctx.fillText(label, x + 48, py);
+    ctx.fillStyle = "rgba(145,205,230,0.68)";
+    ctx.fillText(status, x + 220, py);
+  }
+  ctx.restore();
 }
 
 function updateCamera(camera: { pos: V2; zoom: number }, canvas: HTMLCanvasElement, dpr: number, shipPos: V2, shipVel: V2, horizonR: number) {
