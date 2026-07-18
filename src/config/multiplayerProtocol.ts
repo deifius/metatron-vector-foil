@@ -1,24 +1,30 @@
 import type { PlayerId, PlayerSlotIndex } from "./playerSlots";
 import type { SolidKind } from "./gameConstants";
 
-export const MULTIPLAYER_PROTOCOL_VERSION = 2 as const;
+export const MULTIPLAYER_PROTOCOL_VERSION = 3 as const;
 
 export type MultiplayerAuthorityRole = "host" | "guest" | "solo";
 
-export type NetInputMessage = {
-  type: "player-input";
-  protocolVersion: typeof MULTIPLAYER_PROTOCOL_VERSION;
-  playerId: PlayerId;
+export type NetInputFramePayload = {
   seq: number;
+  clientTick: number;
   clientTimeMs: number;
+  simulationDtMs: number;
   rotate: number;
   thrust: number;
   brake: number;
   fireHeld: boolean;
   firePressed: boolean;
-  // Optional client-side ship telemetry. Guests include this so the host can
-  // bridge current WebRTC transport into authoritative projectiles before the
-  // full remote-ship simulation lands. Host truth still wins in snapshots.
+  clientShotId?: string;
+};
+
+export type NetInputMessage = NetInputFramePayload & {
+  type: "player-input";
+  protocolVersion: typeof MULTIPLAYER_PROTOCOL_VERSION;
+  playerId: PlayerId;
+  recentInputs?: NetInputFramePayload[];
+  // Protocol v3 no longer treats telemetry as authority. These optional fields
+  // remain for one-version diagnostics and can be removed after old clients age out.
   x?: number;
   y?: number;
   vx?: number;
@@ -41,12 +47,15 @@ export type NetPlayerState = {
   angularVelocity: number;
   fuel: number;
   hitsTaken: number;
+  thrust?: number;
+  brake?: number;
   lastInputSeq: number;
 };
 
 export type NetProjectileState = {
   id: string;
   ownerId: PlayerId;
+  clientShotId?: string;
   x: number;
   y: number;
   vx: number;
@@ -93,7 +102,10 @@ export type NetWorldSnapshot = {
   score: number;
   solIntegrity: number;
   authorityRole?: MultiplayerAuthorityRole;
+  runState?: "playing" | "debrief";
+  gameOverCause?: string;
   ackInputSeqByPlayer: Record<PlayerId, number>;
+  ackClientTimeMsByPlayer?: Record<PlayerId, number>;
 };
 
 export type NetWorldEvent = {
@@ -112,7 +124,8 @@ export type NetWorldEvent = {
     | "player-hit"
     | "projectile-destroyed"
     | "shrapnel-destroyed"
-    | "host-authority-heartbeat";
+    | "host-authority-heartbeat"
+    | "run-ended";
   playerId?: PlayerId;
   entityId?: string;
   data?: Record<string, unknown>;
@@ -158,6 +171,14 @@ export function isPlayerInputMessage(value: unknown): value is NetInputMessage {
   return hasExpectedProtocolVersion(value) && (value as { type?: unknown }).type === "player-input";
 }
 
+export function isWorldEventMessage(value: unknown): value is NetWorldEvent {
+  return hasExpectedProtocolVersion(value) && (value as { type?: unknown }).type === "world-event";
+}
+
 export function isPeerLifecycleMessage(value: unknown): value is PeerLifecycleMessage {
   return hasExpectedProtocolVersion(value) && (value as { type?: unknown }).type === "peer-lifecycle";
+}
+
+export function isRealtimeMultiplayerMessage(value: MultiplayerMessage) {
+  return value.type === "player-input" || value.type === "world-snapshot";
 }

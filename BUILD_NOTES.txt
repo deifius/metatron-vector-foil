@@ -1,0 +1,11 @@
+Metatron Vector Foil — six-phase multiplayer pass
+
+Changed source files are under src/. A prebuilt static/main.js is included.
+To regenerate the browser bundle from source:
+  npm install
+  npm run build
+
+Validated with:
+  npx tsc --noEmit
+  npm run build
+  python3 -m py_compile app.py app_config.py

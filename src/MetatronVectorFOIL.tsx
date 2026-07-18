@@ -4,7 +4,7 @@ import { HUDRoot } from "./ui/hud/HUDRoot";
 import { HUDState } from "./ui/hud/hudTypes";
 import { loadJson, loadTextLines } from "./data/textLoader";
 import { scoreForCitation, scoreForEnemy, scoreForPerfectWave, scoreForWaveClear } from "./config/scoring";
-import { getGamepadControlsHint, readGamepadShipInput } from "./config/gamepadControls";
+import { getConnectedGamepadDescriptors, getGamepadControlsHint, readGamepadShipInput, readGamepadShipInputForIndex } from "./config/gamepadControls";
 import {
   debugLog,
   debugWarn,
@@ -35,15 +35,28 @@ import {
   createEntityIdCounters,
   logSnapshotHeartbeat,
   makeAuthorityEntityId,
+  markInputSequenceApplied,
   nextInputSequence,
   resetAuthorityClock,
   resetEntityIdCounters,
   shouldLogSnapshotHeartbeat,
   shouldPublishSnapshot,
 } from "./config/multiplayerAuthority";
-import { MULTIPLAYER_PROTOCOL_VERSION, isPeerLifecycleMessage, isPlayerInputMessage, isWorldSnapshotMessage } from "./config/multiplayerProtocol";
-import type { NetInputMessage, NetWorldSnapshot, PeerLifecycleMessage } from "./config/multiplayerProtocol";
+import { MULTIPLAYER_PROTOCOL_VERSION, isPeerLifecycleMessage, isPlayerInputMessage, isWorldEventMessage, isWorldSnapshotMessage } from "./config/multiplayerProtocol";
+import type { NetInputFramePayload, NetInputMessage, NetPlayerState, NetWorldSnapshot, PeerLifecycleMessage } from "./config/multiplayerProtocol";
 import { createMultiplayerTransport, detectMultiplayerTransportLaunch } from "./config/multiplayerTransport";
+import {
+  SnapshotTimeline,
+  acknowledgePredictedInputs,
+  addRenderCorrection,
+  createPendingInputQueue,
+  decayRenderCorrection,
+  lerpAngle,
+  lerpNumber,
+  queuePredictedInput,
+  recentInputsForRedundancy,
+  shortestAngleDelta,
+} from "./config/multiplayerPrediction";
 import type { InboundTransportMessage, MultiplayerTransportHub } from "./config/multiplayerTransport";
 import { SCORE_THRESHOLDS } from "./config/thresholds";
 import type { CitationCategory, CommendationDefinition } from "./types/scoring";
@@ -229,7 +242,51 @@ function makePolyhedron(kind: SolidKind, r: number): PolyMesh {
 
 
 // ===================== GAME TYPES =====================
-type Bullet = { id: string; ownerId: PlayerId; hostTick: number; pos: V2; prevPos: V2; vel: V2; life: number; mass: number; origin: V2; firedAtMs: number; burstId: number };
+type PlayerShipState = {
+  pos: V2;
+  vel: V2;
+  angle: number;
+  angularVel: number;
+  thrust: number;
+  brakeAnim: number;
+  thrustGlow: number;
+  inActivatedSphere: boolean;
+  fuel: number;
+  stuckTime: number;
+  hitsTaken: number;
+  hitInvuln: number;
+};
+
+type PlayerControlState = {
+  rotate: number;
+  thrust: number;
+  brake: number;
+  fireHeld: boolean;
+  firePressed: boolean;
+  clientShotId?: string;
+  seq: number;
+  clientTick: number;
+  simulationDtMs: number;
+  clientTimeMs: number;
+};
+
+type PlayerRuntimeMirror = PlayerShipState & {
+  brakeInput: number;
+  gunCooldown: number;
+  lastInputSeq: number;
+  currentInput: PlayerControlState;
+  pendingInputs: PlayerControlState[];
+  trail: V2[];
+  localGamepadIndex: number | null;
+  local: boolean;
+  renderCorrection: { x: number; y: number; angle: number };
+  displayedX: number;
+  displayedY: number;
+  displayedAngle: number;
+  lastAckClientTimeMs: number;
+};
+
+type Bullet = { id: string; ownerId: PlayerId; hostTick: number; clientShotId?: string; predicted?: boolean; pos: V2; prevPos: V2; vel: V2; life: number; mass: number; origin: V2; firedAtMs: number; burstId: number };
 type FuelBit = { pos: V2; vel: V2; life: number; hue: number; };
 type Shard = { id: string; sourceEnemyId?: string; hostTick: number; pos: V2; vel: V2; life: number; life0: number; hue: number; size: number; ang: number; spin: number; };
 type OortCluster = {
@@ -328,6 +385,21 @@ type WaveCitationFlags = {
 
 type DebriefPhase = "inactive" | "burn_fade" | "game_over_hold" | "plotting" | "ready";
 type DeathCauseKey = "shrapnel" | "enemy" | "well" | "sol" | "fuel" | "collapse" | "oort";
+
+function deathCauseKeyFromUnknown(value: unknown): DeathCauseKey {
+  switch (value) {
+    case "shrapnel":
+    case "enemy":
+    case "well":
+    case "sol":
+    case "fuel":
+    case "collapse":
+    case "oort":
+      return value;
+    default:
+      return "enemy";
+  }
+}
 type DebriefSnapshot = {
   causeKey: DeathCauseKey;
   causeLabel: string;
@@ -1023,7 +1095,10 @@ export default function MetatronVectorFOIL() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // UI state
-  const [mode, setMode] = useState<GameMode>("menu");
+  const [mode, setMode] = useState<GameMode>(() => {
+    if (typeof window === "undefined") return "menu";
+    return new URLSearchParams(window.location.search).get("mvfAutostart") === "1" ? "playing" : "menu";
+  });
   const [levelIdx, setLevelIdx] = useState(0);
   const [toggles, setToggles] = useState({ metatron: true, trails: false, debug: T.DEBUG_TEXT });
   const [hudState, setHUDState] = useState<HUDState>(DEFAULT_HUD_STATE);
@@ -1079,6 +1154,13 @@ export default function MetatronVectorFOIL() {
       maxPlayers: MULTIPLAYER_NET_CONFIG.maxPlayers,
       snapshotHz: MULTIPLAYER_NET_CONFIG.snapshotHz,
     });
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      if (url.searchParams.get("mvfAutostart") === "1") {
+        url.searchParams.delete("mvfAutostart");
+        window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+      }
+    }
     return () => debugLog("lifecycle", "component-unmounted");
   }, []);
 
@@ -1431,6 +1513,7 @@ export default function MetatronVectorFOIL() {
 
     // ---- input ----
     let onDebriefAdvance: (() => void) | null = null;
+    let publishTerminalAuthorityState: ((causeKey: DeathCauseKey) => void) | null = null;
     const keys = keysRef.current;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === " ") e.preventDefault();
@@ -1456,7 +1539,38 @@ export default function MetatronVectorFOIL() {
           onDebriefAdvance?.();
           return;
         }
-        if (modeRef.current === "menu" || modeRef.current === "paused") {
+        if (modeRef.current === "menu") {
+          const url = new URL(window.location.href);
+          const rawConfiguredCount = Number(url.searchParams.get("mvfLocalPlayers"));
+          const hasExplicitLocalCount = rawConfiguredCount === 1 || rawConfiguredCount === 2 || rawConfiguredCount === 3 || rawConfiguredCount === 4;
+          const detectedLocalCount = Math.max(1, Math.min(4, getConnectedGamepadDescriptors().length)) as 1 | 2 | 3 | 4;
+          const desiredLocalCount = transportLaunch.role === "guest"
+            ? 1
+            : hasExplicitLocalCount
+              ? rawConfiguredCount as 1 | 2 | 3 | 4
+              : detectedLocalCount;
+
+          if (desiredLocalCount !== transportLaunch.localPlayerCount) {
+            url.searchParams.set("mvfRole", transportLaunch.role);
+            url.searchParams.set("mvfRoom", transportLaunch.roomId);
+            url.searchParams.set("mvfRoster", "1");
+            url.searchParams.set("mvfBroadcast", transportLaunch.enableBroadcastChannel ? "1" : "0");
+            url.searchParams.set("mvfLocalPlayers", String(desiredLocalCount));
+            url.searchParams.set("mvfAutostart", "1");
+            debugLog("lifecycle", "local-player-launch-reconfigure", {
+              previousLocalPlayerCount: transportLaunch.localPlayerCount,
+              desiredLocalPlayerCount: desiredLocalCount,
+              detectedGamepads: getConnectedGamepadDescriptors().map((pad) => ({ index: pad.index, label: pad.label })),
+            });
+            window.location.assign(url.toString());
+            return;
+          }
+
+          modeRef.current = "playing";
+          setMode("playing");
+          return;
+        }
+        if (modeRef.current === "paused") {
           modeRef.current = "playing";
           setMode("playing");
         }
@@ -1506,7 +1620,7 @@ export default function MetatronVectorFOIL() {
 
     // entities
     const camera = { pos: new V2(0, 0), zoom: 1 };
-    const player = {
+    const player: PlayerShipState = {
       pos: new V2(metaRadius, 0),
       vel: new V2(0, 0),
       angle: 0,
@@ -1529,6 +1643,20 @@ export default function MetatronVectorFOIL() {
       playerIdentityRef.current.callsign,
       transportLaunch.requestedSlot,
     );
+    const localPlayerIds = new Set<PlayerId>([transportLaunch.localPlayerId]);
+    if (transportLaunch.role !== "guest" && transportLaunch.localPlayerCount > 1) {
+      for (let slotIndex = 1; slotIndex < transportLaunch.localPlayerCount; slotIndex += 1) {
+        const localId = `${transportLaunch.localPlayerId}-local-${slotIndex}`;
+        const slot = assignPlayerSlot(
+          playerSlots,
+          localId,
+          transportLaunch.role,
+          `P${slotIndex + 1}`,
+          slotIndex as PlayerSlotIndex,
+        );
+        if (slot) localPlayerIds.add(localId);
+      }
+    }
     const authorityMode = transportLaunch.role === "host"
       ? "host"
       : transportLaunch.role === "guest"
@@ -1551,8 +1679,14 @@ export default function MetatronVectorFOIL() {
     const authorityClock = createAuthorityClock(authorityMode);
     const entityIdCounters = createEntityIdCounters();
     let lastLocalInputSeq = 0;
-    const remotePlayerMirrors: Record<PlayerId, { x: number; y: number; vx: number; vy: number; angle: number; angularVelocity: number; fuel: number; hitsTaken: number; lastInputSeq: number }> = {};
-    const remoteGunCooldowns: Record<PlayerId, number> = {};
+    let localClientTick = 0;
+    const remotePlayerMirrors: Record<PlayerId, PlayerRuntimeMirror> = {};
+    const guestPredictionQueue = createPendingInputQueue(transportLaunch.localPlayerId);
+    const guestSnapshotTimeline = new SnapshotTimeline();
+    const localRenderCorrection = { x: 0, y: 0, angle: 0 };
+    let displayedLocalPlayer = { x: player.pos.x, y: player.pos.y, angle: player.angle };
+    const ackClientTimeMsByPlayer: Record<PlayerId, number> = {};
+    let predictionHeartbeatAccumulator = 0;
 
     const bullets: Bullet[] = [];
     const enemies: Enemy[] = [];
@@ -1735,21 +1869,85 @@ export default function MetatronVectorFOIL() {
       player.angle = spawn.angle;
     };
 
-    const seedRemoteMirrorSpawn = (slot: { id: PlayerId; slot: PlayerSlotIndex }) => {
-      if (remotePlayerMirrors[slot.id]) return;
-      const spawn = slotSpawnState(slot.slot, 0);
-      remotePlayerMirrors[slot.id] = {
-        x: spawn.pos.x,
-        y: spawn.pos.y,
-        vx: spawn.vel.x,
-        vy: spawn.vel.y,
+    const neutralControl = (seq = 0): PlayerControlState => ({
+      rotate: 0,
+      thrust: 0,
+      brake: 0,
+      fireHeld: false,
+      firePressed: false,
+      seq,
+      clientTick: 0,
+      simulationDtMs: T.FIXED_DT * 1000,
+      clientTimeMs: Date.now(),
+    });
+
+    const createRuntimeForSlot = (slot: { id: PlayerId; slot: PlayerSlotIndex }, tangentialSpeed = 0): PlayerRuntimeMirror => {
+      const spawn = slotSpawnState(slot.slot, tangentialSpeed);
+      const pad = getConnectedGamepadDescriptors()[slot.slot];
+      return {
+        pos: spawn.pos,
+        vel: spawn.vel,
         angle: spawn.angle,
-        angularVelocity: 0,
+        angularVel: 0,
+        thrust: 0,
+        brakeAnim: 0,
+        thrustGlow: 0,
+        inActivatedSphere: false,
         fuel: T.FUEL_MAX,
+        stuckTime: 0,
         hitsTaken: 0,
+        hitInvuln: 0,
+        brakeInput: 0,
+        gunCooldown: 0,
         lastInputSeq: 0,
+        currentInput: neutralControl(),
+        pendingInputs: [],
+        trail: [],
+        localGamepadIndex: localPlayerIds.has(slot.id) ? (pad?.index ?? null) : null,
+        local: localPlayerIds.has(slot.id),
+        renderCorrection: { x: 0, y: 0, angle: 0 },
+        displayedX: spawn.pos.x,
+        displayedY: spawn.pos.y,
+        displayedAngle: spawn.angle,
+        lastAckClientTimeMs: 0,
       };
     };
+
+    const seedRemoteMirrorSpawn = (slot: { id: PlayerId; slot: PlayerSlotIndex }, tangentialSpeed = 0) => {
+      if (slot.id === playerSlots[0]?.id || remotePlayerMirrors[slot.id]) return;
+      remotePlayerMirrors[slot.id] = createRuntimeForSlot(slot, tangentialSpeed);
+    };
+
+    const shipForPlayerId = (playerId: PlayerId): PlayerShipState | null => {
+      if (playerId === playerSlots[0]?.id) return player;
+      return remotePlayerMirrors[playerId] ?? null;
+    };
+
+    const allAuthoritativeShips = () => playerSlots
+      .filter((slot) => slot.connected && slot.lifeState === "alive")
+      .map((slot) => ({ slot, ship: shipForPlayerId(slot.id) }))
+      .filter((entry): entry is { slot: (typeof playerSlots)[number]; ship: PlayerShipState } => Boolean(entry.ship));
+
+    const samplePlayerTrail = (points: V2[], position: V2) => {
+      const maxTrail = Math.max(0, slidersRef.current.trail | 0);
+      if (maxTrail <= 0) {
+        points.length = 0;
+        return;
+      }
+      points.push(position.copy());
+      if (points.length > maxTrail) points.splice(0, points.length - maxTrail);
+    };
+
+    const clearPlayerTrail = (playerId: PlayerId) => {
+      if (playerId === playerSlots[0]?.id) {
+        trail.length = 0;
+        return;
+      }
+      const runtime = remotePlayerMirrors[playerId];
+      if (runtime) runtime.trail.length = 0;
+    };
+
+    for (const slot of playerSlots) seedRemoteMirrorSpawn(slot);
 
     const resetRun = (toMenu = false) => {
       debugLog("lifecycle", "run-reset", { toMenu, previousMode: modeRef.current, wave: getLevel(levelIdxRef.current).wave });
@@ -1776,8 +1974,20 @@ export default function MetatronVectorFOIL() {
       player.stuckTime = 0;
       player.hitsTaken = 0;
       player.hitInvuln = 0;
-      markPlayerRespawned(playerSlots[0]);
-      debugLog("player", "player-respawned", { playerId: playerSlots[0]?.id, slot: playerSlots[0]?.slot, reason: "run-reset", authorityTick: authorityClock.tick });
+      guestPredictionQueue.items.length = 0;
+      guestPredictionQueue.lastAckSeq = 0;
+      guestSnapshotTimeline.clear();
+      localRenderCorrection.x = 0;
+      localRenderCorrection.y = 0;
+      localRenderCorrection.angle = 0;
+      displayedLocalPlayer = { x: player.pos.x, y: player.pos.y, angle: player.angle };
+      for (const slot of playerSlots) {
+        markPlayerRespawned(slot);
+        if (slot.id === playerSlots[0]?.id) continue;
+        const replacementRuntime = createRuntimeForSlot(slot, v0);
+        remotePlayerMirrors[slot.id] = replacementRuntime;
+      }
+      debugLog("player", "players-respawned", { players: playerSlotSummary(playerSlots), reason: "run-reset", authorityTick: authorityClock.tick });
       gunCD = 0;
       nextEnemyId = 1;
       metaAx = 0; metaAy = 0; metaAz = 0; metaPulseClock = 0;
@@ -1823,31 +2033,34 @@ export default function MetatronVectorFOIL() {
     const respawnPendingPlayersAtWaveBoundary = () => {
       const pending = respawnPendingPlayers(playerSlots);
       if (pending.length <= 0) return;
-      const localPlayerId = playerSlots[0]?.id;
+      const gm = slidersRef.current.gravity;
+      const v0 = Math.sqrt(gm / metaRadius) * T.ORBIT_GAIN;
       for (const slot of pending) {
         markPlayerRespawned(slot);
+        if (slot.id === playerSlots[0]?.id) {
+          applyLocalSlotSpawn(v0);
+          player.angularVel = 0;
+          player.thrust = 0;
+          shipBrakeInput = 0;
+          player.brakeAnim = 0;
+          player.thrustGlow = 0;
+          player.inActivatedSphere = false;
+          player.fuel = T.FUEL_MAX;
+          player.stuckTime = 0;
+          player.hitsTaken = 0;
+          player.hitInvuln = T.SHIP_HIT_IFRAME_SEC * 2;
+          trail.length = 0;
+        } else {
+          const runtime = createRuntimeForSlot(slot, v0);
+          runtime.hitInvuln = T.SHIP_HIT_IFRAME_SEC * 2;
+          remotePlayerMirrors[slot.id] = runtime;
+        }
         debugLog("player", "player-respawned", {
           playerId: slot.id,
           slot: slot.slot,
           reason: "wave-boundary",
           authorityTick: authorityClock.tick,
         });
-      }
-      if (localPlayerId && pending.some((slot) => slot.id === localPlayerId)) {
-        const gm = slidersRef.current.gravity;
-        const v0 = Math.sqrt(gm / metaRadius) * T.ORBIT_GAIN;
-        applyLocalSlotSpawn(v0);
-        player.angularVel = 0;
-        player.thrust = 0;
-        shipBrakeInput = 0;
-        player.brakeAnim = 0;
-        player.thrustGlow = 0;
-        player.inActivatedSphere = false;
-        player.fuel = T.FUEL_MAX;
-        player.stuckTime = 0;
-        player.hitsTaken = 0;
-        player.hitInvuln = T.SHIP_HIT_IFRAME_SEC * 2;
-        trail.length = 0;
       }
     };
 
@@ -1893,14 +2106,23 @@ export default function MetatronVectorFOIL() {
       return out.mul(k * press).add(tang.mul(k * tangAmt));
     };
 
-    const makeBulletFromState = (burstId: number, ownerId: PlayerId, shipState: { pos: V2; vel: V2; angle: number }) => {
+    const makeBulletFromState = (
+      burstId: number,
+      ownerId: PlayerId,
+      shipState: { pos: V2; vel: V2; angle: number },
+      options: { clientShotId?: string; predicted?: boolean; id?: string } = {},
+    ): Bullet => {
       const muzzle = V2.fromAngle(shipState.angle, 18);
       const pos = shipState.pos.copy().add(muzzle);
       const vel = V2.fromAngle(shipState.angle, T.BULLET_SPEED).add(shipState.vel.copy());
-      const id = makeAuthorityEntityId("projectile", entityIdCounters, authorityClock.tick, ownerId);
-      const bullet = {
+      const id = options.id ?? (options.predicted && options.clientShotId
+        ? `predicted-${options.clientShotId}`
+        : makeAuthorityEntityId("projectile", entityIdCounters, authorityClock.tick, ownerId));
+      const bullet: Bullet = {
         id,
         ownerId,
+        clientShotId: options.clientShotId,
+        predicted: options.predicted,
         hostTick: authorityClock.tick,
         pos,
         prevPos: pos.copy(),
@@ -2144,7 +2366,8 @@ export default function MetatronVectorFOIL() {
       furthestRadius,
     });
 
-    const enterDebrief = (causeKey: DeathCauseKey) => {
+    const enterDebrief = (causeKey: DeathCauseKey, submitAuthoritativeScore = true) => {
+      if (modeRef.current === "debrief") return;
       debriefSnapshot = buildDebriefSnapshot(causeKey);
       debugLog("lifecycle", "debrief-entered", {
         causeKey,
@@ -2152,12 +2375,13 @@ export default function MetatronVectorFOIL() {
         wave: debriefSnapshot.wave,
         survivalTimeSec: debriefSnapshot.survivalTimeSec,
       });
-      submitScoreRef.current(debriefSnapshot);
+      if (submitAuthoritativeScore && authorityClock.mode !== "client-mirror") submitScoreRef.current(debriefSnapshot);
       debriefVisibleRows = 0;
       debriefPublishAccumulator = 0;
       modeRef.current = "debrief";
       setMode("debrief");
       setDebriefPhaseNow("burn_fade");
+      publishTerminalAuthorityState?.(causeKey);
     };
 
     onDebriefAdvance = () => {
@@ -2172,37 +2396,102 @@ export default function MetatronVectorFOIL() {
       resetRun(true);
     };
 
-    const loseRun = (reason: "ship" | "sol" = "ship", causeKey: DeathCauseKey = reason === "sol" ? "sol" : "enemy") => {
-      debugWarn(reason === "sol" ? "wave" : "player", reason === "sol" ? "sol-destroyed" : "player-destroyed", {
-        reason,
-        causeKey,
-        playerId: playerSlots[0]?.id,
-        wave: getLevel(levelIdxRef.current).wave,
-        hitsTaken: player.hitsTaken,
-      });
-      if (reason === "ship") {
-        markPlayerDestroyed(playerSlots[0]);
-        debugLog("player", "player-registry-after-destruction", {
-          players: playerSlotSummary(playerSlots),
-          allPlayersDown: shouldEndRunForPlayerLoss(playerSlots),
-          authorityTick: authorityClock.tick,
-        });
+    const destroyPlayer = (slot: (typeof playerSlots)[number] | undefined, causeKey: DeathCauseKey = "enemy") => {
+      if (!slot || slot.lifeState !== "alive") return false;
+      const ship = shipForPlayerId(slot.id);
+      markPlayerDestroyed(slot);
+      clearPlayerTrail(slot.id);
+      if (ship) {
+        ship.thrust = 0;
+        ship.brakeAnim = 0;
+        ship.thrustGlow = 0;
+        ship.inActivatedSphere = false;
       }
-      if (reason === "sol") audioRef.current.solDestroyed();
-      else audioRef.current.shipDestroyed();
-      if (reason === "ship" && !shouldEndRunForPlayerLoss(playerSlots)) {
-        debugWarn("player", "local-player-destroyed-world-continues", {
-          playerId: playerSlots[0]?.id,
-          alivePlayers: playerSlots.filter((slot) => slot.connected && slot.lifeState === "alive").length,
-          authorityTick: authorityClock.tick,
-        });
+      if (slot.id === playerSlots[0]?.id) {
+        shipBrakeInput = 0;
+        gunCD = 0;
+      } else {
+        const runtime = remotePlayerMirrors[slot.id];
+        if (runtime) {
+          runtime.brakeInput = 0;
+          runtime.gunCooldown = 0;
+          runtime.pendingInputs.length = 0;
+          runtime.currentInput = neutralControl(runtime.lastInputSeq);
+        }
+      }
+      const allPlayersDown = shouldEndRunForPlayerLoss(playerSlots);
+      debugWarn("player", "player-destroyed", {
+        playerId: slot.id,
+        slot: slot.slot,
+        causeKey,
+        wave: getLevel(levelIdxRef.current).wave,
+        hitsTaken: ship?.hitsTaken,
+        allPlayersDown,
+        survivors: playerSlots.filter((candidate) => candidate.connected && candidate.lifeState === "alive").map((candidate) => candidate.id),
+        authorityTick: authorityClock.tick,
+      });
+      audioRef.current.shipDestroyed();
+      if (allPlayersDown) {
+        enterDebrief(causeKey);
+      } else {
+        waveBannerText = `P${slot.slot + 1} SIGNAL LOST // RESPAWN NEXT WAVE`;
+        waveBannerTimer = Math.max(waveBannerTimer, 2.4);
+      }
+      return true;
+    };
+
+    const loseRun = (reason: "ship" | "sol" = "ship", causeKey: DeathCauseKey = reason === "sol" ? "sol" : "enemy") => {
+      if (reason === "sol") {
+        debugWarn("wave", "sol-destroyed", { causeKey, wave: getLevel(levelIdxRef.current).wave, authorityTick: authorityClock.tick });
+        audioRef.current.solDestroyed();
+        enterDebrief(causeKey);
         return;
       }
-      enterDebrief(causeKey);
+      destroyPlayer(playerSlots[0], causeKey);
     };
 
     const killPlayer = (causeKey: DeathCauseKey = "enemy") => {
       loseRun("ship", causeKey);
+    };
+
+    const applyShipHitTo = (
+      slot: (typeof playerSlots)[number] | undefined,
+      ship: PlayerShipState | null,
+      sourcePos?: V2,
+      causeKey: DeathCauseKey = "enemy",
+      damage = 1,
+      knockback = T.SHIP_HIT_KNOCKBACK,
+    ) => {
+      if (!slot || !ship || slot.lifeState !== "alive" || ship.hitInvuln > 0) return false;
+      const appliedDamage = Math.max(0, damage);
+      ship.hitsTaken += appliedDamage;
+      ship.hitInvuln = T.SHIP_HIT_IFRAME_SEC;
+      waveDamageTaken += appliedDamage;
+      debugWarn("collision", "player-hit", {
+        playerId: slot.id,
+        slot: slot.slot,
+        causeKey,
+        damage: appliedDamage,
+        hitsTaken: ship.hitsTaken,
+        resilience: T.SHIP_RESILIENCE,
+        x: ship.pos.x,
+        y: ship.pos.y,
+        sourceX: sourcePos?.x,
+        sourceY: sourcePos?.y,
+        authorityTick: authorityClock.tick,
+      });
+      chainMultiplier = Math.max(1, chainMultiplier - SCORE_THRESHOLDS.chainDamagePenalty);
+      if (sourcePos) {
+        const away = ship.pos.copy().sub(sourcePos);
+        if (away.len() > 0.0001) ship.vel.add(away.norm().mul(knockback));
+      }
+      if (causeKey === "oort") audioRef.current.oortStrike();
+      else audioRef.current.hit();
+      if (ship.hitsTaken >= T.SHIP_RESILIENCE) {
+        destroyPlayer(slot, causeKey);
+        return true;
+      }
+      return false;
     };
 
     const applyShipHit = (
@@ -2210,39 +2499,7 @@ export default function MetatronVectorFOIL() {
       causeKey: DeathCauseKey = "enemy",
       damage = 1,
       knockback = T.SHIP_HIT_KNOCKBACK,
-    ) => {
-      if (player.hitInvuln > 0) return false;
-      const appliedDamage = Math.max(0, damage);
-      player.hitsTaken += appliedDamage;
-      player.hitInvuln = T.SHIP_HIT_IFRAME_SEC;
-      waveDamageTaken += appliedDamage;
-      debugWarn("collision", "player-hit", {
-        playerId: playerSlots[0]?.id,
-        causeKey,
-        damage: appliedDamage,
-        hitsTaken: player.hitsTaken,
-        resilience: T.SHIP_RESILIENCE,
-        x: player.pos.x,
-        y: player.pos.y,
-        sourceX: sourcePos?.x,
-        sourceY: sourcePos?.y,
-        authorityTick: authorityClock.tick,
-      });
-      chainMultiplier = Math.max(1, chainMultiplier - SCORE_THRESHOLDS.chainDamagePenalty);
-
-      if (sourcePos) {
-        const away = player.pos.copy().sub(sourcePos);
-        if (away.len() > 0.0001) player.vel.add(away.norm().mul(knockback));
-      }
-
-      if (causeKey === "oort") audioRef.current.oortStrike();
-      else audioRef.current.hit();
-      if (player.hitsTaken >= T.SHIP_RESILIENCE) {
-        killPlayer(causeKey);
-        return true;
-      }
-      return false;
-    };
+    ) => applyShipHitTo(playerSlots[0], player, sourcePos, causeKey, damage, knockback);
 
     const applyEnemyImpulse = (e: Enemy, impulseDir: V2, impulseMag: number, tangentialBias = 0) => {
       if (impulseMag <= 0) return;
@@ -2465,7 +2722,7 @@ export default function MetatronVectorFOIL() {
       return medium.depth;
     };
 
-    const getMetaNodeBonuses = () => {
+    const getMetaNodeBonuses = (point: V2 = player.pos) => {
       let passiveFuel = 0;
       let sphereFuel = 0;
       let shieldRepair = 0;
@@ -2477,7 +2734,7 @@ export default function MetatronVectorFOIL() {
         if (node.kind === "center") continue;
         const nodePos = metaNodeWorld[node.index];
         if (!nodePos) continue;
-        const d = player.pos.copy().sub(nodePos).len();
+        const d = point.copy().sub(nodePos).len();
         if (d > T.META_CIRCLE_RADIUS) continue;
 
         occupiedNode = node.index;
@@ -2519,14 +2776,14 @@ export default function MetatronVectorFOIL() {
     };
 
     const collectFuelBits = () => {
+      const activeShips = allAuthoritativeShips();
       for (let i = fuelBits.length - 1; i >= 0; i--) {
         const b = fuelBits[i];
-        const d = b.pos.copy().sub(player.pos).len();
-        if (d < 18) {
-          player.fuel = clamp(player.fuel + T.FUEL_PICKUP_AMOUNT, 0, T.FUEL_MAX);
-          audioRef.current.blip(520 + rand(-50, 50), 0.06, 0.12);
-          fuelBits.splice(i, 1);
-        }
+        const collector = activeShips.find(({ ship }) => b.pos.copy().sub(ship.pos).len() < 18);
+        if (!collector) continue;
+        collector.ship.fuel = clamp(collector.ship.fuel + T.FUEL_PICKUP_AMOUNT, 0, T.FUEL_MAX);
+        audioRef.current.blip(520 + rand(-50, 50), 0.06, 0.12);
+        fuelBits.splice(i, 1);
       }
     };
 
@@ -2547,114 +2804,122 @@ export default function MetatronVectorFOIL() {
       return smoothstep(0.05, 0.55, oortDustDensityAt(p, timeSec));
     };
 
-    const applyOortPassiveDrag = (dt: number, timeSec: number) => {
+    const applyOortPassiveDragTo = (ship: PlayerShipState, dt: number, timeSec: number) => {
       if (!T.OORT_CONSTELLATIONS_ENABLED || T.OORT_PASSIVE_DRAG <= 0) return 0;
-      const depth = oortMediumDepthAt(player.pos, timeSec);
+      const depth = oortMediumDepthAt(ship.pos, timeSec);
       if (depth <= 0) return 0;
-      player.vel.mul(clamp(Math.exp(-T.OORT_PASSIVE_DRAG * depth * dt), 0, 1));
+      ship.vel.mul(clamp(Math.exp(-T.OORT_PASSIVE_DRAG * depth * dt), 0, 1));
       return depth;
     };
 
-    const applyOortInwardPressure = (dt: number) => {
+    const applyOortPassiveDrag = (dt: number, timeSec: number) => applyOortPassiveDragTo(player, dt, timeSec);
+
+    const applyOortInwardPressureTo = (ship: PlayerShipState, dt: number) => {
       if (!T.OORT_INWARD_PRESSURE_ENABLED || T.OORT_INWARD_PRESSURE_ACCEL <= 0) return 0;
-      const r = player.pos.len();
+      const r = ship.pos.len();
       const startR = oortOuter * T.OORT_INWARD_PRESSURE_START_MULT;
       const fullR = oortOuter * T.OORT_INWARD_PRESSURE_FULL_MULT;
       if (r <= startR) return 0;
-      const inward = player.pos.copy().mul(-1);
+      const inward = ship.pos.copy().mul(-1);
       if (inward.len() <= 0.0001) return 0;
       const pressure = smoothstep(startR, fullR, r) * T.OORT_INWARD_PRESSURE_ACCEL;
-      player.vel.add(inward.norm().mul(pressure * dt));
+      ship.vel.add(inward.norm().mul(pressure * dt));
       return pressure;
     };
 
-    const applyOortCollisionRecovery = () => {
-      if (T.OORT_COLLISION_SPEED_DAMPING > 0) {
-        player.vel.mul(clamp(T.OORT_COLLISION_SPEED_DAMPING, 0, 1));
-      }
+    const applyOortInwardPressure = (dt: number) => applyOortInwardPressureTo(player, dt);
+
+    const applyOortCollisionRecoveryTo = (ship: PlayerShipState) => {
+      if (T.OORT_COLLISION_SPEED_DAMPING > 0) ship.vel.mul(clamp(T.OORT_COLLISION_SPEED_DAMPING, 0, 1));
       const bias = clamp(T.OORT_COLLISION_INWARD_BIAS, 0, 1);
       if (bias <= 0) return;
-      const speed = player.vel.len();
-      const inward = player.pos.copy().mul(-1);
+      const speed = ship.vel.len();
+      const inward = ship.pos.copy().mul(-1);
       if (speed <= 0.0001 || inward.len() <= 0.0001) return;
-      const biased = player.vel.copy().norm().mul(1 - bias).add(inward.norm().mul(bias));
+      const biased = ship.vel.copy().norm().mul(1 - bias).add(inward.norm().mul(bias));
       if (biased.len() <= 0.0001) return;
       const next = biased.norm().mul(speed);
-      player.vel.x = next.x;
-      player.vel.y = next.y;
+      ship.vel.x = next.x;
+      ship.vel.y = next.y;
     };
 
-    const applyOortAmbientAbrasion = (dt: number, timeSec: number) => {
+    const applyOortAmbientAbrasionTo = (
+      slot: (typeof playerSlots)[number],
+      ship: PlayerShipState,
+      dt: number,
+      timeSec: number,
+      primary = false,
+    ) => {
       if (!T.OORT_CONSTELLATIONS_ENABLED || T.OORT_DUST_DAMAGE_PER_SECOND <= 0) {
-        audioRef.current.setOortDust(0);
+        if (primary) audioRef.current.setOortDust(0);
         return false;
       }
-      const density = oortDustDensityAt(player.pos, timeSec);
+      const density = oortDustDensityAt(ship.pos, timeSec);
       if (density <= 0.015) {
-        audioRef.current.setOortDust(0);
+        if (primary) audioRef.current.setOortDust(0);
         return false;
       }
-      const speedFactor = 0.38 + player.vel.len() * T.OORT_DUST_SPEED_SCALE;
+      const speedFactor = 0.38 + ship.vel.len() * T.OORT_DUST_SPEED_SCALE;
       const damage = density * T.OORT_DUST_DAMAGE_PER_SECOND * speedFactor * dt;
       if (damage <= 0) {
-        audioRef.current.setOortDust(0);
+        if (primary) audioRef.current.setOortDust(0);
         return false;
       }
-      audioRef.current.setOortDust(clamp(density * speedFactor * 0.85, 0, 1));
-      player.hitsTaken += damage;
+      if (primary) audioRef.current.setOortDust(clamp(density * speedFactor * 0.85, 0, 1));
+      ship.hitsTaken += damage;
       waveDamageTaken += damage;
-      if (player.hitsTaken >= T.SHIP_RESILIENCE) {
-        killPlayer("oort");
+      if (ship.hitsTaken >= T.SHIP_RESILIENCE) {
+        destroyPlayer(slot, "oort");
         return true;
       }
       return false;
     };
 
-    const applyOortPlayerHazards = (dt: number, playerPrevPos: V2) => {
+    const applyOortPlayerHazardsTo = (
+      slot: (typeof playerSlots)[number],
+      ship: PlayerShipState,
+      dt: number,
+      previousPos: V2,
+      primary = false,
+    ) => {
       if (!T.OORT_CONSTELLATIONS_ENABLED) return false;
       const timeSec = metaPulseClock;
-      if (applyOortAmbientAbrasion(dt, timeSec)) return true;
-      if (player.hitInvuln > 0) return false;
-
-      const speed = player.vel.len();
+      if (applyOortAmbientAbrasionTo(slot, ship, dt, timeSec, primary)) return true;
+      if (ship.hitInvuln > 0) return false;
+      const speed = ship.vel.len();
       const lineHitR = T.SHIP_HIT_RADIUS + T.OORT_LINE_HIT_RADIUS;
       const nodeHitR = T.SHIP_HIT_RADIUS + T.OORT_NODE_HIT_RADIUS;
       for (const c of oortClusters) {
         if (c.brokenUntil > timeSec) continue;
         const center = oortClusterCenter(c, timeSec);
-        const coarse = center.copy().sub(player.pos).len();
+        const coarse = center.copy().sub(ship.pos).len();
         if (coarse > T.OORT_HAZARD_WAKE_RADIUS + c.glyphRadius + T.SHIP_HIT_RADIUS) continue;
-
         const pts = oortClusterNodes(c, timeSec);
-        let struck = false;
-        for (const p of pts) {
-          if (pointSegmentDistanceSq(p, playerPrevPos, player.pos) <= nodeHitR * nodeHitR) {
-            struck = true;
-            break;
-          }
-        }
+        let struck = pts.some((point) => pointSegmentDistanceSq(point, previousPos, ship.pos) <= nodeHitR * nodeHitR);
         if (!struck) {
           for (const [ai, bi] of oortClusterLinks(c)) {
             const a = pts[ai];
             const b = pts[bi];
             if (!a || !b) continue;
-            const res = closestPointsOnSegments(playerPrevPos, player.pos, a, b);
-            if (res.d2 <= lineHitR * lineHitR) {
+            if (closestPointsOnSegments(previousPos, ship.pos, a, b).d2 <= lineHitR * lineHitR) {
               struck = true;
               break;
             }
           }
         }
-
-        if (struck) {
-          c.pulseUntil = timeSec + 0.72;
-          const damage = (T.OORT_COLLISION_BASE_DAMAGE + speed * T.OORT_COLLISION_SPEED_DAMAGE) * c.hazard;
-          const died = applyShipHit(center, "oort", damage, T.OORT_COLLISION_KNOCKBACK);
-          if (!died) applyOortCollisionRecovery();
-          return died;
-        }
+        if (!struck) continue;
+        c.pulseUntil = timeSec + 0.72;
+        const damage = (T.OORT_COLLISION_BASE_DAMAGE + speed * T.OORT_COLLISION_SPEED_DAMAGE) * c.hazard;
+        const died = applyShipHitTo(slot, ship, center, "oort", damage, T.OORT_COLLISION_KNOCKBACK);
+        if (!died) applyOortCollisionRecoveryTo(ship);
+        return died;
       }
       return false;
+    };
+
+    const applyOortPlayerHazards = (dt: number, previousPos: V2) => {
+      const slot = playerSlots[0];
+      return slot ? applyOortPlayerHazardsTo(slot, player, dt, previousPos, true) : false;
     };
 
     const breakOortCluster = (c: OortCluster, timeSec: number) => {
@@ -2711,29 +2976,186 @@ export default function MetatronVectorFOIL() {
       }
     };
 
+    const simulatePlayerShip = (
+      ship: PlayerShipState,
+      control: Pick<PlayerControlState, "rotate" | "thrust" | "brake">,
+      dt: number,
+      currentBrakeInput: number,
+    ) => {
+      const lvl = getLevel(levelIdxRef.current);
+      const thrustForce = slidersRef.current.thrust;
+      const solar = slidersRef.current.solar;
+      ship.hitInvuln = Math.max(0, ship.hitInvuln - dt);
+
+      const turnInput = clamp(control.rotate, -1, 1);
+      if (T.SHIP_ROTATIONAL_INERTIA_ENABLED) {
+        ship.angularVel = clamp(
+          ship.angularVel + turnInput * T.SHIP_ANGULAR_ACCEL * dt,
+          -T.SHIP_MAX_ANGULAR_SPEED,
+          T.SHIP_MAX_ANGULAR_SPEED,
+        );
+        if (Math.abs(turnInput) < 0.001 && T.SHIP_ANGULAR_DAMPING > 0) ship.angularVel *= Math.exp(-T.SHIP_ANGULAR_DAMPING * dt);
+        ship.angle += ship.angularVel * dt;
+      } else {
+        ship.angularVel = 0;
+        ship.angle += turnInput * T.ROT_SPEED * dt;
+      }
+
+      const thrustIntent = clamp(control.thrust, 0, 1);
+      const brakeIntent = clamp(control.brake, 0, 1);
+      ship.thrust = lerp(ship.thrust, thrustIntent, thrustIntent > 0 ? 0.16 : 0.10);
+      const nextBrakeInput = lerp(currentBrakeInput, brakeIntent, brakeIntent > 0 ? 0.18 : 0.12);
+
+      const dist = ship.pos.len();
+      const outside = dist > horizonR;
+      const use = Math.max(0, ship.thrust);
+      if (use > 0.03 && ship.fuel > 0) ship.fuel = Math.max(0, ship.fuel - T.FUEL_BURN * use * dt);
+
+      const nodeBonuses = getMetaNodeBonuses(ship.pos);
+      ship.inActivatedSphere = nodeBonuses.insideAwakenedSphere;
+      const baseFuelRegen = outside ? T.FUEL_REGEN_OUTER : T.FUEL_REGEN_INNER;
+      const totalFuelRegen = baseFuelRegen + nodeBonuses.passiveFuel + nodeBonuses.sphereFuel;
+      if (totalFuelRegen > 0) ship.fuel = Math.min(T.FUEL_MAX, ship.fuel + totalFuelRegen * dt);
+      if (nodeBonuses.shieldRepair > 0 && ship.hitInvuln <= 0) ship.hitsTaken = Math.max(0, ship.hitsTaken - nodeBonuses.shieldRepair * dt);
+
+      const velBefore = ship.vel.copy();
+      const g = gravityAt(ship.pos, lvl.gravityGM);
+      const nodeG = T.META_NODE_GRAVITY_AFFECTS_PLAYER ? activeMetaNodeGravityAt(ship.pos, lvl.gravityGM) : new V2(0, 0);
+      const sail = solarSailAt(ship.pos, ship.angle, lvl.solarPressure * (solar / T.SOLAR_PRESSURE));
+      const fwd = V2.fromAngle(ship.angle, 1);
+      const engine = fwd.copy().mul((ship.fuel > 0 ? 1 : 0) * Math.max(0, ship.thrust) * thrustForce);
+      ship.vel.add(g.mul(dt));
+      ship.vel.add(nodeG.mul(dt));
+      ship.vel.add(sail.mul(dt / T.SHIP_MASS));
+      ship.vel.add(engine.mul(dt / T.SHIP_MASS));
+
+      const brake = clamp(nextBrakeInput, 0, 1);
+      const oortBrakeMedium = T.OORT_ALLOWS_BRAKING ? T.OORT_BRAKE_MULTIPLIER * oortMediumDepthAt(ship.pos, metaPulseClock) : 0;
+      const brakeMedium = T.BRAKING_REQUIRES_ACTIVATED_SPHERE
+        ? (nodeBonuses.insideAwakenedSphere ? 1 : Math.max(T.OPEN_SPACE_BRAKE_MULTIPLIER, oortBrakeMedium))
+        : 1;
+      const effectiveBrake = brake * brakeMedium;
+      ship.brakeAnim = lerp(ship.brakeAnim, effectiveBrake, effectiveBrake > 0 ? 0.22 : 0.11);
+      ship.thrustGlow = lerp(ship.thrustGlow, (ship.fuel > 0 ? 1 : 0) * Math.max(0, ship.thrust), ship.thrust > 0 ? 0.18 : 0.10);
+      if (effectiveBrake > 0.001) ship.vel.mul(lerp(1, T.BRAKE_COEFF, effectiveBrake));
+      if (nodeBonuses.mediumDepth > 0 && T.META_SPHERE_PLAYER_MEDIUM_DRAG > 0) {
+        const mediumDrag = Math.exp(-T.META_SPHERE_PLAYER_MEDIUM_DRAG * nodeBonuses.mediumDepth * dt);
+        ship.vel.mul(clamp(mediumDrag, 0, 1));
+      }
+      applyOortPassiveDragTo(ship, dt, metaPulseClock);
+      applyOortInwardPressureTo(ship, dt);
+      if (T.DRAG > 0) ship.vel.mul(1 - T.DRAG * dt);
+      const speed = ship.vel.len();
+      if (speed > T.MAX_SPEED) ship.vel.mul(T.MAX_SPEED / speed);
+      const previousPosition = ship.pos.copy();
+      ship.pos.add(ship.vel.copy().mul(dt));
+      return { brakeInput: nextBrakeInput, previousPosition, velBefore };
+    };
+
+    const simulateSecondaryAuthoritativePlayers = (dt: number) => {
+      if (authorityClock.mode === "client-mirror") return false;
+      const descriptors = getConnectedGamepadDescriptors();
+      const solCrashR = Math.max(1, T.STAR_COLLISION_RADIUS + T.SHIP_HIT_RADIUS * 0.25);
+      for (const slot of playerSlots) {
+        if (slot.id === playerSlots[0]?.id || !slot.connected || slot.lifeState !== "alive") continue;
+        const runtime = remotePlayerMirrors[slot.id];
+        if (!runtime) continue;
+
+        let control = runtime.currentInput;
+        if (runtime.local) {
+          const descriptor = descriptors[slot.slot];
+          runtime.localGamepadIndex = descriptor?.index ?? runtime.localGamepadIndex;
+          const pad = runtime.localGamepadIndex === null ? null : readGamepadShipInputForIndex(runtime.localGamepadIndex, dt);
+          const seq = nextInputSequence(authorityClock, slot.id);
+          control = {
+            rotate: pad?.rotate ?? 0,
+            thrust: pad?.thrust ?? 0,
+            brake: pad?.brake ?? 0,
+            fireHeld: pad?.fire ?? false,
+            firePressed: pad?.firePressed ?? false,
+            clientShotId: (pad?.fire ?? false) && runtime.gunCooldown <= 0 ? `${slot.id}-${seq}` : undefined,
+            seq,
+            clientTick: authorityClock.tick,
+            simulationDtMs: dt * 1000,
+            clientTimeMs: Date.now(),
+          };
+          markInputSequenceApplied(authorityClock, slot.id, seq);
+        } else if (runtime.pendingInputs.length > 0) {
+          control = runtime.pendingInputs.shift() ?? runtime.currentInput;
+          markInputSequenceApplied(authorityClock, slot.id, control.seq);
+          ackClientTimeMsByPlayer[slot.id] = control.clientTimeMs;
+        } else {
+          control = { ...runtime.currentInput, firePressed: false, clientShotId: undefined };
+        }
+        runtime.currentInput = control;
+        runtime.lastInputSeq = control.seq;
+        slot.lastInputSeq = control.seq;
+
+        const result = simulatePlayerShip(runtime, control, dt, runtime.brakeInput);
+        runtime.brakeInput = result.brakeInput;
+        runtime.gunCooldown = Math.max(0, runtime.gunCooldown - dt);
+        if ((control.firePressed || control.fireHeld) && runtime.gunCooldown <= 0) {
+          const burstId = beginShotBurstIfNeeded();
+          const stats = burstStats.get(burstId);
+          if (stats) { stats.shots += 1; stats.active += 1; }
+          bullets.push(makeBulletFromState(burstId, slot.id, runtime, { clientShotId: control.clientShotId }));
+          runtime.gunCooldown = T.FIRE_RATE;
+          audioRef.current.shoot();
+        }
+        runtime.currentInput = { ...control, firePressed: false, clientShotId: undefined };
+        samplePlayerTrail(runtime.trail, runtime.pos);
+
+        if (pointSegmentDistanceSq(new V2(0, 0), result.previousPosition, runtime.pos) <= solCrashR * solCrashR) {
+          destroyPlayer(slot, "sol");
+          if (modeRef.current === "debrief") return true;
+          continue;
+        }
+        if (applyOortPlayerHazardsTo(slot, runtime, dt, result.previousPosition, false)) {
+          if (modeRef.current === "debrief") return true;
+          continue;
+        }
+        const dStar = runtime.pos.len();
+        if (dStar < T.STAR_TRAP_RADIUS && runtime.vel.len() < 120) {
+          runtime.stuckTime += dt;
+          if (runtime.stuckTime >= T.STAR_TRAP_TIME) {
+            destroyPlayer(slot, runtime.fuel <= 0 ? "fuel" : "well");
+            if (modeRef.current === "debrief") return true;
+          }
+        } else runtime.stuckTime = 0;
+      }
+      return false;
+    };
+
     const buildAuthoritySnapshot = (): NetWorldSnapshot => {
-      const localSlot = playerSlots[0];
-      const players = playerSlots.map((slot) => ({
-        id: slot.id,
-        slot: slot.slot,
-        callsign: slot.callsign ?? null,
-        alive: slot.lifeState === "alive",
-        respawnPending: slot.lifeState === "respawn-pending",
-        x: slot.id === localSlot?.id ? player.pos.x : (remotePlayerMirrors[slot.id]?.x ?? 0),
-        y: slot.id === localSlot?.id ? player.pos.y : (remotePlayerMirrors[slot.id]?.y ?? 0),
-        vx: slot.id === localSlot?.id ? player.vel.x : (remotePlayerMirrors[slot.id]?.vx ?? 0),
-        vy: slot.id === localSlot?.id ? player.vel.y : (remotePlayerMirrors[slot.id]?.vy ?? 0),
-        angle: slot.id === localSlot?.id ? player.angle : (remotePlayerMirrors[slot.id]?.angle ?? 0),
-        angularVelocity: slot.id === localSlot?.id ? player.angularVel : (remotePlayerMirrors[slot.id]?.angularVelocity ?? 0),
-        fuel: slot.id === localSlot?.id ? player.fuel : (remotePlayerMirrors[slot.id]?.fuel ?? 0),
-        hitsTaken: slot.id === localSlot?.id ? player.hitsTaken : (remotePlayerMirrors[slot.id]?.hitsTaken ?? 0),
-        lastInputSeq: slot.lastInputSeq,
-      }));
+      const players = playerSlots.map((slot) => {
+        const ship = shipForPlayerId(slot.id);
+        const runtime = remotePlayerMirrors[slot.id];
+        return {
+          id: slot.id,
+          slot: slot.slot,
+          callsign: slot.callsign ?? null,
+          alive: slot.lifeState === "alive",
+          respawnPending: slot.lifeState === "respawn-pending",
+          x: ship?.pos.x ?? 0,
+          y: ship?.pos.y ?? 0,
+          vx: ship?.vel.x ?? 0,
+          vy: ship?.vel.y ?? 0,
+          angle: ship?.angle ?? 0,
+          angularVelocity: ship?.angularVel ?? 0,
+          fuel: ship?.fuel ?? 0,
+          hitsTaken: ship?.hitsTaken ?? 0,
+          thrust: ship?.thrust ?? 0,
+          brake: slot.id === playerSlots[0]?.id ? shipBrakeInput : (runtime?.brakeInput ?? 0),
+          lastInputSeq: slot.lastInputSeq,
+        };
+      });
 
       return {
         type: "world-snapshot",
         protocolVersion: MULTIPLAYER_PROTOCOL_VERSION,
         authorityRole: authorityClock.mode === "solo-authority" ? "solo" : authorityClock.mode === "host" ? "host" : "guest",
+        runState: modeRef.current === "debrief" ? "debrief" : "playing",
+        gameOverCause: debriefSnapshot?.causeKey,
         tick: authorityClock.tick,
         serverTimeMs: Date.now(),
         players,
@@ -2747,34 +3169,63 @@ export default function MetatronVectorFOIL() {
           morphing: e.morphing,
           nextKind: e.nextKind,
         })),
-        projectiles: bullets.map((b) => ({
-          id: b.id,
-          ownerId: b.ownerId,
-          hostTick: b.hostTick,
-          x: b.pos.x,
-          y: b.pos.y,
-          vx: b.vel.x,
-          vy: b.vel.y,
-          ageMs: Math.max(0, runClockMs - b.firedAtMs),
-          kind: "blaster",
-        })),
-        shrapnel: shards.map((s) => ({
-          id: s.id,
-          sourceEnemyId: s.sourceEnemyId,
-          hostTick: s.hostTick,
-          x: s.pos.x,
-          y: s.pos.y,
-          vx: s.vel.x,
-          vy: s.vel.y,
-          lifeMs: Math.max(0, s.life * 1000),
-          size: s.size,
-          hue: s.hue,
+        projectiles: bullets
+          .filter((b) => !b.predicted)
+          .map((b) => ({
+            id: b.id,
+            ownerId: b.ownerId,
+            clientShotId: b.clientShotId,
+            hostTick: b.hostTick,
+            x: b.pos.x,
+            y: b.pos.y,
+            vx: b.vel.x,
+            vy: b.vel.y,
+            ageMs: Math.max(0, runClockMs - b.firedAtMs),
+            kind: "blaster",
+          })),
+        shrapnel: shards.map((fragment) => ({
+          id: fragment.id,
+          sourceEnemyId: fragment.sourceEnemyId,
+          hostTick: fragment.hostTick,
+          x: fragment.pos.x,
+          y: fragment.pos.y,
+          vx: fragment.vel.x,
+          vy: fragment.vel.y,
+          lifeMs: Math.max(0, fragment.life * 1000),
+          size: fragment.size,
+          hue: fragment.hue,
         })),
         wave: getLevel(levelIdxRef.current).wave,
         score: Math.round(score),
         solIntegrity: 1,
         ackInputSeqByPlayer: ackInputSeqByPlayer(authorityClock),
+        ackClientTimeMsByPlayer: { ...ackClientTimeMsByPlayer },
       };
+    };
+
+    publishTerminalAuthorityState = (causeKey: DeathCauseKey) => {
+      if (authorityClock.mode !== "host") return;
+      const snapshot = buildAuthoritySnapshot();
+      const snapshotSent = transport.broadcastFromHost(snapshot);
+      const eventSent = transport.broadcastFromHost({
+        type: "world-event",
+        protocolVersion: MULTIPLAYER_PROTOCOL_VERSION,
+        tick: authorityClock.tick,
+        serverTimeMs: Date.now(),
+        event: "run-ended",
+        data: {
+          causeKey,
+          score: debriefSnapshot?.score ?? Math.round(score),
+          wave: debriefSnapshot?.wave ?? getLevel(levelIdxRef.current).wave,
+          survivalTimeSec: debriefSnapshot?.survivalTimeSec ?? runClockMs / 1000,
+        },
+      });
+      debugLog("network", "terminal-state-broadcast", {
+        causeKey,
+        snapshotSent,
+        eventSent,
+        authorityTick: authorityClock.tick,
+      });
     };
 
     const ensureRemoteSlot = (playerId: PlayerId, callsign?: string | null, preferredSlot?: number | null) => {
@@ -2798,101 +3249,195 @@ export default function MetatronVectorFOIL() {
       return slot;
     };
 
-    const mirrorRemoteInputTelemetry = (input: NetInputMessage) => {
-      if (
-        typeof input.x !== "number" || typeof input.y !== "number" ||
-        typeof input.vx !== "number" || typeof input.vy !== "number" ||
-        typeof input.angle !== "number"
-      ) return;
-      remotePlayerMirrors[input.playerId] = {
-        x: input.x,
-        y: input.y,
-        vx: input.vx,
-        vy: input.vy,
-        angle: input.angle,
-        angularVelocity: typeof input.angularVelocity === "number" ? input.angularVelocity : 0,
-        fuel: remotePlayerMirrors[input.playerId]?.fuel ?? T.FUEL_MAX,
-        hitsTaken: remotePlayerMirrors[input.playerId]?.hitsTaken ?? 0,
-        lastInputSeq: input.seq,
-      };
+    const toControlState = (frame: NetInputFramePayload): PlayerControlState => ({
+      rotate: clamp(frame.rotate, -1, 1),
+      thrust: clamp(frame.thrust, 0, 1),
+      brake: clamp(frame.brake, 0, 1),
+      fireHeld: Boolean(frame.fireHeld),
+      firePressed: Boolean(frame.firePressed),
+      clientShotId: frame.clientShotId,
+      seq: frame.seq,
+      clientTick: frame.clientTick,
+      simulationDtMs: clamp(frame.simulationDtMs || T.FIXED_DT * 1000, 1, 50),
+      clientTimeMs: frame.clientTimeMs,
+    });
+
+    const enqueueRemoteInput = (input: NetInputMessage) => {
+      const slot = ensureRemoteSlot(input.playerId);
+      if (!slot) return 0;
+      const runtime = remotePlayerMirrors[input.playerId];
+      if (!runtime) return 0;
+      const frames = [...(input.recentInputs ?? []), input]
+        .sort((a, b) => a.seq - b.seq)
+        .filter((frame, index, all) => index === 0 || all[index - 1].seq !== frame.seq);
+      let accepted = 0;
+      for (const frame of frames) {
+        const framedMessage = { playerId: input.playerId, seq: frame.seq };
+        if (!acceptInputSequence(authorityClock, framedMessage)) continue;
+        runtime.pendingInputs.push(toControlState(frame));
+        accepted += 1;
+      }
+      if (runtime.pendingInputs.length > MULTIPLAYER_NET_CONFIG.maxPendingPredictedInputs) {
+        runtime.pendingInputs.splice(0, runtime.pendingInputs.length - MULTIPLAYER_NET_CONFIG.maxPendingPredictedInputs);
+      }
+      return accepted;
     };
 
-    const maybeFireRemoteProjectile = (input: NetInputMessage) => {
-      if (!input.firePressed) return;
-      if ((remoteGunCooldowns[input.playerId] ?? 0) > 0) return;
-      const mirror = remotePlayerMirrors[input.playerId];
-      if (!mirror) {
-        debugWarn("projectile", "remote-fire-without-telemetry", { playerId: input.playerId, seq: input.seq, authorityTick: authorityClock.tick });
-        return;
+    const reconcileLocalPlayerFromSnapshot = (snapshot: NetWorldSnapshot, localNetPlayer: NetPlayerState, inbound: InboundTransportMessage) => {
+      localJoinAccepted = true;
+      const localPlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
+      const previousDisplayed = {
+        x: player.pos.x + localRenderCorrection.x,
+        y: player.pos.y + localRenderCorrection.y,
+        angle: player.angle + localRenderCorrection.angle,
+      };
+      player.pos = new V2(localNetPlayer.x, localNetPlayer.y);
+      player.vel = new V2(localNetPlayer.vx, localNetPlayer.vy);
+      player.angle = localNetPlayer.angle;
+      player.angularVel = localNetPlayer.angularVelocity;
+      player.fuel = localNetPlayer.fuel;
+      player.hitsTaken = localNetPlayer.hitsTaken;
+      player.thrust = localNetPlayer.thrust ?? player.thrust;
+      shipBrakeInput = localNetPlayer.brake ?? shipBrakeInput;
+
+      const ackSeq = snapshot.ackInputSeqByPlayer[localPlayerId] ?? localNetPlayer.lastInputSeq ?? 0;
+      acknowledgePredictedInputs(guestPredictionQueue, ackSeq);
+      let replayed = 0;
+      for (const pending of guestPredictionQueue.items) {
+        const simulated = simulatePlayerShip(player, pending, pending.simulationDtMs / 1000, shipBrakeInput);
+        shipBrakeInput = simulated.brakeInput;
+        replayed += 1;
       }
-      const burstId = currentBurstId++;
-      bullets.push(makeBulletFromState(burstId, input.playerId, {
-        pos: new V2(mirror.x, mirror.y),
-        vel: new V2(mirror.vx, mirror.vy),
-        angle: mirror.angle,
-      }));
-      remoteGunCooldowns[input.playerId] = T.FIRE_RATE;
-      audioRef.current.shoot();
-      debugLog("projectile", "remote-projectile-authorized", {
-        playerId: input.playerId,
-        seq: input.seq,
-        burstId,
-        authorityTick: authorityClock.tick,
+
+      const correctionDistance = Math.hypot(previousDisplayed.x - player.pos.x, previousDisplayed.y - player.pos.y);
+      const angularCorrection = Math.abs(shortestAngleDelta(player.angle, previousDisplayed.angle));
+      if (correctionDistance >= MULTIPLAYER_NET_CONFIG.correctionSnapDistance || angularCorrection >= MULTIPLAYER_NET_CONFIG.correctionSnapAngleRad) {
+        localRenderCorrection.x = 0;
+        localRenderCorrection.y = 0;
+        localRenderCorrection.angle = 0;
+      } else {
+        addRenderCorrection(localRenderCorrection, previousDisplayed, { x: player.pos.x, y: player.pos.y, angle: player.angle });
+      }
+      displayedLocalPlayer = previousDisplayed;
+      const ackClientTimeMs = snapshot.ackClientTimeMsByPlayer?.[localPlayerId] ?? 0;
+      guestSnapshotTimeline.updateMetrics({
+        lastAckSeq: ackSeq,
+        pendingInputs: guestPredictionQueue.items.length,
+        replayedInputs: replayed,
+        correctionDistance,
+        angularCorrection,
+        snapshotAgeMs: Math.max(0, Date.now() - snapshot.serverTimeMs),
       });
+      if (correctionDistance > MULTIPLAYER_NET_CONFIG.largeCorrectionWarnDistance) {
+        debugWarn("snapshot", "large-player-correction", {
+          playerId: localPlayerId,
+          correction: correctionDistance,
+          angularCorrection,
+          tick: snapshot.tick,
+          via: inbound.via,
+          replayed,
+          ackSeq,
+          pendingInputs: guestPredictionQueue.items.length,
+          roundTripMs: ackClientTimeMs > 0 ? Date.now() - ackClientTimeMs : undefined,
+        });
+      }
     };
 
     const applyAuthoritySnapshot = (snapshot: NetWorldSnapshot, inbound: InboundTransportMessage) => {
       if (!acceptWorldSnapshot(authorityClock, snapshot)) return;
+      if (!guestSnapshotTimeline.push(snapshot, inbound.receivedAtMs)) return;
       const localPlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
       const localNetPlayer = snapshot.players.find((candidate) => candidate.id === localPlayerId);
-      if (localNetPlayer) {
-        localJoinAccepted = true;
-        const before = player.pos.copy();
-        player.pos = new V2(localNetPlayer.x, localNetPlayer.y);
-        player.vel = new V2(localNetPlayer.vx, localNetPlayer.vy);
-        player.angle = localNetPlayer.angle;
-        player.angularVel = localNetPlayer.angularVelocity;
-        player.fuel = localNetPlayer.fuel;
-        player.hitsTaken = localNetPlayer.hitsTaken;
-        const correction = before.sub(player.pos).len();
-        if (correction > MULTIPLAYER_NET_CONFIG.largeCorrectionWarnDistance) {
-          debugWarn("snapshot", "large-player-correction", {
-            playerId: localPlayerId,
-            correction,
-            tick: snapshot.tick,
-            via: inbound.via,
-          });
-        }
-      }
+      if (localNetPlayer) reconcileLocalPlayerFromSnapshot(snapshot, localNetPlayer, inbound);
+
       for (const netPlayer of snapshot.players) {
-        const existing = playerSlots.find((slot) => slot.id === netPlayer.id) ?? assignNextPlayerSlot(playerSlots, netPlayer.id, netPlayer.id === localPlayerId ? transportLaunch.role : "guest", netPlayer.callsign ?? null);
-        if (existing) {
-          existing.slot = netPlayer.slot;
-          existing.connected = true;
-          existing.lifeState = netPlayer.alive ? "alive" : netPlayer.respawnPending ? "respawn-pending" : "dead";
-          existing.lastInputSeq = netPlayer.lastInputSeq;
-          existing.callsign = netPlayer.callsign ?? existing.callsign;
-        }
-        if (netPlayer.id !== localPlayerId) {
-          remotePlayerMirrors[netPlayer.id] = {
-            x: netPlayer.x,
-            y: netPlayer.y,
-            vx: netPlayer.vx,
-            vy: netPlayer.vy,
-            angle: netPlayer.angle,
-            angularVelocity: netPlayer.angularVelocity,
-            fuel: netPlayer.fuel,
-            hitsTaken: netPlayer.hitsTaken,
-            lastInputSeq: netPlayer.lastInputSeq,
-          };
-        }
+        const existing = playerSlots.find((slot) => slot.id === netPlayer.id)
+          ?? assignNextPlayerSlot(playerSlots, netPlayer.id, netPlayer.id === localPlayerId ? transportLaunch.role : "guest", netPlayer.callsign ?? null);
+        if (!existing) continue;
+        existing.slot = netPlayer.slot;
+        existing.connected = true;
+        existing.lifeState = netPlayer.alive ? "alive" : netPlayer.respawnPending ? "respawn-pending" : "dead";
+        existing.lastInputSeq = netPlayer.lastInputSeq;
+        existing.callsign = netPlayer.callsign ?? existing.callsign;
+        if (netPlayer.id !== localPlayerId) seedRemoteMirrorSpawn(existing);
       }
 
-      const incomingEnemies = new Map(snapshot.enemies.map((enemy) => [enemy.id, enemy]));
-      for (let i = enemies.length - 1; i >= 0; i--) {
-        if (!incomingEnemies.has(enemies[i].id)) enemies.splice(i, 1);
+      score = snapshot.score;
+      const nextLevelIdx = Math.max(0, snapshot.wave - 1);
+      if (nextLevelIdx !== levelIdxRef.current) {
+        levelIdxRef.current = nextLevelIdx;
+        setLevelIdx(nextLevelIdx);
       }
-      for (const netEnemy of snapshot.enemies) {
+      if (snapshot.runState === "debrief") {
+        const cause = deathCauseKeyFromUnknown(snapshot.gameOverCause);
+        enterDebrief(cause, false);
+      }
+      debugLog("snapshot", "snapshot-buffered", {
+        tick: snapshot.tick,
+        via: inbound.via,
+        players: snapshot.players.length,
+        enemies: snapshot.enemies.length,
+        projectiles: snapshot.projectiles.length,
+        shrapnel: snapshot.shrapnel.length,
+        metrics: guestSnapshotTimeline.getMetrics(),
+      }, "debug");
+    };
+
+    const interpolateNetPlayer = (older: NetPlayerState | undefined, newer: NetPlayerState, alpha: number) => ({
+      x: older ? lerpNumber(older.x, newer.x, alpha) : newer.x,
+      y: older ? lerpNumber(older.y, newer.y, alpha) : newer.y,
+      vx: older ? lerpNumber(older.vx, newer.vx, alpha) : newer.vx,
+      vy: older ? lerpNumber(older.vy, newer.vy, alpha) : newer.vy,
+      angle: older ? lerpAngle(older.angle, newer.angle, alpha) : newer.angle,
+      angularVelocity: older ? lerpNumber(older.angularVelocity, newer.angularVelocity, alpha) : newer.angularVelocity,
+      fuel: older ? lerpNumber(older.fuel, newer.fuel, Math.min(1, alpha)) : newer.fuel,
+      hitsTaken: older ? lerpNumber(older.hitsTaken, newer.hitsTaken, Math.min(1, alpha)) : newer.hitsTaken,
+      thrust: newer.thrust ?? 0,
+      brake: newer.brake ?? 0,
+    });
+
+    const applyInterpolatedSnapshotPresentation = () => {
+      const sample = guestSnapshotTimeline.sample(Date.now(), MULTIPLAYER_NET_CONFIG.interpolationDelayMs);
+      if (!sample) return;
+      const { older, newer, alpha } = sample;
+      const localPlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
+      const olderPlayers = new Map(older.players.map((entry) => [entry.id, entry]));
+      for (const netPlayer of newer.players) {
+        if (netPlayer.id === localPlayerId) continue;
+        const slot = playerSlots.find((candidate) => candidate.id === netPlayer.id)
+          ?? assignNextPlayerSlot(playerSlots, netPlayer.id, "guest", netPlayer.callsign ?? null);
+        if (!slot) continue;
+        slot.slot = netPlayer.slot;
+        slot.connected = true;
+        slot.lifeState = netPlayer.alive ? "alive" : netPlayer.respawnPending ? "respawn-pending" : "dead";
+        seedRemoteMirrorSpawn(slot);
+        const runtime = remotePlayerMirrors[netPlayer.id];
+        if (!runtime) continue;
+        const state = interpolateNetPlayer(olderPlayers.get(netPlayer.id), netPlayer, alpha);
+        runtime.pos.x = state.x;
+        runtime.pos.y = state.y;
+        runtime.vel.x = state.vx;
+        runtime.vel.y = state.vy;
+        runtime.angle = state.angle;
+        runtime.angularVel = state.angularVelocity;
+        runtime.fuel = state.fuel;
+        runtime.hitsTaken = state.hitsTaken;
+        runtime.thrust = state.thrust;
+        runtime.thrustGlow = lerp(runtime.thrustGlow, clamp(state.thrust, 0, 1), 0.22);
+        runtime.brakeInput = state.brake;
+        runtime.displayedX = state.x;
+        runtime.displayedY = state.y;
+        runtime.displayedAngle = state.angle;
+        runtime.lastInputSeq = netPlayer.lastInputSeq;
+        if (slot.lifeState === "alive") samplePlayerTrail(runtime.trail, runtime.pos);
+        else runtime.trail.length = 0;
+      }
+
+      const olderEnemies = new Map(older.enemies.map((entry) => [entry.id, entry]));
+      const liveEnemyIds = new Set(newer.enemies.map((entry) => entry.id));
+      for (let index = enemies.length - 1; index >= 0; index -= 1) if (!liveEnemyIds.has(enemies[index].id)) enemies.splice(index, 1);
+      for (const netEnemy of newer.enemies) {
+        const prior = olderEnemies.get(netEnemy.id);
         let enemy = enemies.find((candidate) => candidate.id === netEnemy.id);
         if (!enemy) {
           enemy = {
@@ -2912,8 +3457,10 @@ export default function MetatronVectorFOIL() {
           };
           enemies.push(enemy);
         }
-        enemy.pos = new V2(netEnemy.x, netEnemy.y);
-        enemy.vel = new V2(netEnemy.vx, netEnemy.vy);
+        enemy.pos.x = prior ? lerpNumber(prior.x, netEnemy.x, alpha) : netEnemy.x;
+        enemy.pos.y = prior ? lerpNumber(prior.y, netEnemy.y, alpha) : netEnemy.y;
+        enemy.vel.x = prior ? lerpNumber(prior.vx, netEnemy.vx, alpha) : netEnemy.vx;
+        enemy.vel.y = prior ? lerpNumber(prior.vy, netEnemy.vy, alpha) : netEnemy.vy;
         if (enemy.kind !== netEnemy.kind) {
           enemy.kind = netEnemy.kind;
           enemy.mesh = makePolyhedron(netEnemy.kind, enemy.r);
@@ -2922,56 +3469,81 @@ export default function MetatronVectorFOIL() {
         enemy.nextKind = netEnemy.nextKind;
       }
 
-      bullets.length = 0;
-      for (const projectile of snapshot.projectiles) {
-        const pos = new V2(projectile.x, projectile.y);
-        bullets.push({
-          id: projectile.id,
-          ownerId: projectile.ownerId,
-          hostTick: projectile.hostTick ?? snapshot.tick,
-          pos,
-          prevPos: pos.copy(),
-          vel: new V2(projectile.vx, projectile.vy),
-          life: Math.max(0.02, T.BULLET_LIFE - projectile.ageMs / 1000),
-          mass: T.BULLET_MASS,
-          origin: pos.copy(),
-          firedAtMs: runClockMs - projectile.ageMs,
-          burstId: 0,
-        });
+      const olderProjectiles = new Map(older.projectiles.map((entry) => [entry.id, entry]));
+      const authoritativeIds = new Set<string>();
+      for (const projectile of newer.projectiles) {
+        authoritativeIds.add(projectile.id);
+        const prior = olderProjectiles.get(projectile.id);
+        let bullet = bullets.find((candidate) => candidate.id === projectile.id);
+        if (!bullet && projectile.clientShotId) bullet = bullets.find((candidate) => candidate.predicted && candidate.clientShotId === projectile.clientShotId);
+        const x = prior ? lerpNumber(prior.x, projectile.x, alpha) : projectile.x;
+        const y = prior ? lerpNumber(prior.y, projectile.y, alpha) : projectile.y;
+        const vx = prior ? lerpNumber(prior.vx, projectile.vx, alpha) : projectile.vx;
+        const vy = prior ? lerpNumber(prior.vy, projectile.vy, alpha) : projectile.vy;
+        if (!bullet) {
+          const pos = new V2(x, y);
+          bullet = {
+            id: projectile.id,
+            ownerId: projectile.ownerId,
+            clientShotId: projectile.clientShotId,
+            hostTick: projectile.hostTick ?? newer.tick,
+            pos,
+            prevPos: pos.copy(),
+            vel: new V2(vx, vy),
+            life: Math.max(0.02, T.BULLET_LIFE - projectile.ageMs / 1000),
+            mass: T.BULLET_MASS,
+            origin: pos.copy(),
+            firedAtMs: runClockMs - projectile.ageMs,
+            burstId: 0,
+          };
+          bullets.push(bullet);
+        } else {
+          bullet.id = projectile.id;
+          bullet.predicted = false;
+          bullet.clientShotId = projectile.clientShotId ?? bullet.clientShotId;
+          bullet.prevPos = bullet.pos.copy();
+          bullet.pos.x = x;
+          bullet.pos.y = y;
+          bullet.vel.x = vx;
+          bullet.vel.y = vy;
+          bullet.life = Math.max(0.02, T.BULLET_LIFE - projectile.ageMs / 1000);
+        }
+      }
+      for (let index = bullets.length - 1; index >= 0; index -= 1) {
+        const bullet = bullets[index];
+        if (bullet.predicted && runClockMs - bullet.firedAtMs < 900) continue;
+        if (!authoritativeIds.has(bullet.id)) bullets.splice(index, 1);
       }
 
-      shards.length = 0;
-      for (const fragment of snapshot.shrapnel) {
+      const olderFragments = new Map(older.shrapnel.map((entry) => [entry.id, entry]));
+      const fragmentIds = new Set(newer.shrapnel.map((entry) => entry.id));
+      for (let index = shards.length - 1; index >= 0; index -= 1) if (!fragmentIds.has(shards[index].id)) shards.splice(index, 1);
+      for (const fragment of newer.shrapnel) {
+        const prior = olderFragments.get(fragment.id);
+        let shard = shards.find((candidate) => candidate.id === fragment.id);
         const life = Math.max(0.02, fragment.lifeMs / 1000);
-        shards.push({
-          id: fragment.id,
-          sourceEnemyId: fragment.sourceEnemyId,
-          hostTick: fragment.hostTick ?? snapshot.tick,
-          pos: new V2(fragment.x, fragment.y),
-          vel: new V2(fragment.vx, fragment.vy),
-          life,
-          life0: life,
-          hue: fragment.hue ?? 210,
-          size: fragment.size,
-          ang: 0,
-          spin: 0,
-        });
+        if (!shard) {
+          shard = {
+            id: fragment.id,
+            sourceEnemyId: fragment.sourceEnemyId,
+            hostTick: fragment.hostTick ?? newer.tick,
+            pos: new V2(fragment.x, fragment.y),
+            vel: new V2(fragment.vx, fragment.vy),
+            life,
+            life0: life,
+            hue: fragment.hue ?? 210,
+            size: fragment.size,
+            ang: 0,
+            spin: 0,
+          };
+          shards.push(shard);
+        }
+        shard.pos.x = prior ? lerpNumber(prior.x, fragment.x, alpha) : fragment.x;
+        shard.pos.y = prior ? lerpNumber(prior.y, fragment.y, alpha) : fragment.y;
+        shard.vel.x = prior ? lerpNumber(prior.vx, fragment.vx, alpha) : fragment.vx;
+        shard.vel.y = prior ? lerpNumber(prior.vy, fragment.vy, alpha) : fragment.vy;
+        shard.life = life;
       }
-
-      score = snapshot.score;
-      const nextLevelIdx = Math.max(0, snapshot.wave - 1);
-      if (nextLevelIdx !== levelIdxRef.current) {
-        levelIdxRef.current = nextLevelIdx;
-        setLevelIdx(nextLevelIdx);
-      }
-      debugLog("snapshot", "snapshot-applied", {
-        tick: snapshot.tick,
-        via: inbound.via,
-        players: snapshot.players.length,
-        enemies: snapshot.enemies.length,
-        projectiles: snapshot.projectiles.length,
-        shrapnel: snapshot.shrapnel.length,
-      }, "debug");
     };
 
     const handlePeerLifecycleMessage = (message: PeerLifecycleMessage, inbound: InboundTransportMessage) => {
@@ -3044,15 +3616,18 @@ export default function MetatronVectorFOIL() {
         }
         if (isPlayerInputMessage(message)) {
           if (authorityClock.mode !== "host") continue;
+          if (item.fromPlayerId !== message.playerId) {
+            debugWarn("network", "input-owner-mismatch", { fromPlayerId: item.fromPlayerId, claimedPlayerId: message.playerId, via: item.via });
+            continue;
+          }
           const slot = ensureRemoteSlot(message.playerId);
           if (!slot) continue;
-          if (!acceptInputSequence(authorityClock, message)) continue;
-          slot.lastInputSeq = message.seq;
-          mirrorRemoteInputTelemetry(message);
-          maybeFireRemoteProjectile(message);
-          debugLog("input", "remote-input-accepted", {
+          const acceptedFrames = enqueueRemoteInput(message);
+          if (acceptedFrames <= 0) continue;
+          debugLog("input", "remote-input-queued", {
             playerId: message.playerId,
             seq: message.seq,
+            acceptedFrames,
             rotate: message.rotate,
             thrust: message.thrust,
             brake: message.brake,
@@ -3060,6 +3635,22 @@ export default function MetatronVectorFOIL() {
             via: item.via,
             authorityTick: authorityClock.tick,
           }, "debug");
+          continue;
+        }
+        if (isWorldEventMessage(message)) {
+          if (authorityClock.mode === "client-mirror" && message.event === "run-ended") {
+            const eventScore = message.data?.score;
+            const eventWave = message.data?.wave;
+            const eventSurvivalTimeSec = message.data?.survivalTimeSec;
+            if (typeof eventScore === "number" && Number.isFinite(eventScore)) score = eventScore;
+            if (typeof eventSurvivalTimeSec === "number" && Number.isFinite(eventSurvivalTimeSec)) runClockMs = eventSurvivalTimeSec * 1000;
+            if (typeof eventWave === "number" && Number.isFinite(eventWave)) {
+              const nextLevelIdx = Math.max(0, Math.floor(eventWave) - 1);
+              levelIdxRef.current = nextLevelIdx;
+              setLevelIdx(nextLevelIdx);
+            }
+            enterDebrief(deathCauseKeyFromUnknown(message.data?.causeKey), false);
+          }
           continue;
         }
         if (isWorldSnapshotMessage(message)) {
@@ -3093,7 +3684,11 @@ export default function MetatronVectorFOIL() {
       const gm = slidersRef.current.gravity;
       const thrust = slidersRef.current.thrust;
       const solar = slidersRef.current.solar;
-      const gamepadInput = readGamepadShipInput(dt);
+      const connectedPads = getConnectedGamepadDescriptors();
+      const primaryPadIndex = transportLaunch.localPlayerCount > 1 ? (connectedPads[0]?.index ?? null) : null;
+      const gamepadInput = primaryPadIndex === null
+        ? readGamepadShipInput(dt)
+        : readGamepadShipInputForIndex(primaryPadIndex, dt);
       const gamepadActive = gamepadInput.connected && (
         Math.abs(gamepadInput.rotate) > 0.08 ||
         gamepadInput.thrust > 0.05 ||
@@ -3107,9 +3702,6 @@ export default function MetatronVectorFOIL() {
       scoreIdleMs += dt * 1000;
       handleInboundTransportMessages();
       if (!localJoinAccepted) sendGuestJoinRequest(false);
-      for (const id of Object.keys(remoteGunCooldowns)) {
-        remoteGunCooldowns[id] = Math.max(0, remoteGunCooldowns[id] - dt);
-      }
       if (scoreIdleMs >= SCORE_THRESHOLDS.chainDecayMs) {
         chainMultiplier = 1;
         lastScoreCategory = null;
@@ -3183,49 +3775,36 @@ export default function MetatronVectorFOIL() {
         }
       }
 
-      player.hitInvuln = Math.max(0, player.hitInvuln - dt);
-
-      // ---- ship input (keyboard + gamepad) ----
-      const turnLeft = keys.has("a") || keys.has("A") || keys.has("ArrowLeft");
-      const turnRight = keys.has("d") || keys.has("D") || keys.has("ArrowRight");
+      // ---- local ship input + prediction ----
+      const primaryAlive = playerSlots[0]?.lifeState === "alive";
+      const turnLeft = primaryAlive && (keys.has("a") || keys.has("A") || keys.has("ArrowLeft"));
+      const turnRight = primaryAlive && (keys.has("d") || keys.has("D") || keys.has("ArrowRight"));
       const keyboardTurnInput = (turnRight ? 1 : 0) - (turnLeft ? 1 : 0);
       const turnInput = keyboardTurnInput !== 0 ? keyboardTurnInput : gamepadInput.rotate;
-      if (T.SHIP_ROTATIONAL_INERTIA_ENABLED) {
-        player.angularVel = clamp(
-          player.angularVel + turnInput * T.SHIP_ANGULAR_ACCEL * dt,
-          -T.SHIP_MAX_ANGULAR_SPEED,
-          T.SHIP_MAX_ANGULAR_SPEED,
-        );
-        if (Math.abs(turnInput) < 0.001 && T.SHIP_ANGULAR_DAMPING > 0) {
-          player.angularVel *= Math.exp(-T.SHIP_ANGULAR_DAMPING * dt);
-        }
-        player.angle += player.angularVel * dt;
-      } else {
-        player.angularVel = 0;
-        player.angle += turnInput * T.ROT_SPEED * dt;
-      }
-
-      const keyboardThrustInput = (keys.has("w") || keys.has("W") || keys.has("ArrowUp")) ? 1 : 0;
-      const keyboardBrakeInput = (keys.has("s") || keys.has("S") || keys.has("ArrowDown")) ? 1 : 0;
-      const thrustIntent = Math.max(keyboardThrustInput, gamepadInput.thrust);
-      const brakeIntent = Math.max(keyboardBrakeInput, gamepadInput.brake);
-      const fireHeld = keys.has(" ") || keys.has("Space") || gamepadInput.fire;
-      const firePressedIntent = gamepadInput.firePressed || (fireHeld && gunCD <= 0);
+      const keyboardThrustInput = primaryAlive && (keys.has("w") || keys.has("W") || keys.has("ArrowUp")) ? 1 : 0;
+      const keyboardBrakeInput = primaryAlive && (keys.has("s") || keys.has("S") || keys.has("ArrowDown")) ? 1 : 0;
+      const thrustIntent = primaryAlive ? Math.max(keyboardThrustInput, gamepadInput.thrust) : 0;
+      const brakeIntent = primaryAlive ? Math.max(keyboardBrakeInput, gamepadInput.brake) : 0;
+      const fireHeld = primaryAlive && (keys.has(" ") || keys.has("Space") || gamepadInput.fire);
       const localPlayerId = playerSlots[0]?.id ?? LOCAL_SOLO_PLAYER_ID;
       lastLocalInputSeq = nextInputSequence(authorityClock, localPlayerId);
-      if (playerSlots[0]) playerSlots[0].lastInputSeq = lastLocalInputSeq;
-      authorityClock.lastInputSeqByPlayer[localPlayerId] = lastLocalInputSeq;
+      localClientTick += 1;
+      const willFireThisTick = fireHeld && gunCD <= 0;
+      const clientShotId = willFireThisTick ? `${localPlayerId}-${lastLocalInputSeq}` : undefined;
       const localInputMessage: NetInputMessage = {
         type: "player-input",
         protocolVersion: MULTIPLAYER_PROTOCOL_VERSION,
         playerId: localPlayerId,
         seq: lastLocalInputSeq,
+        clientTick: localClientTick,
         clientTimeMs: Date.now(),
+        simulationDtMs: dt * 1000,
         rotate: turnInput,
         thrust: thrustIntent,
         brake: brakeIntent,
         fireHeld,
-        firePressed: firePressedIntent,
+        firePressed: willFireThisTick,
+        clientShotId,
         x: player.pos.x,
         y: player.pos.y,
         vx: player.vel.x,
@@ -3234,11 +3813,17 @@ export default function MetatronVectorFOIL() {
         angularVelocity: player.angularVel,
       };
       if (authorityClock.mode === "client-mirror") {
+        queuePredictedInput(guestPredictionQueue, localInputMessage);
+        localInputMessage.recentInputs = recentInputsForRedundancy(guestPredictionQueue, localInputMessage);
         const sent = transport.sendToHost(localInputMessage);
         if (sent > 0 && lastLocalInputSeq % MULTIPLAYER_NET_CONFIG.hostSimulationHz === 0) {
           debugLog("network", "input-sent-to-host", { playerId: localPlayerId, seq: lastLocalInputSeq, sent }, "debug");
         }
+      } else {
+        markInputSequenceApplied(authorityClock, localPlayerId, lastLocalInputSeq);
+        ackClientTimeMsByPlayer[localPlayerId] = localInputMessage.clientTimeMs;
       }
+      if (playerSlots[0]) playerSlots[0].lastInputSeq = lastLocalInputSeq;
       if (lastLocalInputSeq % MULTIPLAYER_NET_CONFIG.hostSimulationHz === 0 && (Math.abs(turnInput) > 0.01 || thrustIntent > 0.01 || brakeIntent > 0.01 || fireHeld)) {
         debugLog("input", "local-input-heartbeat", {
           playerId: localInputMessage.playerId,
@@ -3250,71 +3835,25 @@ export default function MetatronVectorFOIL() {
           authorityTick: authorityClock.tick,
         }, "debug");
       }
-      player.thrust = lerp(player.thrust, thrustIntent, thrustIntent > 0 ? 0.16 : 0.10);
-      shipBrakeInput = lerp(shipBrakeInput, brakeIntent, brakeIntent > 0 ? 0.18 : 0.12);
 
-      // fuel burn/regen
-      const dist = player.pos.len();
-      const outside = dist > horizonR;
-      const use = Math.max(0, player.thrust);
-      if (use > 0.03 && player.fuel > 0) player.fuel = Math.max(0, player.fuel - T.FUEL_BURN * use * dt);
-
-      const nodeBonuses = getMetaNodeBonuses();
-      player.inActivatedSphere = nodeBonuses.insideAwakenedSphere;
-      const baseFuelRegen = outside ? T.FUEL_REGEN_OUTER : T.FUEL_REGEN_INNER;
-      const totalFuelRegen = baseFuelRegen + nodeBonuses.passiveFuel + nodeBonuses.sphereFuel;
-      if (totalFuelRegen > 0) player.fuel = Math.min(T.FUEL_MAX, player.fuel + totalFuelRegen * dt);
-      if (nodeBonuses.shieldRepair > 0 && player.hitInvuln <= 0) {
-        player.hitsTaken = Math.max(0, player.hitsTaken - nodeBonuses.shieldRepair * dt);
+      const localSim = primaryAlive
+        ? simulatePlayerShip(player, toControlState(localInputMessage), dt, shipBrakeInput)
+        : { brakeInput: 0, previousPosition: player.pos.copy(), velBefore: player.vel.copy() };
+      shipBrakeInput = localSim.brakeInput;
+      if (!primaryAlive) {
+        player.thrust = 0;
+        player.thrustGlow = 0;
+        player.brakeAnim = 0;
       }
-
-      const velBefore = player.vel.copy();
-
-      // Forces
-      const g = gravityAt(player.pos, lvl.gravityGM);
-      const nodeG = T.META_NODE_GRAVITY_AFFECTS_PLAYER ? activeMetaNodeGravityAt(player.pos, lvl.gravityGM) : new V2(0, 0);
-      const sail = solarSailAt(player.pos, player.angle, lvl.solarPressure * (solar / T.SOLAR_PRESSURE));
-      const fwd = V2.fromAngle(player.angle, 1);
-
-      // engine thrust (only if fuel); braking is multiplicative drag, not reverse thrust
-      const engine = fwd.copy().mul((player.fuel > 0 ? 1 : 0) * Math.max(0, player.thrust) * thrust);
-      // acceleration = (g + sail + engine/mass)
-      player.vel.add(g.mul(dt));
-      player.vel.add(nodeG.mul(dt));
-      player.vel.add(sail.mul(dt / T.SHIP_MASS));
-      player.vel.add(engine.mul(dt / T.SHIP_MASS));
-
-      const brake = clamp(shipBrakeInput, 0, 1);
-      const oortBrakeMedium = T.OORT_ALLOWS_BRAKING
-        ? T.OORT_BRAKE_MULTIPLIER * oortMediumDepthAt(player.pos, metaPulseClock)
-        : 0;
-      const brakeMedium = T.BRAKING_REQUIRES_ACTIVATED_SPHERE
-        ? (nodeBonuses.insideAwakenedSphere ? 1 : Math.max(T.OPEN_SPACE_BRAKE_MULTIPLIER, oortBrakeMedium))
-        : 1;
-      const effectiveBrake = brake * brakeMedium;
-      player.brakeAnim = lerp(player.brakeAnim, effectiveBrake, effectiveBrake > 0 ? 0.22 : 0.11);
-      player.thrustGlow = lerp(player.thrustGlow, (player.fuel > 0 ? 1 : 0) * Math.max(0, player.thrust), player.thrust > 0 ? 0.18 : 0.10);
-      if (effectiveBrake > 0.001) {
-        const brakeMul = lerp(1, T.BRAKE_COEFF, effectiveBrake);
-        player.vel.mul(brakeMul);
-      }
-
-      if (nodeBonuses.mediumDepth > 0 && T.META_SPHERE_PLAYER_MEDIUM_DRAG > 0) {
-        const mediumDrag = Math.exp(-T.META_SPHERE_PLAYER_MEDIUM_DRAG * nodeBonuses.mediumDepth * dt);
-        player.vel.mul(clamp(mediumDrag, 0, 1));
-      }
-      applyOortPassiveDrag(dt, metaPulseClock);
-      applyOortInwardPressure(dt);
-
-      // no passive drag
-      if (T.DRAG > 0) player.vel.mul(1 - T.DRAG * dt);
-
-      // clamp speed
-      const sp = player.vel.len();
-      if (sp > T.MAX_SPEED) player.vel.mul(T.MAX_SPEED / sp);
-
-      const playerPrevPos = player.pos.copy();
-      player.pos.add(player.vel.copy().mul(dt));
+      const playerPrevPos = localSim.previousPosition;
+      const velBefore = localSim.velBefore;
+      decayRenderCorrection(localRenderCorrection, dt);
+      displayedLocalPlayer = {
+        x: player.pos.x + localRenderCorrection.x,
+        y: player.pos.y + localRenderCorrection.y,
+        angle: player.angle + localRenderCorrection.angle,
+      };
+      if (authorityClock.mode !== "client-mirror") {
       const solCrashR = Math.max(1, T.STAR_COLLISION_RADIUS + T.SHIP_HIT_RADIUS * 0.25);
       if (pointSegmentDistanceSq(new V2(0, 0), playerPrevPos, player.pos) <= solCrashR * solCrashR) {
         loseRun("ship", "sol");
@@ -3377,20 +3916,28 @@ export default function MetatronVectorFOIL() {
         player.stuckTime = 0;
       }
 
+      }
+
       // ---- gun ----
-      gunCD -= dt;
-      if (fireHeld && gunCD <= 0) {
+      gunCD = Math.max(0, gunCD - dt);
+      if (willFireThisTick) {
         const burstId = beginShotBurstIfNeeded();
         const stats = burstStats.get(burstId);
         if (stats) {
           stats.shots += 1;
           stats.active += 1;
         }
-        bullets.push(makeBullet(burstId));
+        bullets.push(makeBulletFromState(burstId, localPlayerId, player, {
+          clientShotId,
+          predicted: authorityClock.mode === "client-mirror",
+        }));
         audioRef.current.shoot();
         gunCD = T.FIRE_RATE;
       }
 
+      if (simulateSecondaryAuthoritativePlayers(dt)) return;
+
+      if (authorityClock.mode !== "client-mirror") {
       // bullets
       for (let i = bullets.length - 1; i >= 0; i--) {
         const b = bullets[i];
@@ -3431,7 +3978,11 @@ export default function MetatronVectorFOIL() {
         const starDir = toStar.copy().mul(1 / starDist);
         const starTang = starDir.copy().rot(Math.PI / 2);
 
-        const toShip = player.pos.copy().sub(e.pos);
+        const targetEntry = allAuthoritativeShips().reduce<ReturnType<typeof allAuthoritativeShips>[number] | null>((best, entry) => {
+          if (!best) return entry;
+          return entry.ship.pos.copy().sub(e.pos).len() < best.ship.pos.copy().sub(e.pos).len() ? entry : best;
+        }, null);
+        const toShip = (targetEntry?.ship.pos ?? player.pos).copy().sub(e.pos);
         const shipDist = Math.max(1, toShip.len());
         const shipDir = toShip.copy().mul(1 / shipDist);
 
@@ -3471,11 +4022,9 @@ export default function MetatronVectorFOIL() {
           }
         }
 
-        const toPlayer = player.pos.copy().sub(e.pos);
         const enemyHitR = Math.max(8, e.r * T.ENEMY_HIT_RADIUS_MULT);
-        if (toPlayer.len() <= T.SHIP_HIT_RADIUS + enemyHitR) {
-          if (applyShipHit(e.pos.copy(), "enemy")) return;
-        }
+        const impactedPlayer = allAuthoritativeShips().find(({ ship }) => ship.pos.copy().sub(e.pos).len() <= T.SHIP_HIT_RADIUS + enemyHitR);
+        if (impactedPlayer && applyShipHitTo(impactedPlayer.slot, impactedPlayer.ship, e.pos.copy(), "enemy")) return;
 
         const starLossR = T.STAR_RADIUS + e.r * 0.4;
         if (e.pos.len() <= starLossR) {
@@ -3563,15 +4112,18 @@ export default function MetatronVectorFOIL() {
         s.ang += s.spin * dt;
         s.life -= dt;
 
-        if (s.pos.copy().sub(player.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD) {
-          if (applyShipHit(s.pos.copy(), "shrapnel")) return;
+        const shardTarget = allAuthoritativeShips().find(({ ship }) => s.pos.copy().sub(ship.pos).len() <= T.SHIP_HIT_RADIUS + s.size + T.SHARD_HIT_RADIUS_PAD);
+        if (shardTarget) {
+          const destroyed = applyShipHitTo(shardTarget.slot, shardTarget.ship, s.pos.copy(), "shrapnel");
           debugLog("shrapnel", "shrapnel-destroyed", {
             id: s.id,
             sourceEnemyId: s.sourceEnemyId,
             reason: "player-hit",
+            playerId: shardTarget.slot.id,
             authorityTick: authorityClock.tick,
           }, "debug");
           shards.splice(i, 1);
+          if (destroyed) return;
           continue;
         }
 
@@ -3622,11 +4174,28 @@ export default function MetatronVectorFOIL() {
 
       settleFuelBitsFromShards(dt);
       collectFuelBits();
+      } else {
+        applyInterpolatedSnapshotPresentation();
+        for (let i = bullets.length - 1; i >= 0; i -= 1) {
+          const bullet = bullets[i];
+          if (!bullet.predicted) continue;
+          bullet.prevPos = bullet.pos.copy();
+          if (bullet.mass > 0) bullet.vel.add(gravityAt(bullet.pos, lvl.gravityGM * bullet.mass).mul(dt));
+          bullet.pos.add(bullet.vel.copy().mul(dt));
+          bullet.life -= dt;
+          if (bullet.life <= 0) bullets.splice(i, 1);
+        }
+        predictionHeartbeatAccumulator += dt;
+        if (predictionHeartbeatAccumulator >= 1) {
+          predictionHeartbeatAccumulator = 0;
+          guestSnapshotTimeline.logHeartbeat(localPlayerId);
+        }
+      }
 
-      // contrail
-      trail.push(player.pos.copy());
-      const maxTrail = (slidersRef.current.trail | 0);
-      if (trail.length > maxTrail) trail.splice(0, trail.length - maxTrail);
+      // Each pilot owns an independent phosphor trace. Dead ships stop sampling
+      // immediately and their stored path is cleared by destroyPlayer().
+      if (primaryAlive) samplePlayerTrail(trail, player.pos);
+      else trail.length = 0;
 
       // metatron spin increases with distance; "dwell" keeps it readable near center
       const distK = clamp(player.pos.len() / Math.max(1, metaRadius), 0, 8);
@@ -3643,7 +4212,7 @@ export default function MetatronVectorFOIL() {
       updateMetaAlignment(dt);
       syncMetaNodeWorldPositions();
 
-      if (waveActive && enemies.length === 0 && shards.length === 0) {
+      if (authorityClock.mode !== "client-mirror" && waveActive && enemies.length === 0 && shards.length === 0) {
         const waveNumber = getLevel(levelIdxRef.current).wave;
         awardPoints(scoreForWaveClear(waveNumber), "wave", {
           showAlert: true,
@@ -3674,8 +4243,11 @@ export default function MetatronVectorFOIL() {
 
       publishAuthoritySnapshotIfDue(dt);
 
-      // camera (center stays on star; zoom guarantees ship in view)
-      updateCamera(camera, canvas, dpr, player.pos, player.vel, horizonR);
+      // camera remains Sol-centered, fitting the local couch constellation within a bounded scope.
+      const cameraShips = authorityClock.mode === "client-mirror"
+        ? [{ pos: player.pos, vel: player.vel }]
+        : allAuthoritativeShips().filter(({ slot }) => localPlayerIds.has(slot.id)).map(({ ship }) => ({ pos: ship.pos, vel: ship.vel }));
+      updateCamera(camera, canvas, dpr, cameraShips.length > 0 ? cameraShips : [{ pos: player.pos, vel: player.vel }], horizonR);
       // audio continuous
       audioRef.current.updateDrones(modeRef.current as GameMode, enemies, player, T.STAR_RADIUS, oortOuter);
       audioRef.current.setThrust(Math.max(0, player.thrust) * (player.fuel > 0 ? 1 : 0));
@@ -3791,7 +4363,23 @@ export default function MetatronVectorFOIL() {
       const transportStateForRender = transport.getState();
       const renderPlayers: RenderMultiplayerPlayer[] = playerSlots.map((slot) => {
         const mirror = remotePlayerMirrors[slot.id];
-        const isLocal = slot.id === localPlayerIdForRender;
+        const isPrimaryLocal = slot.id === localPlayerIdForRender;
+        const useInterpolatedMirror = authorityClock.mode === "client-mirror" && !isPrimaryLocal;
+        const renderX = isPrimaryLocal
+          ? displayedLocalPlayer.x
+          : useInterpolatedMirror
+            ? (mirror?.displayedX ?? mirror?.pos.x ?? 0)
+            : (mirror?.pos.x ?? 0);
+        const renderY = isPrimaryLocal
+          ? displayedLocalPlayer.y
+          : useInterpolatedMirror
+            ? (mirror?.displayedY ?? mirror?.pos.y ?? 0)
+            : (mirror?.pos.y ?? 0);
+        const renderAngle = isPrimaryLocal
+          ? displayedLocalPlayer.angle
+          : useInterpolatedMirror
+            ? (mirror?.displayedAngle ?? mirror?.angle ?? 0)
+            : (mirror?.angle ?? 0);
         return {
           id: slot.id,
           slot: slot.slot,
@@ -3799,23 +4387,31 @@ export default function MetatronVectorFOIL() {
           callsign: slot.callsign ?? null,
           lifeState: slot.lifeState,
           connected: slot.connected,
-          isLocal,
-          x: isLocal ? player.pos.x : (mirror?.x ?? 0),
-          y: isLocal ? player.pos.y : (mirror?.y ?? 0),
-          vx: isLocal ? player.vel.x : (mirror?.vx ?? 0),
-          vy: isLocal ? player.vel.y : (mirror?.vy ?? 0),
-          angle: isLocal ? player.angle : (mirror?.angle ?? 0),
-          angularVelocity: isLocal ? player.angularVel : (mirror?.angularVelocity ?? 0),
-          fuel: isLocal ? player.fuel : (mirror?.fuel ?? T.FUEL_MAX),
-          hitsTaken: isLocal ? player.hitsTaken : (mirror?.hitsTaken ?? 0),
+          isLocal: localPlayerIds.has(slot.id),
+          x: renderX,
+          y: renderY,
+          vx: isPrimaryLocal ? player.vel.x : (mirror?.vel.x ?? 0),
+          vy: isPrimaryLocal ? player.vel.y : (mirror?.vel.y ?? 0),
+          angle: renderAngle,
+          angularVelocity: isPrimaryLocal ? player.angularVel : (mirror?.angularVel ?? 0),
+          fuel: isPrimaryLocal ? player.fuel : (mirror?.fuel ?? T.FUEL_MAX),
+          hitsTaken: isPrimaryLocal ? player.hitsTaken : (mirror?.hitsTaken ?? 0),
+          thrustGlow: isPrimaryLocal ? player.thrustGlow : (mirror?.thrustGlow ?? 0),
+          trail: isPrimaryLocal ? trail : (mirror?.trail ?? []),
           lastInputSeq: slot.lastInputSeq,
         };
       });
+      const playerForRender: PlayerShipState = {
+        ...player,
+        pos: new V2(displayedLocalPlayer.x, displayedLocalPlayer.y),
+        vel: player.vel,
+        angle: displayedLocalPlayer.angle,
+      };
 
       render(ctx, canvas, dpr, {
         mode: modeRef.current,
         level: getLevel(levelIdxRef.current),
-        player, camera,
+        player: playerForRender, camera,
         meta: { ax: metaAx, ay: metaAy, az: metaAz, alignT: metaAlignT, centers3, nodes: metaNodes, pulseClock: metaPulseClock },
         oort: { clusters: oortClusters, timeSec: metaPulseClock },
         entities: { bullets, enemies, shards, fuelBits, trail },
@@ -3827,7 +4423,7 @@ export default function MetatronVectorFOIL() {
           role: transportLaunch.role,
           roomId: transportLaunch.roomId,
           localPlayerId: localPlayerIdForRender,
-          showRoster: transportLaunch.showRoster,
+          showRoster: transportLaunch.showRoster || playerSlots.length > 1,
           transportPeers: transportStateForRender.peers.length,
           queuedInbound: transportStateForRender.queuedInbound,
           sent: transportStateForRender.stats.sent,
@@ -4612,16 +5208,50 @@ function MultiplayerStartConsole({
   const [hailCallsign, setHailCallsign] = useState("");
   const [hailSlot, setHailSlot] = useState<1 | 2 | 3>(1);
   const [hailStatus, setHailStatus] = useState("CARRIER COLD // NAME ROOM THEN HAIL A PILOT");
+  const [connectedPads, setConnectedPads] = useState(() => getConnectedGamepadDescriptors());
+  const localCountTouchedRef = useRef(false);
+  const [selectedLocalCount, setSelectedLocalCount] = useState<1 | 2 | 3 | 4>(() => {
+    if (typeof window !== "undefined") {
+      const configured = Number(new URLSearchParams(window.location.search).get("mvfLocalPlayers"));
+      if (configured === 1 || configured === 2 || configured === 3 || configured === 4) return configured;
+    }
+    return Math.max(1, Math.min(4, getConnectedGamepadDescriptors().length)) as 1 | 2 | 3 | 4;
+  });
+
+  useEffect(() => {
+    const refresh = () => {
+      const next = getConnectedGamepadDescriptors();
+      setConnectedPads(next);
+      const availableCount = Math.max(1, Math.min(4, next.length)) as 1 | 2 | 3 | 4;
+      const configured = typeof window === "undefined" ? 0 : Number(new URLSearchParams(window.location.search).get("mvfLocalPlayers"));
+      const hasConfiguredCount = configured === 1 || configured === 2 || configured === 3 || configured === 4;
+      setSelectedLocalCount((current) => {
+        if (!localCountTouchedRef.current && !hasConfiguredCount) return availableCount;
+        return Math.min(current, availableCount) as 1 | 2 | 3 | 4;
+      });
+    };
+    refresh();
+    window.addEventListener("gamepadconnected", refresh);
+    window.addEventListener("gamepaddisconnected", refresh);
+    const timer = window.setInterval(refresh, 1000);
+    return () => {
+      window.removeEventListener("gamepadconnected", refresh);
+      window.removeEventListener("gamepaddisconnected", refresh);
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const baseUrl = typeof window !== "undefined" ? `${window.location.origin}${window.location.pathname}` : "";
   const safeRoom = fallbackMultiplayerRoomId(roomId);
 
-  const launchUrl = (role: "host" | "guest", slot?: 1 | 2 | 3) => {
+  const launchUrl = (role: "host" | "guest" | "solo", slot?: 1 | 2 | 3, localPlayers: 1 | 2 | 3 | 4 = 1, autoStart = false) => {
     const params = new URLSearchParams();
     params.set("mvfRole", role);
     params.set("mvfRoom", safeRoom);
     params.set("mvfRoster", "1");
     params.set("mvfBroadcast", "0");
+    params.set("mvfLocalPlayers", String(role === "guest" ? 1 : localPlayers));
+    if (autoStart) params.set("mvfAutostart", "1");
     if (slot !== undefined) params.set("mvfSlot", String(slot));
     return `${baseUrl}?${params.toString()}`;
   };
@@ -4649,7 +5279,13 @@ function MultiplayerStartConsole({
   const openHost = () => {
     if (typeof window === "undefined") return;
     setHailStatus(`HOST CARRIER ARMING // ROOM ${safeRoom}`);
-    window.location.assign(launchUrl("host"));
+    window.location.assign(launchUrl("host", undefined, selectedLocalCount));
+  };
+
+  const openLocal = (count: 1 | 2 | 3 | 4) => {
+    if (typeof window === "undefined") return;
+    localCountTouchedRef.current = true;
+    window.location.assign(launchUrl("solo", undefined, count, true));
   };
 
   const hailPilot = async () => {
@@ -4682,7 +5318,47 @@ function MultiplayerStartConsole({
   return (
     <div style={{ display: "grid", gap: 10 }}>
       <div aria-hidden style={{ pointerEvents: "none", display: "grid", placeItems: "center", maxHeight: 112, overflow: "hidden", opacity: 0.72 }}>
-        <GhostMetatronCube glow={featuredGlow} opacity={featuredOpacity} headline={featuredHeadline} subline={featuredSubline} compact />
+        <GhostMetatronCube glow={featuredGlow} opacity={featuredOpacity} headline={featuredHeadline} subline={featuredSubline} />
+      </div>
+
+      <div style={{
+        display: "grid",
+        gap: 8,
+        padding: 10,
+        border: "1px solid rgba(150,205,255,0.18)",
+        background: "linear-gradient(180deg, rgba(5,12,24,0.58), rgba(0,0,0,0.18))",
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+          <div style={{ fontSize: 9, letterSpacing: "0.25em", textTransform: "uppercase", color: "rgba(150,205,255,0.76)" }}>Local Phosphor Bus</div>
+          <div style={{ fontSize: 9, letterSpacing: "0.14em", textTransform: "uppercase", color: "rgba(243,214,152,0.72)" }}>{connectedPads.length} CONTROL TRACE{connectedPads.length === 1 ? "" : "S"}</div>
+        </div>
+        <div style={{ display: "grid", gap: 4 }}>
+          {connectedPads.length === 0 ? (
+            <div style={{ fontSize: 9, letterSpacing: "0.10em", color: "rgba(180,215,235,0.58)" }}>PRESS A BUTTON TO WAKE EACH CONTROLLER TRACE</div>
+          ) : connectedPads.slice(0, 4).map((pad, index) => (
+            <div key={`${pad.index}-${pad.id}`} style={{ display: "grid", gridTemplateColumns: "3ch 1fr auto", gap: 7, fontSize: 9, letterSpacing: "0.08em", color: "rgba(210,238,250,0.72)" }}>
+              <span>P{index + 1}</span><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{pad.id}</span><span>READY</span>
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,minmax(0,1fr))", gap: 6 }}>
+          {([1, 2, 3, 4] as const).map((count) => {
+            const enabled = count === 1 || connectedPads.length >= count;
+            return (
+              <button
+                key={count}
+                type="button"
+                disabled={!enabled}
+                onClick={() => { setSelectedLocalCount(count); openLocal(count); }}
+                style={{ ...btnStyle, padding: "7px 5px", fontSize: 9, opacity: enabled ? 1 : 0.32, borderColor: count === selectedLocalCount ? "rgba(176,255,218,0.42)" : "rgba(150,205,255,0.20)" }}
+              >
+                {count === 1 ? "SOLO" : `${count}-PILOT`}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ fontSize: 8, letterSpacing: "0.10em", color: "rgba(176,255,218,0.66)" }}>{selectedLocalCount === 1 ? "SOLO TRACE ARMED" : `${selectedLocalCount}-PILOT CONSTELLATION ARMED`} // ENTER COMMITS THIS CONFIGURATION</div>
+        <div style={{ fontSize: 8, letterSpacing: "0.10em", color: "rgba(150,205,255,0.50)" }}>CONTROLLERS ARE ASSIGNED P1→P4 IN BROWSER GAMEPAD ORDER FOR THIS RUN</div>
       </div>
 
       <div style={{
@@ -4726,7 +5402,13 @@ function MultiplayerStartConsole({
           }}
         />
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 7, alignItems: "center" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "auto 1fr auto", gap: 7, alignItems: "center" }}>
+          <select value={selectedLocalCount} onChange={(event) => {
+            localCountTouchedRef.current = true;
+            setSelectedLocalCount(Number(event.target.value) as 1 | 2 | 3 | 4);
+          }} style={{ ...multiplayerInputStyle, padding: "7px 6px", fontSize: 10 }}>
+            {([1, 2, 3, 4] as const).filter((count) => count === 1 || connectedPads.length >= count).map((count) => <option key={count} value={count}>{count} LOCAL</option>)}
+          </select>
           <button type="button" onClick={openHost} style={{ ...btnStyle, padding: "7px 9px", fontSize: 10, borderColor: "rgba(176,255,218,0.28)", color: "rgba(212,255,230,0.92)" }}>
             Open Host Carrier
           </button>
@@ -5184,6 +5866,8 @@ type RenderMultiplayerPlayer = {
   angularVelocity: number;
   fuel: number;
   hitsTaken: number;
+  thrustGlow: number;
+  trail: V2[];
   lastInputSeq: number;
 };
 
@@ -5514,78 +6198,60 @@ function render(
   ctx.stroke();
   ctx.restore();
 
-  // contrail
-  ctx.save();
-  ctx.globalAlpha = worldAlpha;
-  ctx.lineWidth = 1.2 / S.camera.zoom;
-  ctx.strokeStyle = `rgba(120,255,220,${T.TRAIL_ALPHA})`;
-  ctx.beginPath();
-  for (let i = 0; i < S.entities.trail.length; i++) {
-    const p = S.entities.trail[i];
-    if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
-  }
-  ctx.stroke();
-  ctx.restore();
-
-  if (T.THRUST_TRAIL_GLOW_ENABLED && S.player.thrustGlow > 0.02 && S.entities.trail.length > 2) {
-    ctx.save();
-    ctx.globalAlpha = worldAlpha;
-    ctx.lineCap = "round";
-    const count = Math.min(T.THRUST_TRAIL_GLOW_POINTS, S.entities.trail.length - 1);
-    const start = S.entities.trail.length - count;
-    for (let i = Math.max(1, start); i < S.entities.trail.length; i++) {
-      const p0 = S.entities.trail[i - 1];
-      const p1 = S.entities.trail[i];
-      const k = (i - start) / Math.max(1, count);
-      const alpha = S.player.thrustGlow * T.THRUST_TRAIL_GLOW_INTENSITY * Math.pow(k, 2.25);
-      ctx.strokeStyle = `rgba(175,255,230,${alpha})`;
-      ctx.lineWidth = (1.6 + 4.8 * S.player.thrustGlow * k) / S.camera.zoom;
-      ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke();
-    }
-    ctx.restore();
+  // Every corsair owns its own phosphor trace. The traces use the same slot
+  // identity as the hulls so couch and online pilots remain distinguishable.
+  for (const pilot of S.multiplayer.players) {
+    if (!pilot.connected || pilot.lifeState !== "alive") continue;
+    drawPlayerTrail(ctx, S.camera.zoom, pilot, worldAlpha);
   }
 
   // remote player ships
   ctx.save();
   ctx.globalAlpha = worldAlpha;
   for (const remote of S.multiplayer.players) {
-    if (remote.isLocal) continue;
-    if (!remote.connected || remote.lifeState === "disconnected") continue;
+    // P1 is rendered by the primary ship path below. Other locally controlled
+    // couch ships still use this multiplayer ship renderer.
+    if (remote.id === S.multiplayer.localPlayerId) continue;
+    if (!remote.connected || remote.lifeState !== "alive") continue;
     drawRemotePlayerShip(ctx, S.camera.zoom, remote);
   }
   ctx.restore();
 
-  // ship
-  ctx.save();
-  ctx.globalAlpha = worldAlpha;
-  ctx.translate(S.player.pos.x, S.player.pos.y);
-  ctx.rotate(S.player.angle);
-  ctx.lineWidth = 2.2 / S.camera.zoom;
-  const hitFlash = S.player.hitInvuln > 0 && Math.floor(performance.now() / 60) % 2 === 0;
-  ctx.strokeStyle = hitFlash ? "rgba(255,240,200,0.98)" : "rgba(120,255,200,0.95)";
-  const brakeOpen = T.BRAKE_UNFOLD_ENABLED ? clamp(S.player.brakeAnim, 0, 1) * T.BRAKE_UNFOLD_AMOUNT : 0;
-  const rearX = -10 - brakeOpen * 2.5;
-  const innerX = -6 + brakeOpen * 3.5;
-  const wingY = 7 + brakeOpen * 8.0;
-  ctx.beginPath();
-  ctx.moveTo(12, 0); ctx.lineTo(rearX, -wingY); ctx.lineTo(innerX, 0); ctx.lineTo(rearX, wingY); ctx.closePath();
-  ctx.stroke();
+  // The primary hull is a live gameplay entity, not a permanent HUD marker.
+  // Once destroyed it disappears while the surviving constellation continues.
+  const primaryPilot = S.multiplayer.players.find((pilot) => pilot.id === S.multiplayer.localPlayerId);
+  if (!primaryPilot || primaryPilot.lifeState === "alive") {
+    ctx.save();
+    ctx.globalAlpha = worldAlpha;
+    ctx.translate(S.player.pos.x, S.player.pos.y);
+    ctx.rotate(S.player.angle);
+    ctx.lineWidth = 2.2 / S.camera.zoom;
+    const hitFlash = S.player.hitInvuln > 0 && Math.floor(performance.now() / 60) % 2 === 0;
+    ctx.strokeStyle = hitFlash ? "rgba(255,240,200,0.98)" : "rgba(120,255,200,0.95)";
+    const brakeOpen = T.BRAKE_UNFOLD_ENABLED ? clamp(S.player.brakeAnim, 0, 1) * T.BRAKE_UNFOLD_AMOUNT : 0;
+    const rearX = -10 - brakeOpen * 2.5;
+    const innerX = -6 + brakeOpen * 3.5;
+    const wingY = 7 + brakeOpen * 8.0;
+    ctx.beginPath();
+    ctx.moveTo(12, 0); ctx.lineTo(rearX, -wingY); ctx.lineTo(innerX, 0); ctx.lineTo(rearX, wingY); ctx.closePath();
+    ctx.stroke();
 
-  if (brakeOpen > 0.035 && T.BRAKE_WAKE_LINES_ENABLED) {
-    const wakeAlpha = T.BRAKE_WAKE_INTENSITY * brakeOpen;
-    ctx.strokeStyle = `rgba(205,240,255,${0.20 * wakeAlpha})`;
-    ctx.lineWidth = (1.0 + brakeOpen * 1.1) / S.camera.zoom;
-    ctx.beginPath();
-    ctx.moveTo(-2, -wingY * 0.55); ctx.lineTo(rearX - 10 - 6 * brakeOpen, -wingY * 1.15);
-    ctx.moveTo(-2, wingY * 0.55); ctx.lineTo(rearX - 10 - 6 * brakeOpen, wingY * 1.15);
-    ctx.stroke();
-    ctx.strokeStyle = `rgba(120,255,220,${0.18 * wakeAlpha})`;
-    ctx.beginPath();
-    ctx.moveTo(rearX - 2, -wingY * 0.62); ctx.quadraticCurveTo(rearX - 15, -wingY * 0.30, rearX - 26, -wingY * 0.80);
-    ctx.moveTo(rearX - 2, wingY * 0.62); ctx.quadraticCurveTo(rearX - 15, wingY * 0.30, rearX - 26, wingY * 0.80);
-    ctx.stroke();
+    if (brakeOpen > 0.035 && T.BRAKE_WAKE_LINES_ENABLED) {
+      const wakeAlpha = T.BRAKE_WAKE_INTENSITY * brakeOpen;
+      ctx.strokeStyle = `rgba(205,240,255,${0.20 * wakeAlpha})`;
+      ctx.lineWidth = (1.0 + brakeOpen * 1.1) / S.camera.zoom;
+      ctx.beginPath();
+      ctx.moveTo(-2, -wingY * 0.55); ctx.lineTo(rearX - 10 - 6 * brakeOpen, -wingY * 1.15);
+      ctx.moveTo(-2, wingY * 0.55); ctx.lineTo(rearX - 10 - 6 * brakeOpen, wingY * 1.15);
+      ctx.stroke();
+      ctx.strokeStyle = `rgba(120,255,220,${0.18 * wakeAlpha})`;
+      ctx.beginPath();
+      ctx.moveTo(rearX - 2, -wingY * 0.62); ctx.quadraticCurveTo(rearX - 15, -wingY * 0.30, rearX - 26, -wingY * 0.80);
+      ctx.moveTo(rearX - 2, wingY * 0.62); ctx.quadraticCurveTo(rearX - 15, wingY * 0.30, rearX - 26, wingY * 0.80);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
-  ctx.restore();
 
   drawMultiplayerRosterOverlay(ctx, dpr, w, h, S.multiplayer);
 }
@@ -5594,9 +6260,51 @@ function remotePlayerHue(slot: PlayerSlotIndex) {
   return [165, 205, 285, 38][slot] ?? 165;
 }
 
+function drawPlayerTrail(
+  ctx: CanvasRenderingContext2D,
+  cameraZoom: number,
+  pilot: RenderMultiplayerPlayer,
+  worldAlpha: number,
+) {
+  if (pilot.trail.length < 2) return;
+  const hue = remotePlayerHue(pilot.slot);
+  ctx.save();
+  ctx.globalAlpha = worldAlpha;
+  ctx.lineWidth = 1.2 / cameraZoom;
+  ctx.strokeStyle = `hsla(${hue},92%,74%,${T.TRAIL_ALPHA})`;
+  ctx.beginPath();
+  for (let i = 0; i < pilot.trail.length; i++) {
+    const point = pilot.trail[i];
+    if (i === 0) ctx.moveTo(point.x, point.y);
+    else ctx.lineTo(point.x, point.y);
+  }
+  ctx.stroke();
+  ctx.restore();
+
+  if (!T.THRUST_TRAIL_GLOW_ENABLED || pilot.thrustGlow <= 0.02 || pilot.trail.length <= 2) return;
+  ctx.save();
+  ctx.globalAlpha = worldAlpha;
+  ctx.lineCap = "round";
+  const count = Math.min(T.THRUST_TRAIL_GLOW_POINTS, pilot.trail.length - 1);
+  const start = pilot.trail.length - count;
+  for (let i = Math.max(1, start); i < pilot.trail.length; i++) {
+    const p0 = pilot.trail[i - 1];
+    const p1 = pilot.trail[i];
+    const k = (i - start) / Math.max(1, count);
+    const alpha = pilot.thrustGlow * T.THRUST_TRAIL_GLOW_INTENSITY * Math.pow(k, 2.25);
+    ctx.strokeStyle = `hsla(${hue},95%,82%,${alpha})`;
+    ctx.lineWidth = (1.6 + 4.8 * pilot.thrustGlow * k) / cameraZoom;
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y);
+    ctx.lineTo(p1.x, p1.y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
 function drawRemotePlayerShip(ctx: CanvasRenderingContext2D, cameraZoom: number, remote: RenderMultiplayerPlayer) {
   const hue = remotePlayerHue(remote.slot);
-  const alpha = remote.lifeState === "alive" ? 0.84 : 0.28;
+  const alpha = 0.84;
   ctx.save();
   ctx.translate(remote.x, remote.y);
   ctx.rotate(remote.angle);
@@ -5663,30 +6371,35 @@ function drawMultiplayerRosterOverlay(ctx: CanvasRenderingContext2D, dpr: number
   ctx.restore();
 }
 
-function updateCamera(camera: { pos: V2; zoom: number }, canvas: HTMLCanvasElement, dpr: number, shipPos: V2, shipVel: V2, horizonR: number) {
-  // keep star centered
-  camera.pos.x = 0; camera.pos.y = 0;
-
+function updateCamera(
+  camera: { pos: V2; zoom: number },
+  canvas: HTMLCanvasElement,
+  dpr: number,
+  ships: Array<{ pos: V2; vel: V2 }>,
+  horizonR: number,
+) {
+  camera.pos.x = 0;
+  camera.pos.y = 0;
   const w = canvas.width / dpr;
   const h = canvas.height / dpr;
-
-  // keep-in-view zoom ceiling (ship must stay on-screen)
   const pad = T.CAMERA_PAD_PX;
-  const ax = Math.abs(shipPos.x);
-  const ay = Math.abs(shipPos.y);
+  let ax = 0;
+  let ay = 0;
+  let furthest = ships[0] ?? { pos: new V2(0, 0), vel: new V2(0, 0) };
+  for (const ship of ships) {
+    ax = Math.max(ax, Math.abs(ship.pos.x));
+    ay = Math.max(ay, Math.abs(ship.pos.y));
+    if (ship.pos.len() > furthest.pos.len()) furthest = ship;
+  }
   const zX = w / (2 * (ax + pad));
   const zY = h / (2 * (ay + pad));
   const keepZoom = clamp(Math.min(zX, zY), T.CAMERA_ZOOM_FLOOR, T.CAMERA_ZOOM_CEIL);
-
-  // aesthetic: prefer showing ring context + speed
-  const dist = shipPos.len();
+  const dist = furthest.pos.len();
   const base = 1 / (1 + dist / (horizonR * 0.55));
-  const sp = shipVel.len();
+  const sp = Math.max(...ships.map((ship) => ship.vel.len()), 0);
   const spZoom = 1 / (1 + sp / (T.MAX_SPEED * 0.85));
   const aesthetic = clamp(base * 0.72 + spZoom * 0.28, T.CAMERA_ZOOM_FLOOR, T.CAMERA_ZOOM_CEIL);
-
-  const blend = T.CAMERA_AESTHETIC;
-  const target = Math.min(keepZoom, lerp(keepZoom, aesthetic, blend));
+  const target = Math.min(keepZoom, lerp(keepZoom, aesthetic, T.CAMERA_AESTHETIC));
   camera.zoom = clamp(lerp(camera.zoom, target, T.CAMERA_LERP), T.CAMERA_ZOOM_FLOOR, T.CAMERA_ZOOM_CEIL);
 }
 

@@ -13,6 +13,7 @@ export type AuthorityClock = {
   lastSnapshotTick: number;
   nextInputSeqByPlayer: Record<PlayerId, number>;
   lastInputSeqByPlayer: Record<PlayerId, number>;
+  lastReceivedInputSeqByPlayer: Record<PlayerId, number>;
   lastSnapshotReceivedTick: number;
 };
 
@@ -31,6 +32,7 @@ export function createAuthorityClock(mode: AuthorityMode = "solo-authority"): Au
     lastSnapshotTick: 0,
     nextInputSeqByPlayer: {},
     lastInputSeqByPlayer: {},
+    lastReceivedInputSeqByPlayer: {},
     lastSnapshotReceivedTick: 0,
   };
 }
@@ -48,6 +50,7 @@ export function resetAuthorityClock(clock: AuthorityClock, mode: AuthorityMode =
   clock.lastSnapshotReceivedTick = 0;
   clock.nextInputSeqByPlayer = {};
   clock.lastInputSeqByPlayer = {};
+  clock.lastReceivedInputSeqByPlayer = {};
 }
 
 export function resetEntityIdCounters(counters: EntityIdCounters) {
@@ -74,12 +77,18 @@ export function nextInputSequence(clock: AuthorityClock, playerId: PlayerId) {
 }
 
 export function acceptInputSequence(clock: AuthorityClock, input: Pick<NetInputMessage, "playerId" | "seq">) {
-  const last = clock.lastInputSeqByPlayer[input.playerId] ?? 0;
+  const last = clock.lastReceivedInputSeqByPlayer[input.playerId] ?? 0;
   if (input.seq <= last) {
     debugWarn("network", "stale-input-ignored", { playerId: input.playerId, seq: input.seq, lastSeq: last, tick: clock.tick });
     return false;
   }
-  clock.lastInputSeqByPlayer[input.playerId] = input.seq;
+  clock.lastReceivedInputSeqByPlayer[input.playerId] = input.seq;
+  return true;
+}
+
+export function markInputSequenceApplied(clock: AuthorityClock, playerId: PlayerId, seq: number) {
+  if (seq <= (clock.lastInputSeqByPlayer[playerId] ?? 0)) return false;
+  clock.lastInputSeqByPlayer[playerId] = seq;
   return true;
 }
 

@@ -5,6 +5,7 @@ export type DebugCategory =
   | "input"
   | "network"
   | "snapshot"
+  | "prediction"
   | "collision"
   | "projectile"
   | "shrapnel"

@@ -10,6 +10,18 @@ export type ShipControllerInput = {
   connected: boolean;
   profile: GamepadControlProfile;
   label: string;
+  gamepadIndex: number | null;
+};
+
+export type ConnectedGamepadDescriptor = {
+  index: number;
+  id: string;
+  label: string;
+  mapping: GamepadMappingType | "";
+  profile: GamepadControlProfile;
+  buttons: number;
+  axes: number;
+  active: boolean;
 };
 
 export const GAMEPAD_CONFIG = {
@@ -21,14 +33,14 @@ export const GAMEPAD_CONFIG = {
     rotationCurve: 1.35,
     rotationScale: 1.0,
 
-    thrustButton: 7, // RT / R2 on standard controllers
+    thrustButton: 7,
     thrustCurve: 1.15,
 
-    brakeButton: 6, // LT / L2 on standard controllers
+    brakeButton: 6,
     brakeCurve: 1.1,
 
-    fireButtons: [0], // A / Cross
-    pauseButtons: [9], // Start / Menu
+    fireButtons: [0],
+    pauseButtons: [9],
   },
 
   legacy: {
@@ -42,9 +54,9 @@ export const GAMEPAD_CONFIG = {
     dpadLeftButton: 14,
     dpadRightButton: 15,
 
-    fireButtons: [0], // NES A, arcade primary, or equivalent
-    brakeButtons: [1], // NES B as alternate brake
-    pauseButtons: [9, 8, 3], // Start, Select fallback, generic Start fallback
+    fireButtons: [0],
+    brakeButtons: [1],
+    pauseButtons: [9, 8, 3],
   },
 } as const;
 
@@ -58,6 +70,7 @@ const EMPTY_INPUT: ShipControllerInput = {
   connected: false,
   profile: "none",
   label: "",
+  gamepadIndex: null,
 };
 
 type DigitalPadState = {
@@ -157,6 +170,7 @@ function pickGamepad() {
   if (pads.length === 0) {
     activeGamepadIndex = null;
     previousButtons.clear();
+    legacySmooth.clear();
     return null;
   }
 
@@ -186,21 +200,10 @@ function detectProfile(gamepad: Gamepad): GamepadControlProfile {
 function readDigitalDpad(gamepad: Gamepad): DigitalPadState {
   const cfg = GAMEPAD_CONFIG.legacy;
 
-  const left =
-    buttonPressed(gamepad, cfg.dpadLeftButton) ||
-    axisNegative(gamepad, 0, cfg.deadzone);
-
-  const right =
-    buttonPressed(gamepad, cfg.dpadRightButton) ||
-    axisPositive(gamepad, 0, cfg.deadzone);
-
-  const up =
-    buttonPressed(gamepad, cfg.dpadUpButton) ||
-    axisNegative(gamepad, 1, cfg.deadzone);
-
-  const down =
-    buttonPressed(gamepad, cfg.dpadDownButton) ||
-    axisPositive(gamepad, 1, cfg.deadzone);
+  const left = buttonPressed(gamepad, cfg.dpadLeftButton) || axisNegative(gamepad, 0, cfg.deadzone);
+  const right = buttonPressed(gamepad, cfg.dpadRightButton) || axisPositive(gamepad, 0, cfg.deadzone);
+  const up = buttonPressed(gamepad, cfg.dpadUpButton) || axisNegative(gamepad, 1, cfg.deadzone);
+  const down = buttonPressed(gamepad, cfg.dpadDownButton) || axisPositive(gamepad, 1, cfg.deadzone);
 
   return { left, right, up, down };
 }
@@ -220,11 +223,7 @@ function readLegacyInput(gamepad: Gamepad, dt: number) {
   smooth.brake = approach(smooth.brake, brakeTarget, cfg.brakeSlew * safeDt);
   legacySmooth.set(gamepad.index, smooth);
 
-  return {
-    rotate: smooth.rotate,
-    thrust: smooth.thrust,
-    brake: smooth.brake,
-  };
+  return { rotate: smooth.rotate, thrust: smooth.thrust, brake: smooth.brake };
 }
 
 function readModernInput(gamepad: Gamepad, dt: number) {
@@ -241,23 +240,12 @@ function readModernInput(gamepad: Gamepad, dt: number) {
   };
 }
 
-export function readGamepadShipInput(dt = 1 / 60): ShipControllerInput {
-  if (!GAMEPAD_CONFIG.enabled) return EMPTY_INPUT;
-
-  const gamepad = pickGamepad();
-  if (!gamepad) return EMPTY_INPUT;
-
+function readGamepad(gamepad: Gamepad, dt: number): ShipControllerInput {
   const profile = detectProfile(gamepad);
-  const motion = profile === "modern-standard"
-    ? readModernInput(gamepad, dt)
-    : readLegacyInput(gamepad, dt);
+  const motion = profile === "modern-standard" ? readModernInput(gamepad, dt) : readLegacyInput(gamepad, dt);
 
-  const fireButtons = profile === "modern-standard"
-    ? GAMEPAD_CONFIG.modern.fireButtons
-    : GAMEPAD_CONFIG.legacy.fireButtons;
-  const pauseButtons = profile === "modern-standard"
-    ? GAMEPAD_CONFIG.modern.pauseButtons
-    : GAMEPAD_CONFIG.legacy.pauseButtons;
+  const fireButtons = profile === "modern-standard" ? GAMEPAD_CONFIG.modern.fireButtons : GAMEPAD_CONFIG.legacy.fireButtons;
+  const pauseButtons = profile === "modern-standard" ? GAMEPAD_CONFIG.modern.pauseButtons : GAMEPAD_CONFIG.legacy.pauseButtons;
 
   const input: ShipControllerInput = {
     rotate: clamp(motion.rotate, -1, 1),
@@ -269,10 +257,52 @@ export function readGamepadShipInput(dt = 1 / 60): ShipControllerInput {
     connected: true,
     profile,
     label: gamepad.id || "Gamepad",
+    gamepadIndex: gamepad.index,
   };
 
   updatePreviousButtons(gamepad);
   return input;
+}
+
+export function getConnectedGamepadDescriptors(): ConnectedGamepadDescriptor[] {
+  return getGamepads()
+    .sort((a, b) => a.index - b.index)
+    .map((gamepad) => ({
+      index: gamepad.index,
+      id: gamepad.id || `Gamepad ${gamepad.index + 1}`,
+      label: gamepad.id || `Gamepad ${gamepad.index + 1}`,
+      mapping: gamepad.mapping,
+      profile: detectProfile(gamepad),
+      buttons: gamepad.buttons.length,
+      axes: gamepad.axes.length,
+      active: gamepadHasActivity(gamepad),
+    }));
+}
+
+export function readGamepadShipInputForIndex(index: number | null | undefined, dt = 1 / 60): ShipControllerInput {
+  if (!GAMEPAD_CONFIG.enabled || index === null || index === undefined) return { ...EMPTY_INPUT };
+  const gamepad = getGamepads().find((candidate) => candidate.index === index);
+  if (!gamepad) return { ...EMPTY_INPUT, gamepadIndex: index };
+  return readGamepad(gamepad, dt);
+}
+
+export function readGamepadShipInput(dt = 1 / 60): ShipControllerInput {
+  if (!GAMEPAD_CONFIG.enabled) return { ...EMPTY_INPUT };
+  const gamepad = pickGamepad();
+  if (!gamepad) return { ...EMPTY_INPUT };
+  return readGamepad(gamepad, dt);
+}
+
+export function resetGamepadEdgeState(index?: number) {
+  if (index === undefined) {
+    previousButtons.clear();
+    legacySmooth.clear();
+    activeGamepadIndex = null;
+    return;
+  }
+  previousButtons.delete(index);
+  legacySmooth.delete(index);
+  if (activeGamepadIndex === index) activeGamepadIndex = null;
 }
 
 export function getGamepadControlsHint(input: ShipControllerInput) {
